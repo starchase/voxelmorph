@@ -75,6 +75,7 @@ fixed, fixed_affine = vxm.py.utils.load_volfile(
     args.fixed, add_batch_axis=True, add_feat_axis=add_feat_axis, ret_affine=True)
 
 # load and set up model
+# model = vxm.networks.VxmDense.load(args.model, device)
 model = vxm.networks.VxmDense.load(args.model, device)
 model.to(device)
 model.eval()

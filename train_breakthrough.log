@@ -1,0 +1,39 @@
+nohup: ignoring input
+Using device: cuda
+Warning: No matched pairs found. Falling back to Unpaired/Cross-Product Mode.
+Subsampled Training Dataset to 500 pairs.
+Training Dataset: Found 44 CTs and 35 MRs.
+Training Pairs Generated: 500 (Unpaired/Cross-Product: True)
+Validation set loaded: 25 pairs.
+DEBUG: Paired Mode Enabled.
+DEBUG: Found 8 CT candidates and 8 MR candidates.
+Test (Monitor) set loaded: 8 pairs.
+Output directory for this run: models/multimodal_vxm_local_mi_20260129_222639
+Training for 50 epochs...
+Training Batch:   0%|          | 0/32 [00:00<?, ?it/s]Training Batch:   0%|          | 0/32 [00:20<?, ?it/s]
+Traceback (most recent call last):
+  File "/root/voxelmorph-dev/scripts/train_multimodal.py", line 1022, in <module>
+    main()
+  File "/root/voxelmorph-dev/scripts/train_multimodal.py", line 866, in main
+    avg_loss = train_epoch(
+  File "/root/voxelmorph-dev/scripts/train_multimodal.py", line 563, in train_epoch
+    displacement, warped_source = model(
+  File "/usr/local/miniconda3/envs/zcmorph/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/usr/local/miniconda3/envs/zcmorph/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/root/voxelmorph-dev/voxelmorph/nn/models.py", line 200, in forward
+    combined_features = self.model(combined_features)
+  File "/usr/local/miniconda3/envs/zcmorph/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/usr/local/miniconda3/envs/zcmorph/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/usr/local/miniconda3/envs/zcmorph/lib/python3.10/site-packages/neurite/nn/models.py", line 276, in forward
+    feature_tensor = block(feature_tensor, skip)
+  File "/usr/local/miniconda3/envs/zcmorph/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1776, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+  File "/usr/local/miniconda3/envs/zcmorph/lib/python3.10/site-packages/torch/nn/modules/module.py", line 1787, in _call_impl
+    return forward_call(*args, **kwargs)
+  File "/usr/local/miniconda3/envs/zcmorph/lib/python3.10/site-packages/neurite/nn/modules.py", line 859, in forward
+    features = torch.cat([features, skip], dim=1)
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 11.25 GiB. GPU 0 has a total capacity of 23.57 GiB of which 4.93 GiB is free. Process 3925165 has 18.63 GiB memory in use. Of the allocated memory 18.28 GiB is allocated by PyTorch, and 62.47 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)

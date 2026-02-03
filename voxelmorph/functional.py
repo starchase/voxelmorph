@@ -1,7 +1,7 @@
 """
 Single tensor operations (no B, C, dimensions assumption)
 """
-from typing import Union, Sequence, Tuple, Literal
+from typing import Union, Sequence, Tuple, Literal, Optional
 
 import numpy as np
 import torch
@@ -466,8 +466,8 @@ def trf_to_disp(
 
 def disp_to_coords(
     disp: torch.Tensor,
-    meshgrid: torch.Tensor | None = None,
-    non_spatial_dims: Tuple[int, ...] | None = None,
+    meshgrid: Optional[torch.Tensor] = None,
+    non_spatial_dims: Optional[Tuple[int, ...]] = None,
 ) -> torch.Tensor:
     """
     Convert displacement field to normalized coordinates in [-1, 1] range for grid_sample.

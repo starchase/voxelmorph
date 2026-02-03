@@ -1,0 +1,15 @@
+Using device: cuda
+Training Dataset: Found 44 CTs and 35 MRs.
+Training Pairs Generated: 1540 (Unpaired/Cross-Product: True)
+Validation set loaded: 25 pairs.
+Test (Monitor) set loaded: 7 pairs.
+Output directory for this run: models/multimodal_vxm_ncc_20260127_194520
+Training for 30 epochs...
+Epoch 1, Train Loss: 1.087315, Val Loss: 0.048909, Val Dice: 0.000000, Mag: 1680.9953, NegJac: 0.477097
+  [Monitor] Test Dice: 0.000000, Test Loss: 0.048847, Test Jac: 0.462212, Test Mag: 1678.8967
+Epoch 2, Train Loss: 19.817937, Val Loss: 1.217468, Val Dice: 0.000000, Mag: 3351.5800, NegJac: 0.718850
+  [Monitor] Test Dice: 0.000000, Test Loss: 1.283015, Test Jac: 0.703140, Test Mag: 3292.8064
+Epoch 3, Train Loss: 5.587571, Val Loss: 1.866796, Val Dice: 0.000000, Mag: 3500.0440, NegJac: 0.496800
+  [Monitor] Test Dice: 0.000000, Test Loss: 1.893013, Test Jac: 0.536594, Test Mag: 3442.9437
+Epoch 4, Train Loss: 0.959649, Val Loss: 0.490716, Val Dice: 0.000000, Mag: 1055.8872, NegJac: 0.503020
+  [Monitor] Test Dice: 0.000000, Test Loss: 0.484626, Test Jac: 0.499806, Test Mag: 1039.2635
