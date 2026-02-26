@@ -118,19 +118,25 @@ class MultimodalTrainDataset(torch.utils.data.Dataset):
 
         return {'source': ct, 'target': mr}
 def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', suffix='', best_sample_idx=None):
-    """Save mid-slice images of the first validation/test sample, and optionally a specific 'best' sample."""
+    """Save mid-slice images of samples."""
     
-    # 1. Default Sample (Index 0)
-    sample_default = dataset[0]
+    samples_to_plot = []
     
-    # 2. Best Sample (if provided)
-    sample_best = None
-    if best_sample_idx is not None and best_sample_idx < len(dataset):
-        sample_best = dataset[best_sample_idx]
+    # If it is test set (suffix contains 'test'), plot all samples
+    if 'test' in suffix:
+        for i in range(len(dataset)):
+            sample = dataset[i]
+            # Use filename as tag if available
+            tag = sample.get('filename', f'{i:04d}')
+            samples_to_plot.append((tag, sample))
+    else:
+        # Default behavior for validation: Index 0 and Best Dice
+        sample_default = dataset[0]
+        samples_to_plot.append(('default', sample_default))
         
-    samples_to_plot = [('default', sample_default)]
-    if sample_best is not None:
-        samples_to_plot.append(('best_dice', sample_best))
+        if best_sample_idx is not None and best_sample_idx < len(dataset):
+            sample_best = dataset[best_sample_idx]
+            samples_to_plot.append(('best_dice', sample_best))
         
     for name_tag, sample in samples_to_plot:
         # Dataset returns (C, D, H, W), so unsqueeze for batch dim -> (1, C, D, H, W)
@@ -153,32 +159,84 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
                  trf = vxm.nn.modules.SpatialTransformer(interpolation_mode='nearest').to(device)
                  warped_label = trf(source_label, displacement)
         
-        # Extract middle slices
-        def get_mid_slice(img_tensor):
+        # Determine the best slice index
+        # Default: middle slice
+        slice_idx = source.shape[4] // 2
+        
+        # If labels are available, try to find a slice with most labels (1,2,3,4)
+        lbl_for_search = None
+        if target_label is not None:
+            lbl_for_search = target_label
+        elif source_label is not None:
+            lbl_for_search = source_label
+            
+        if lbl_for_search is not None:
+            # OPTIMIZATION: Computer unique labels per slice on GPU
+            # lbl_for_search: (1, 1, X, Y, Z)
+            # We want to count non-zero unique elements along Z
+            
+            # Simple approach on GPU: Iterate Z slices, but keep data on GPU
+            best_idx = slice_idx
+            max_unique_labels = -1
+            
+            D = lbl_for_search.shape[4] # Z dimension
+            
+            # Start search from middle outwards
+            search_indices = sorted(range(D), key=lambda i: abs(i - slice_idx))
+            
+            for z in search_indices:
+                # Get slice on GPU
+                slice_data = lbl_for_search[0, 0, :, :, z]
+                
+                # Check unique elements. torch.unique is supported on GPU
+                unique = torch.unique(slice_data)
+                
+                # Count non-zero labels (> 0.5 to be safe with float)
+                count = (unique > 0.5).sum().item()
+                
+                if count > max_unique_labels:
+                    max_unique_labels = count
+                    best_idx = z
+                    if max_unique_labels >= 4: # Found all 4
+                        break
+            
+            slice_idx = best_idx
+
+        # Extract slices using the determined index
+        # OPTIMIZATION: Slice on GPU first, then move to CPU
+        def get_slice(img_tensor, z_idx):
             if img_tensor is None: return None
-            # img_tensor: (1, 1, X, Y, Z) -> take middle of Z (Axial view)
-            vol = img_tensor.detach().cpu().numpy()[0, 0]
+            # img_tensor: (1, 1, X, Y, Z)
+            # Slice the Z dimension on GPU
+            # shape becomes (1, 1, X, Y)
+            slice_tensor = img_tensor[:, :, :, :, z_idx]
+            # Remove batch and channel dims -> (X, Y)
+            slice_np = slice_tensor.detach().cpu().numpy()[0, 0]
             # X-Y plane is Axial
             # Typically requires rotation to align with standard visualization
-            return np.rot90(vol[:, :, vol.shape[2] // 2])
+            return np.rot90(slice_np)
 
-        src_slice = get_mid_slice(source)
-        tgt_slice = get_mid_slice(target)
-        warped_slice = get_mid_slice(warped_source)
+        src_slice = get_slice(source, slice_idx)
+        tgt_slice = get_slice(target, slice_idx)
+        warped_slice = get_slice(warped_source, slice_idx)
         
-        src_lbl_slice = get_mid_slice(source_label)
-        tgt_lbl_slice = get_mid_slice(target_label)
-        warped_lbl_slice = get_mid_slice(warped_label)
+        src_lbl_slice = get_slice(source_label, slice_idx)
+        tgt_lbl_slice = get_slice(target_label, slice_idx)
+        warped_lbl_slice = get_slice(warped_label, slice_idx)
         
         # Plot - Dynamic Rows setup
         has_labels = (src_lbl_slice is not None) and (tgt_lbl_slice is not None)
         
         rows = 3 if has_labels else 2
         cols = 4
+        # Use simple subplots. To ensure uniform image size, we must be careful with colorbars.
+        # We will use ImageGrid or just handle colorbars carefully.
+        # But for simplicity, let's stick to subplots and make the figure larger.
         fig, axes = plt.subplots(rows, cols, figsize=(20, 5 * rows))
         
-        # Define a consistent label colormap (e.g., 4 organs)
-        # 0=bg (transparent), 1=liver(red), 2=spleen(green), 3=rkidney(blue), 4=lkidney(yellow)
+        # Turn off all axes initially
+        for ax in axes.flatten():
+            ax.axis('off')
         from matplotlib.colors import ListedColormap
         # Create a custom colormap for up to 4 labels + background
         # Background should be transparent (alpha=0)
@@ -205,60 +263,42 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
             ax.axis('off')
 
         # Row 1: Basic Images
-        # 1. Source
+        # 1. Moving
         axes[0, 0].imshow(src_slice, cmap='gray')
-        axes[0, 0].set_title('Source (CT)')
+        axes[0, 0].set_title('Moving')
         axes[0, 0].axis('off')
         
-        # 2. Target
+        # 2. Fixed
         axes[0, 1].imshow(tgt_slice, cmap='gray')
-        axes[0, 1].set_title('Target (MR)')
+        axes[0, 1].set_title('Fixed')
         axes[0, 1].axis('off')
         
-        # 3. Warped
+        # 3. Warp
         axes[0, 2].imshow(warped_slice, cmap='gray')
-        axes[0, 2].set_title('Warped Source')
+        axes[0, 2].set_title('Deformed')
         axes[0, 2].axis('off')
 
-        # 4. Checkerboard
-        # Normalize per-slice independenty using robust scaling to maximize contrast
-        def normalize_robust(x):
-            # Clip top/bottom outliers (e.g. bone or heavy artifacts) to stretch soft tissue contrast
-            p_low = np.percentile(x, 2)
-            p_high = np.percentile(x, 98)
-            x_clipped = np.clip(x, p_low, p_high)
-            mask_norm = (x_clipped - x_clipped.min()) / (x_clipped.max() - x_clipped.min() + 1e-6)
-            return mask_norm
-        
-        w_disp = normalize_robust(warped_slice)
-        t_disp = normalize_robust(tgt_slice)
-        
-        # Create checkerboard mask
-        H, W = w_disp.shape
-        block_size = H // 16 # Adjust block size dynamically
-        rows = np.arange(H) // block_size
-        cols = np.arange(W) // block_size
-        row_grid, col_grid = np.meshgrid(rows, cols, indexing='ij')
-        mask = (row_grid + col_grid) % 2 == 0
-        
-        checker = w_disp * mask + t_disp * (~mask)
-
-        axes[0, 3].imshow(checker, cmap='gray')
-        axes[0, 3].set_title('Checkerboard')
+        # 4. Moving - Fixed
+        diff_moving_fixed = src_slice - tgt_slice
+        im_diff1 = axes[0, 3].imshow(diff_moving_fixed, cmap='bwr', vmin=-1, vmax=1)
+        axes[0, 3].set_title('Source - Target')
         axes[0, 3].axis('off')
+        fig.colorbar(im_diff1, ax=axes[0, 3], fraction=0.046, pad=0.04)
 
         # Row 2: Advanced Analysis
         
         # 5. Deformed Grid
+        # Get dimensions from slice
+        H, W = src_slice.shape
         # Create a regular grid
         grid_spacing = 10
         xx, yy = np.meshgrid(np.arange(0, W, grid_spacing), np.arange(0, H, grid_spacing))
         # Get displacement for this slice (need to correspond to Meshgrid usage)
         # displacement shape is (1, 3, Dim0, Dim1, Dim2). We need 2D vectors on the last dimension slice.
-        # get_mid_slice takes middle of last dim (Z), so we must do the same here.
         # Spatial dims are indices 2, 3, 4. We want to slice index 4.
-        mid_dim_idx = displacement.shape[4] // 2
-        raw_d_slice = displacement.detach().cpu().numpy()[0, :, :, :, mid_dim_idx] # (3, Dim0, Dim1)
+        
+        # d_slice should be taken from the same slice index we determined above
+        raw_d_slice = displacement.detach().cpu().numpy()[0, :, :, :, slice_idx] # (3, Dim0, Dim1)
         
         # Rotate spatial dimensions to align with image visualization (np.rot90 on axes 0,1 of image)
         # raw_d_slice has channels at axis 0. So we rotate axes 1 and 2.
@@ -291,7 +331,7 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
             if i < d_slice.shape[2]:
                 x_plot = i + d_slice[2, :, i]
                 y_plot = np.arange(H) + d_slice[1, :, i]
-                axes[1, 0].plot(x_plot, y_plot, 'c-', linewidth=0.5, alpha=0.7)
+                axes[1, 0].plot(x_plot, y_plot, 'w-', linewidth=0.8, alpha=0.9) # White lines
             
         # Plot horizontal lines (using dense sampling)
         for j in range(0, H, grid_spacing):
@@ -301,96 +341,194 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
             if j < d_slice.shape[1]:
                 x_plot = np.arange(W) + d_slice[2, j, :]
                 y_plot = j + d_slice[1, j, :]
-                axes[1, 0].plot(x_plot, y_plot, 'c-', linewidth=0.5, alpha=0.7)
+                axes[1, 0].plot(x_plot, y_plot, 'w-', linewidth=0.8, alpha=0.9) # White lines
             
         axes[1, 0].set_title('Deformed Grid')
         axes[1, 0].set_ylim(H, 0) # Flip Y to match image coordinates
         axes[1, 0].set_xlim(0, W)
         axes[1, 0].axis('off')
 
-        # 6. Deformation Heatmap (Magnitude)
-        disp_mag = np.sqrt(d_slice[1]**2 + d_slice[2]**2 + d_slice[0]**2)
-        im = axes[1, 1].imshow(disp_mag, cmap='jet')
-        axes[1, 1].set_title('Def Magnitude')
+        # Create HSV image
+        # Standard flow visualization:
+        # Hue = direction (0..1)
+        # Saturation = magnitude (0..1)
+        # Value = 1.0 (constant bright)
+        
+        from matplotlib.colors import hsv_to_rgb
+        
+        # Calculate magnitude and angle
+        # d_slice indices: 0=Z, 1=Y, 2=X
+        dx = d_slice[2]
+        dy = d_slice[1]
+        
+        mag = np.sqrt(dx**2 + dy**2)
+        angle = np.arctan2(dy, dx)
+        
+        # Normalize magnitude for saturation
+        # Clip outliers to visualize variations better
+        p99 = np.percentile(mag, 99) + 1e-5
+        mag_norm = np.clip(mag / p99, 0, 1)
+
+        hsv = np.zeros((H, W, 3), dtype=np.float32)
+
+        # --- Plot 6: RGB Displacement Field with 3D Axis Legend ---
+        # Normalize flow for visualization: Map X->Red, Y->Green, Z->Blue
+        # d_slice indices: 0=Z, 1=Y, 2=X
+        dx = d_slice[2]
+        dy = d_slice[1]
+        dz = d_slice[0]
+        
+        # Calculate max magnitude for normalization
+        max_mag = np.max(np.abs(d_slice)) + 1e-5
+        
+        # Create RGB image
+        # Center 0 displacement at 0.5 (Gray) to show positive/negative direction
+        # Mapping: [-max, max] -> [0, 1]
+        flow_vis = np.zeros((H, W, 3), dtype=np.float32)
+        flow_vis[..., 0] = (dx / (2 * max_mag)) + 0.5 # X -> R
+        flow_vis[..., 1] = (dy / (2 * max_mag)) + 0.5 # Y -> G
+        flow_vis[..., 2] = (dz / (2 * max_mag)) + 0.5 # Z -> B
+        
+        # Clip to ensure valid range
+        flow_vis = np.clip(flow_vis, 0, 1)
+        
+        # Display the flow
+        axes[1, 1].imshow(flow_vis)
+        axes[1, 1].set_title('RGB Displacement', color='black') # Default color
         axes[1, 1].axis('off')
-        fig.colorbar(im, ax=axes[1, 1], fraction=0.046, pad=0.04)
 
-        # 7. Quiver Plot (Vector Field)
-        # Downsample for readability
-        step = 20
-        q_y, q_x = np.mgrid[0:H:step, 0:W:step]
-        q_dy = d_slice[1, ::step, ::step]
-        q_dx = d_slice[2, ::step, ::step]
-        
-        axes[1, 2].imshow(src_slice, cmap='gray', alpha=0.5) # Faint source underneath
-        axes[1, 2].quiver(q_x, q_y, q_dx, q_dy, color='r', angles='xy', scale_units='xy', scale=1)
-        axes[1, 2].set_title('Vector Field')
-        axes[1, 2].axis('off')
+        # Add legend if this is a test set image
+        if 'test' in suffix:
+            # We now use a dedicated subplot for the legend (axes[1, 2])
+            pass
 
-        # 8. Contrast/Contour Overlay
-        # If labels available, plot contour. If not, simple Canny edge of Source over Target.
-        axes[1, 3].imshow(tgt_slice, cmap='gray')
-        
-        # Simple Gradient-based edge detection for Source
-        from scipy.ndimage import sobel
-        sx = sobel(warped_slice, axis=0, mode='constant')
-        sy = sobel(warped_slice, axis=1, mode='constant')
-        sob = np.hypot(sx, sy)
-        # Threshold edges
-        edges = sob > (sob.max() * 0.2)
-        
-        # Overlay red edges on Target
-        # Create an RGBA image
-        overlay = np.zeros((H, W, 4))
-        overlay[edges] = [1, 0, 0, 0.8] # Red, semi-transparent
-        
-        axes[1, 3].imshow(overlay)
-        axes[1, 3].set_title('Warped Edges on Target')
+        # 7. Warp - Fixed
+        diff_warp_fixed = warped_slice - tgt_slice
+        # Move to position [1, 3] (was [1, 2])
+        im_diff2 = axes[1, 3].imshow(diff_warp_fixed, cmap='bwr', vmin=-1, vmax=1)
+        axes[1, 3].set_title('Deformed - Target')
         axes[1, 3].axis('off')
+        # Create colorbar axis adjacent to image or just inset
+        from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+        cax = inset_axes(axes[1, 3], width="5%", height="100%", loc='center right', borderpad=-1.5)
+        fig.colorbar(im_diff2, cax=cax)
+
+        # 8. RGB Flow Legend (Using the empty spot at [1, 2] since Edges removed)
+        # We removed "Edges" ([1, 3] originally), moved Diff2 to [1, 3].
+        
+        ax_legend_spot = axes[1, 2]
+        ax_legend_spot.clear() # Clear any previous content
+        ax_legend_spot.axis('off')
+        ax_legend_spot.set_xlim(0, 1)
+        ax_legend_spot.set_ylim(0, 1)
+        
+        # Draw Arrows at center of this subplot
+        # Y axis (Green) - pointing Down visually to match image coordinates
+        ax_legend_spot.arrow(0.5, 0.7, 0, -0.4, head_width=0.05, head_length=0.05, fc='lime', ec='lime', width=0.01)
+        ax_legend_spot.text(0.5, 0.2, 'Y', color='lime', ha='center', va='top', fontweight='bold', fontsize=12)
+
+        # X axis (Red) - pointing Right
+        ax_legend_spot.arrow(0.5, 0.7, 0.4, 0, head_width=0.05, head_length=0.05, fc='red', ec='red', width=0.01)
+        ax_legend_spot.text(0.95, 0.7, 'X', color='red', ha='left', va='center', fontweight='bold', fontsize=12)
+        
+        # Z axis (Blue) - Dot
+        ax_legend_spot.plot(0.5, 0.7, 'o', color='blue', markersize=15)
+        ax_legend_spot.text(0.45, 0.75, 'Z', color='blue', ha='right', va='bottom', fontweight='bold', fontsize=12)
+        
+        # Add Range Text
+        range_text = f"Displacement\nRange:\n[-{max_mag:.1f}, {max_mag:.1f}]"
+        ax_legend_spot.text(0.5, 0.9, range_text, ha='center', va='center', fontsize=12, fontweight='bold', color='black')
 
         # Row 3: Label Analysis
         if has_labels:
-            # 9. Source + Label Overlay
-            plot_multi_label(axes[2, 0], src_slice, src_lbl_slice, 'Source + Labels')
+            # Color definitions
+            # 5 distinct hues.
+            # Base colors for fixed (GT) labels - Deep/Dark saturated colors for clear visibility on grey
+            # 1: Liver, 2: Spleen, 3: R-Kidney, 4: L-Kidney
+            # Deep/Dark saturated colors for clear visibility on grey
+            base_colors = {
+                1: '#8B0000', # Dark Red (Liver)
+                2: '#006400', # Dark Green (Spleen)
+                3: '#4682B4', # Steel Blue (R-Kidney) - Lighter/Darker Blue mix, easier to see than Dark Blue
+                4: '#B8860B', # Dark Goldenrod (L-Kidney) - Darker but related to yellow/gold
+                5: '#008B8B'  # Dark Cyan
+            }
+            # Bright colors for moving/warped (source/pred) labels - Standard colors, closer to Base than Neon
+            bright_colors = {
+                1: '#FF0000', # Red
+                2: '#00FF00', # Lime
+                3: '#0000FF', # Blue
+                4: '#FFD700', # Gold
+                5: '#00FFFF'  # Cyan
+            }
             
-            # 10. Target + Label Overlay
-            plot_multi_label(axes[2, 1], tgt_slice, tgt_lbl_slice, 'Target + Labels (GT)')
+            def plot_label_contour(ax, bg_img, label_img, title, color_lookup):
+                ax.imshow(bg_img, cmap='gray')
+                if label_img is not None:
+                     unique_labels = np.unique(label_img)
+                     unique_labels = unique_labels[unique_labels > 0]
+                     for lbl in unique_labels:
+                         mask = (label_img == lbl)
+                         c = color_lookup.get(int(lbl), 'white')
+                         if np.any(mask):
+                             ax.contour(mask, colors=[c], linewidths=1.2)
+                ax.set_title(title)
+                ax.axis('off')
+
+            # 9. Source + Label Overlay (Contour, Bright)
+            plot_label_contour(axes[2, 0], src_slice, src_lbl_slice, 'Source + Labels', bright_colors)
             
-            # 11. Warped Source + Warped Label
-            plot_multi_label(axes[2, 2], warped_slice, warped_lbl_slice, 'Warped + Warped Labels')
+            # 10. Target + Label Overlay (Contour, Base)
+            plot_label_contour(axes[2, 1], tgt_slice, tgt_lbl_slice, 'Target + Labels', base_colors)
+            
+            # 11. Warped Source + Warped Label (Contour, Bright - same as Source)
+            plot_label_contour(axes[2, 2], warped_slice, warped_lbl_slice, 'Deformed + Deformed Labels', bright_colors)
             
             # 12. Overlay Warped Label on Target Image
-            # Logic: Show Target Image in Gray. 
-            # Show Target Labels (GT) as filled regions (semi-transparent).
-            # Show Warped Labels (Pred) as CONTROURS ONLY for comparison.
-            axes[2, 3].imshow(tgt_slice, cmap='gray')
+            # Logic: Show Warped Image (Result) in Gray. 
+            # Show Target Labels (GT) as contours (Base Colors, Dashed).
+            # Show Warped Labels (Pred) as contours (Bright Colors, Solid).
+            axes[2, 3].imshow(warped_slice, cmap='gray')
             
-            # Ground Truth as faint filled regions
+            # Ground Truth Contours
             if tgt_lbl_slice is not None:
-                 masked_tgt = np.ma.masked_where(tgt_lbl_slice < 0.5, tgt_lbl_slice)
-                 axes[2, 3].imshow(masked_tgt, cmap='tab10', alpha=0.3, interpolation='nearest', vmin=1, vmax=10)
+                 unique_labels = np.unique(tgt_lbl_slice)
+                 unique_labels = unique_labels[unique_labels > 0]
+                 for lbl in unique_labels:
+                     mask = (tgt_lbl_slice == lbl)
+                     c = base_colors.get(int(lbl), 'white')
+                     if np.any(mask):
+                         # Dashed line for GT (Target)
+                         # Increase dash spacing via linestyles tuple (offset, (on_off_seq))
+                         # 'dashed' is roughly (0, (5, 5)). Let's make it distinct.
+                         axes[2, 3].contour(mask, colors=[c], linewidths=1.5, linestyles='dashed')
             
-            # Prediction as strong Contours
-            # We need to extract contours for each integer label present
+            # Prediction Contours
             if warped_lbl_slice is not None:
                  unique_labels = np.unique(warped_lbl_slice)
-                 unique_labels = unique_labels[unique_labels > 0] # Skip bg
-                 
-                 # Use a distinct color for contours
-                 for i, lbl in enumerate(unique_labels):
+                 unique_labels = unique_labels[unique_labels > 0]
+                 for lbl in unique_labels:
                      mask = (warped_lbl_slice == lbl)
-                     # Find contours requires float or int array
+                     c = bright_colors.get(int(lbl), 'white')
                      if np.any(mask):
-                         axes[2, 3].contour(mask, colors=['red'], linewidths=0.6)
+                         axes[2, 3].contour(mask, colors=[c], linewidths=1.5, linestyles='solid')
 
-            axes[2, 3].set_title('GT(Fill) vs Warped(Red Contour)')
+            axes[2, 3].set_title('Deformed Image + Target(Dash) & Deformed(Solid)')
             axes[2, 3].axis('off')
 
-        plt.suptitle(f'Epoch {epoch} - Sample {name_tag}')
-        plt.tight_layout()
+        plt.suptitle(f'Epoch {epoch} - Sample {name_tag} (Slice Z={slice_idx})', fontsize=16)
         
-        filename = f'vis_epoch_{epoch:04d}{suffix}_{name_tag}.png'
-        out_file = output_dir / filename
+        # Use tight_layout with rect to avoid overlapping suptitle, but wrap in try-except to handle
+        # incompatibilities with inset_axes (which cause the UserWarning)
+        try:
+            plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        except UserWarning:
+            pass # Ignore warning about incompatible axes (inset_axes)
+        
+        # Clean filename to be safe for filesystem
+        safe_tag = str(name_tag).replace('/', '_').replace('\\', '_')
+        filename_out = f'vis_epoch_{epoch:04d}{suffix}_{safe_tag}.png'
+        out_file = output_dir / filename_out
         plt.savefig(str(out_file))
         plt.close(fig)
 
@@ -583,7 +721,25 @@ class MultimodalValidationDataset(torch.utils.data.Dataset):
              mr_lbl = torch.from_numpy(nib.load(str(mr_lbl_path)).get_fdata()).float().unsqueeze(0)
              sample['target_label'] = mr_lbl
 
+        sample['filename'] = ct_path.name.replace('.nii.gz', '').replace('.nii', '')
         return sample
+
+
+def check_early_stopping(loss_history, patience=20, threshold=0.0, warm_start_steps=10):
+    """
+    Early stopping function.
+    Returns True if training should stop.
+    """
+    if len(loss_history) < warm_start_steps:
+        return False
+
+    best_loss_idx = np.argmin(loss_history)
+    epochs_since_best = len(loss_history) - 1 - best_loss_idx
+
+    if epochs_since_best >= patience:
+        return True
+    
+    return False
 
 
 def train_epoch(
@@ -763,19 +919,19 @@ def validate(
 
 def main():
     parser = argparse.ArgumentParser(description='Train multimodal CT->MR VoxelMorph')
-    parser.add_argument('--ct-dir', type=str, default='classedAbdomenMRCT_norm/train/images/ct', help='CT train images (source)')
-    parser.add_argument('--mr-dir', type=str, default='classedAbdomenMRCT_norm/train/images/mr', help='MR train images (target)')
-    parser.add_argument('--paired-ct-dir', type=str, default='classedAbdomenMRCT_norm/trainPairs/images/ct', help='Paired CT train images (source)')
-    parser.add_argument('--paired-mr-dir', type=str, default='classedAbdomenMRCT_norm/trainPairs/images/mr', help='Paired MR train images (target)')
-    parser.add_argument('--ct-val-dir', type=str, default='classedAbdomenMRCT_norm/val/images/ct', help='Validation CT images')
-    parser.add_argument('--mr-val-dir', type=str, default='classedAbdomenMRCT_norm/val/images/mr', help='Validation MR images')
-    parser.add_argument('--ct-val-label-dir', type=str, default='classedAbdomenMRCT_norm/val/labels/ct', help='Validation CT labels')
-    parser.add_argument('--mr-val-label-dir', type=str, default='classedAbdomenMRCT_norm/val/labels/mr', help='Validation MR labels')
-    parser.add_argument('--ct-test-dir', type=str, default='classedAbdomenMRCT_norm/test/images/ct', help='Test CT images (for monitoring)')
-    parser.add_argument('--mr-test-dir', type=str, default='classedAbdomenMRCT_norm/test/images/mr', help='Test MR images (for monitoring)')
-    parser.add_argument('--ct-test-label-dir', type=str, default='classedAbdomenMRCT_norm/test/labels/ct', help='Test CT labels')
-    parser.add_argument('--mr-test-label-dir', type=str, default='classedAbdomenMRCT_norm/test/labels/mr', help='Test MR labels')
-    parser.add_argument('--output', type=str, default='models/multimodal_vxm.pt', help='Output model path')
+    parser.add_argument('--ct-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/train/images/ct', help='CT train images (source)')
+    parser.add_argument('--mr-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/train/images/mr', help='MR train images (target)')
+    parser.add_argument('--paired-ct-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/trainPairs/images/ct', help='Paired CT train images (source)')
+    parser.add_argument('--paired-mr-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/trainPairs/images/mr', help='Paired MR train images (target)')
+    parser.add_argument('--ct-val-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/val/images/ct', help='Validation CT images')
+    parser.add_argument('--mr-val-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/val/images/mr', help='Validation MR images')
+    parser.add_argument('--ct-val-label-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/val/labels/ct', help='Validation CT labels')
+    parser.add_argument('--mr-val-label-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/val/labels/mr', help='Validation MR labels')
+    parser.add_argument('--ct-test-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/test/images/ct', help='Test CT images (for monitoring)')
+    parser.add_argument('--mr-test-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/test/images/mr', help='Test MR images (for monitoring)')
+    parser.add_argument('--ct-test-label-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/test/labels/ct', help='Test CT labels')
+    parser.add_argument('--mr-test-label-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/test/labels/mr', help='Test MR labels')
+    parser.add_argument('--output', type=str, default='/root/autodl-tmp/models/multimodal_vxm.pt', help='Output model path')
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--workers', type=int, default=8, help='Number of workers')
     parser.add_argument('--steps-per-epoch', type=int, default=100, help='Steps per epoch')
@@ -1046,7 +1202,7 @@ def main():
                  )
 
         # Early stopping check
-        if ne.utils.early_stopping(
+        if check_early_stopping(
             loss_history,
             patience=args.patience,
             threshold=args.threshold,

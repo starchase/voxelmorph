@@ -394,7 +394,7 @@ def disp_to_trf(
     trf_to_disp : Inverse operation.
     """
     if grid is None:
-        num_non_spatial, _ = ne.functional._parse_non_spatial_dims(non_spatial_dims, disp.dim())
+        num_non_spatial, _ = ne.functional.parse_non_spatial_dims(non_spatial_dims, disp.dim())
         spatial_shape = disp.shape[num_non_spatial + 1:]
         grid = ne.volshape_to_ndgrid(
             size=spatial_shape, device=disp.device, dtype=disp.dtype, stack=True
@@ -456,7 +456,7 @@ def trf_to_disp(
     disp_to_trf : Inverse operation.
     """
     if grid is None:
-        num_non_spatial, _ = ne.functional._parse_non_spatial_dims(non_spatial_dims, trf.dim())
+        num_non_spatial, _ = ne.functional.parse_non_spatial_dims(non_spatial_dims, trf.dim())
         spatial_shape = trf.shape[num_non_spatial + 1:]
         grid = ne.volshape_to_ndgrid(
             size=spatial_shape, device=trf.device, dtype=trf.dtype, stack=True
@@ -505,7 +505,7 @@ def disp_to_coords(
     >>> coords.shape
     torch.Size([4, 2, 64, 64])
     """
-    num_non_spatial, num_spatial = ne.functional._parse_non_spatial_dims(
+    num_non_spatial, num_spatial = ne.functional.parse_non_spatial_dims(
         non_spatial_dims=non_spatial_dims,
         tensor_ndim=disp.ndim - 1  # subtract 1 for ndim dimension
     )
@@ -683,7 +683,7 @@ def spatial_transform(
         return image
 
     # Parse image dimensions to understand shape
-    num_non_spatial, num_spatial = ne.functional._parse_non_spatial_dims(
+    num_non_spatial, num_spatial = ne.functional.parse_non_spatial_dims(
         non_spatial_dims, image.ndim
     )
     spatial_shape = image.shape[num_non_spatial:]
@@ -810,7 +810,7 @@ def integrate_disp(
         return disp
 
     # Parse dimensions
-    num_non_spatial, num_spatial = ne.functional._parse_non_spatial_dims(
+    num_non_spatial, num_spatial = ne.functional.parse_non_spatial_dims(
         non_spatial_dims=non_spatial_dims,
         tensor_ndim=disp.ndim - 1  # subtract 1 for ndim dimension
     )
@@ -911,7 +911,7 @@ def resize_disp(
     )
 
     # Parse dimensions
-    num_non_spatial, num_spatial = ne.functional._parse_non_spatial_dims(
+    num_non_spatial, num_spatial = ne.functional.parse_non_spatial_dims(
         non_spatial_dims=non_spatial_dims,
         tensor_ndim=disp.ndim - 1  # subtract 1 for ndim dimension
     )
@@ -1348,7 +1348,7 @@ def random_disp(
     >>> disp.shape
     torch.Size([4, 2, 64, 64])
     """
-    num_non_spatial, num_spatial = ne.functional._parse_non_spatial_dims(
+    num_non_spatial, num_spatial = ne.functional.parse_non_spatial_dims(
         non_spatial_dims=non_spatial_dims,
         tensor_ndim=len(shape)
     )
@@ -1481,7 +1481,7 @@ def random_transform(
     >>> trf.shape
     torch.Size([4, 2, 64, 64])
     """
-    num_non_spatial, num_spatial = ne.functional._parse_non_spatial_dims(
+    num_non_spatial, num_spatial = ne.functional.parse_non_spatial_dims(
         non_spatial_dims=non_spatial_dims,
         tensor_ndim=len(shape)
     )
