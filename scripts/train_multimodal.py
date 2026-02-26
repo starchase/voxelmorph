@@ -163,42 +163,73 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
         # Default: middle slice
         slice_idx = source.shape[4] // 2
         
-        # If labels are available, try to find a slice with most labels (1,2,3,4)
-        lbl_for_search = None
-        if target_label is not None:
-            lbl_for_search = target_label
-        elif source_label is not None:
-            lbl_for_search = source_label
-            
-        if lbl_for_search is not None:
-            # OPTIMIZATION: Computer unique labels per slice on GPU
-            # lbl_for_search: (1, 1, X, Y, Z)
-            # We want to count non-zero unique elements along Z
-            
-            # Simple approach on GPU: Iterate Z slices, but keep data on GPU
+        # Optimization: Find best slice based on Label Richness (Primary) and Dice (Secondary)
+        # Goal: Find slices where CT and MR both have labels, preferring more labels, then better overlap.
+        if source_label is not None and target_label is not None:
+             # GPU-accelerated search for best slice
+            best_score = -1.0
             best_idx = slice_idx
-            max_unique_labels = -1
             
-            D = lbl_for_search.shape[4] # Z dimension
-            
-            # Start search from middle outwards
+            D = target_label.shape[4]
+            # Search from middle outwards
             search_indices = sorted(range(D), key=lambda i: abs(i - slice_idx))
             
             for z in search_indices:
-                # Get slice on GPU
-                slice_data = lbl_for_search[0, 0, :, :, z]
+                # Get slices on GPU
+                s_slice = source_label[0, 0, :, :, z]
+                t_slice = target_label[0, 0, :, :, z]
                 
-                # Check unique elements. torch.unique is supported on GPU
-                unique = torch.unique(slice_data)
+                # Check for content in both
+                if s_slice.sum() == 0 or t_slice.sum() == 0:
+                    continue
+
+                # Unique labels
+                s_uniq = torch.unique(s_slice)
+                t_uniq = torch.unique(t_slice)
+                s_uniq = s_uniq[s_uniq > 0.5] # Exclude bg
+                t_uniq = t_uniq[t_uniq > 0.5] # Exclude bg
                 
-                # Count non-zero labels (> 0.5 to be safe with float)
-                count = (unique > 0.5).sum().item()
+                s_count = len(s_uniq)
+                t_count = len(t_uniq)
                 
-                if count > max_unique_labels:
-                    max_unique_labels = count
+                if s_count == 0 or t_count == 0:
+                    continue
+                
+                # Intersection (Common labels)
+                common_count = 0
+                for lbl in s_uniq:
+                    if (t_uniq == lbl).any():
+                        common_count += 1
+                
+                # Compute Dice for this slice if warped label is available
+                avg_slice_dice = 0.0
+                if warped_label is not None:
+                    w_slice = warped_label[0, 0, :, :, z]
+                    dice_sum = 0.0
+                    dice_n = 0
+                    for lbl in t_uniq:
+                        m1 = (w_slice == lbl)
+                        m2 = (t_slice == lbl)
+                        inter = (m1 & m2).sum().float()
+                        union = m1.sum().float() + m2.sum().float()
+                        if union > 0:
+                            dice_sum += (2.0 * inter / union).item()
+                            dice_n += 1
+                    if dice_n > 0:
+                        avg_slice_dice = dice_sum / dice_n
+
+                # Scoring Formula:
+                # 1. Base Score: Number of common labels (Most important) -> Weight 10
+                # 2. Secondary: Total distinct labels -> Weight 1
+                # 3. Tie-breaker: Dice score -> Weight 0.5 (Max contribution 0.5)
+                # Example: 4 common labels > 3 common labels regardless of Dice
+                # Example: 4 common labels + Dice 0.9 > 4 common labels + Dice 0.8
+                
+                score = (common_count * 10.0) + (s_count + t_count) + (avg_slice_dice * 0.5)
+                
+                if score > best_score:
+                    best_score = score
                     best_idx = z
-                    if max_unique_labels >= 4: # Found all 4
-                        break
             
             slice_idx = best_idx
 
@@ -227,20 +258,17 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
         # Plot - Dynamic Rows setup
         has_labels = (src_lbl_slice is not None) and (tgt_lbl_slice is not None)
         
-        rows = 3 if has_labels else 2
+        # Re-organized Layout: 3 Rows x 4 Cols (12 plots total) to fit Jacobian
+        rows = 3
         cols = 4
-        # Use simple subplots. To ensure uniform image size, we must be careful with colorbars.
-        # We will use ImageGrid or just handle colorbars carefully.
-        # But for simplicity, let's stick to subplots and make the figure larger.
-        fig, axes = plt.subplots(rows, cols, figsize=(20, 5 * rows))
+        fig, axes = plt.subplots(rows, cols, figsize=(20, 15))
         
         # Turn off all axes initially
         for ax in axes.flatten():
             ax.axis('off')
+            
         from matplotlib.colors import ListedColormap
         # Create a custom colormap for up to 4 labels + background
-        # Background should be transparent (alpha=0)
-        # Colors: [Red, Green, Blue, Yellow]
         base_colors = np.array([
             [1, 0, 0, 0.5],   # Label 1: Red
             [0, 1, 0, 0.5],   # Label 2: Green
@@ -250,207 +278,209 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
             [1, 0, 1, 0.5],   # Label 6: Magenta
         ])
         
-        def plot_multi_label(ax, bg_img, label_img, title):
-            ax.imshow(bg_img, cmap='gray')
-            if label_img is not None:
-                 # Mask out background (0)
-                 masked_lbl = np.ma.masked_where(label_img < 0.5, label_img)
-                 # We want discrete colors for integer labels 1, 2, 3, 4
-                 # Normalize max label to fit color map indices?
-                 # Simple approach: float overlay
-                 ax.imshow(masked_lbl, cmap='tab10', alpha=0.5, interpolation='nearest', vmin=1, vmax=10)
-            ax.set_title(title)
-            ax.axis('off')
-
-        # Row 1: Basic Images
-        # 1. Moving
-        axes[0, 0].imshow(src_slice, cmap='gray')
-        axes[0, 0].set_title('Moving')
-        axes[0, 0].axis('off')
+        # --- Row 1: Differences & Grid ---
         
-        # 2. Fixed
-        axes[0, 1].imshow(tgt_slice, cmap='gray')
-        axes[0, 1].set_title('Fixed')
-        axes[0, 1].axis('off')
-        
-        # 3. Warp
-        axes[0, 2].imshow(warped_slice, cmap='gray')
-        axes[0, 2].set_title('Deformed')
-        axes[0, 2].axis('off')
-
-        # 4. Moving - Fixed
+        # 1. [0,0] Diff: Moving - Fixed
         diff_moving_fixed = src_slice - tgt_slice
-        im_diff1 = axes[0, 3].imshow(diff_moving_fixed, cmap='bwr', vmin=-1, vmax=1)
-        axes[0, 3].set_title('Source - Target')
-        axes[0, 3].axis('off')
-        fig.colorbar(im_diff1, ax=axes[0, 3], fraction=0.046, pad=0.04)
+        im_diff1 = axes[0, 0].imshow(diff_moving_fixed, cmap='bwr', vmin=-1, vmax=1)
+        axes[0, 0].set_title('Diff: Source - Target')
+        axes[0, 0].axis('off')
 
-        # Row 2: Advanced Analysis
-        
-        # 5. Deformed Grid
+        # 2. [0,1] Diff: Deformed - Target
+        diff_warp_fixed = warped_slice - tgt_slice
+        im_diff2 = axes[0, 1].imshow(diff_warp_fixed, cmap='bwr', vmin=-1, vmax=1)
+        axes[0, 1].set_title('Diff: Deformed - Target')
+        axes[0, 1].axis('off')
+
+        # 3. [0,2] Deformed Grid
+
         # Get dimensions from slice
         H, W = src_slice.shape
         # Create a regular grid
         grid_spacing = 10
         xx, yy = np.meshgrid(np.arange(0, W, grid_spacing), np.arange(0, H, grid_spacing))
-        # Get displacement for this slice (need to correspond to Meshgrid usage)
-        # displacement shape is (1, 3, Dim0, Dim1, Dim2). We need 2D vectors on the last dimension slice.
-        # Spatial dims are indices 2, 3, 4. We want to slice index 4.
         
-        # d_slice should be taken from the same slice index we determined above
-        raw_d_slice = displacement.detach().cpu().numpy()[0, :, :, :, slice_idx] # (3, Dim0, Dim1)
-        
-        # Rotate spatial dimensions to align with image visualization (np.rot90 on axes 0,1 of image)
-        # raw_d_slice has channels at axis 0. So we rotate axes 1 and 2.
+        # d_slice indices: 0=Z, 1=Y, 2=X
+        raw_d_slice = displacement.detach().cpu().numpy()[0, :, :, :, slice_idx] 
         d_slice = np.rot90(raw_d_slice, axes=(1, 2))
         
-        # Note on orientation: Matplotlib imshow origin is 'upper'. 
-        # Grid: xx is col index (X), yy is row index (Y).
-        # d_slice[2] is X-displacement, d_slice[1] is Y-displacement.
-        
-        # Warped grid positions
-        # We sample displacement at grid points
-        # Simple nearest sampling for visualization
-        # Note: d_slice is (3, H, W). 
-        dx_grid = d_slice[2, ::grid_spacing, ::grid_spacing]
-        dy_grid = d_slice[1, ::grid_spacing, ::grid_spacing]
-        
-        # Add displacement to original grid
-        # Note: VoxelMorph fields are usually 'pull' fields (map target to source)
-        # To visualize 'push' (source to target) geometry simply, we can just subtract flow 
-        # or just plot the grid lines modified by flow.
-        # Standard 'Deformed Grid' usually shows how a regular grid on Target maps back to Source.
-        
-        axes[1, 0].imshow(np.zeros_like(src_slice), cmap='gray', vmin=0, vmax=1) # Black background
-        # Plot vertical lines (using dense sampling for smooth curves)
+        axes[0, 2].imshow(np.zeros_like(src_slice), cmap='gray', vmin=0, vmax=1) # Black background
+        # Plot vertical lines
         for i in range(0, W, grid_spacing):
-            # x is constant i, y varies 0..H
-            # d_slice[2, :, i] is X-displacement along the vertical line at x=i
-            # d_slice[1, :, i] is Y-displacement along the vertical line at x=i
-            # Check bounds
             if i < d_slice.shape[2]:
                 x_plot = i + d_slice[2, :, i]
                 y_plot = np.arange(H) + d_slice[1, :, i]
-                axes[1, 0].plot(x_plot, y_plot, 'w-', linewidth=0.8, alpha=0.9) # White lines
+                axes[0, 2].plot(x_plot, y_plot, 'w-', linewidth=0.8, alpha=0.9)
             
-        # Plot horizontal lines (using dense sampling)
+        # Plot horizontal lines
         for j in range(0, H, grid_spacing):
-            # y is constant j, x varies 0..W
-            # d_slice[2, j, :] is X-displacement along the horizontal line at y=j
-            # d_slice[1, j, :] is Y-displacement along the horizontal line at y=j
             if j < d_slice.shape[1]:
                 x_plot = np.arange(W) + d_slice[2, j, :]
                 y_plot = j + d_slice[1, j, :]
-                axes[1, 0].plot(x_plot, y_plot, 'w-', linewidth=0.8, alpha=0.9) # White lines
+                axes[0, 2].plot(x_plot, y_plot, 'w-', linewidth=0.8, alpha=0.9)
             
-        axes[1, 0].set_title('Deformed Grid')
-        axes[1, 0].set_ylim(H, 0) # Flip Y to match image coordinates
-        axes[1, 0].set_xlim(0, W)
-        axes[1, 0].axis('off')
+        axes[0, 2].set_title('Deformed Grid')
+        axes[0, 2].set_ylim(H, 0)
+        axes[0, 2].set_xlim(0, W)
+        axes[0, 2].axis('off')
 
-        # Create HSV image
-        # Standard flow visualization:
-        # Hue = direction (0..1)
-        # Saturation = magnitude (0..1)
-        # Value = 1.0 (constant bright)
+        # 4. [0,3] Jacobian Determinant
+        # Calculate Jacobian determinant of the displacement field
+        # displacement is (1, 3, D, H, W)
+        # We need to compute spatial gradients.
+        # VoxelMorph provides a utility for this, or we can do it manually.
+        # Let's use numpy gradient on the 3D displacement field, then slice it.
+        disp_np = displacement.detach().cpu().numpy()[0] # (3, D, H, W)
         
-        from matplotlib.colors import hsv_to_rgb
+        # Compute gradients along spatial dimensions (D, H, W)
+        # np.gradient returns a list of arrays, one for each dimension.
+        # We want gradients of each component (x, y, z) with respect to each spatial dimension.
+        # disp_np[0] is Z displacement, disp_np[1] is Y, disp_np[2] is X
+        # Spatial dims are 0:Z, 1:Y, 2:X
         
-        # Calculate magnitude and angle
-        # d_slice indices: 0=Z, 1=Y, 2=X
-        dx = d_slice[2]
-        dy = d_slice[1]
+        # Gradients of Z displacement
+        dz_dz, dz_dy, dz_dx = np.gradient(disp_np[0])
+        # Gradients of Y displacement
+        dy_dz, dy_dy, dy_dx = np.gradient(disp_np[1])
+        # Gradients of X displacement
+        dx_dz, dx_dy, dx_dx = np.gradient(disp_np[2])
         
-        mag = np.sqrt(dx**2 + dy**2)
-        angle = np.arctan2(dy, dx)
+        # Jacobian matrix J = I + \nabla u
+        # J = [[1 + dx_dx, dx_dy, dx_dz],
+        #      [dy_dx, 1 + dy_dy, dy_dz],
+        #      [dz_dx, dz_dy, 1 + dz_dz]]
         
-        # Normalize magnitude for saturation
-        # Clip outliers to visualize variations better
-        p99 = np.percentile(mag, 99) + 1e-5
-        mag_norm = np.clip(mag / p99, 0, 1)
+        # Compute determinant
+        jac_det = ( (1 + dx_dx) * ((1 + dy_dy) * (1 + dz_dz) - dy_dz * dz_dy)
+                  - dx_dy * (dy_dx * (1 + dz_dz) - dy_dz * dz_dx)
+                  + dx_dz * (dy_dx * dz_dy - (1 + dy_dy) * dz_dx) )
+                  
+        # Extract the slice
+        jac_slice = jac_det[:, :, slice_idx]
+        # Rotate to match image orientation
+        jac_slice = np.rot90(jac_slice)
+        
+        # Create RGB image for Jacobian visualization
+        # Red: Jac < 0 (Folding)
+        # Green: 0 < Jac < 1 (Contraction)
+        # Blue: Jac > 1 (Expansion)
+        jac_vis = np.zeros((H, W, 3), dtype=np.float32)
+        
+        # Define colors
+        color_red = np.array([1.0, 0.0, 0.0])
+        color_green = np.array([0.4, 0.8, 0.4]) # Slightly muted green for better visibility
+        color_blue = np.array([0.4, 0.6, 0.9])  # Slightly muted blue
+        
+        # Apply colors based on conditions
+        jac_vis[jac_slice < 0] = color_red
+        jac_vis[(jac_slice >= 0) & (jac_slice <= 1)] = color_green
+        jac_vis[jac_slice > 1] = color_blue
+        
+        axes[0, 3].imshow(jac_vis)
+        axes[0, 3].set_title('Jacobian Determinant')
+        axes[0, 3].axis('off')
 
-        hsv = np.zeros((H, W, 3), dtype=np.float32)
+        # --- Row 2: Flow & Legend ---
 
-        # --- Plot 6: RGB Displacement Field with 3D Axis Legend ---
-        # Normalize flow for visualization: Map X->Red, Y->Green, Z->Blue
-        # d_slice indices: 0=Z, 1=Y, 2=X
-        dx = d_slice[2]
-        dy = d_slice[1]
-        dz = d_slice[0]
-        
-        # Calculate max magnitude for normalization
+        # 5. [1,0] RGB Displacement
+        # Normalize flow for visualization
+        dx, dy, dz = d_slice[2], d_slice[1], d_slice[0]
         max_mag = np.max(np.abs(d_slice)) + 1e-5
         
-        # Create RGB image
-        # Center 0 displacement at 0.5 (Gray) to show positive/negative direction
-        # Mapping: [-max, max] -> [0, 1]
         flow_vis = np.zeros((H, W, 3), dtype=np.float32)
         flow_vis[..., 0] = (dx / (2 * max_mag)) + 0.5 # X -> R
         flow_vis[..., 1] = (dy / (2 * max_mag)) + 0.5 # Y -> G
         flow_vis[..., 2] = (dz / (2 * max_mag)) + 0.5 # Z -> B
-        
-        # Clip to ensure valid range
         flow_vis = np.clip(flow_vis, 0, 1)
         
-        # Display the flow
-        axes[1, 1].imshow(flow_vis)
-        axes[1, 1].set_title('RGB Displacement', color='black') # Default color
-        axes[1, 1].axis('off')
+        axes[1, 0].imshow(flow_vis)
+        axes[1, 0].set_title('RGB Displacement')
+        axes[1, 0].axis('off')
 
-        # Add legend if this is a test set image
-        if 'test' in suffix:
-            # We now use a dedicated subplot for the legend (axes[1, 2])
-            pass
+        from matplotlib.colors import hsv_to_rgb
 
-        # 7. Warp - Fixed
-        diff_warp_fixed = warped_slice - tgt_slice
-        # Move to position [1, 3] (was [1, 2])
-        im_diff2 = axes[1, 3].imshow(diff_warp_fixed, cmap='bwr', vmin=-1, vmax=1)
-        axes[1, 3].set_title('Deformed - Target')
-        axes[1, 3].axis('off')
-        # Create colorbar axis adjacent to image or just inset
-        from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-        cax = inset_axes(axes[1, 3], width="5%", height="100%", loc='center right', borderpad=-1.5)
-        fig.colorbar(im_diff2, cax=cax)
+        # 6. [1,1] 3D Legend (Center)
+        # Note: We skip the HSV mag/angle calculation code from original
+        # as we are plotting RGB flow directly.
 
-        # 8. RGB Flow Legend (Using the empty spot at [1, 2] since Edges removed)
-        # We removed "Edges" ([1, 3] originally), moved Diff2 to [1, 3].
-        
-        ax_legend_spot = axes[1, 2]
+        ax_legend_spot = axes[1, 1]
         ax_legend_spot.clear() # Clear any previous content
         ax_legend_spot.axis('off')
-        ax_legend_spot.set_xlim(0, 1)
-        ax_legend_spot.set_ylim(0, 1)
-        
-        # Draw Arrows at center of this subplot
-        # Y axis (Green) - pointing Down visually to match image coordinates
-        ax_legend_spot.arrow(0.5, 0.7, 0, -0.4, head_width=0.05, head_length=0.05, fc='lime', ec='lime', width=0.01)
-        ax_legend_spot.text(0.5, 0.2, 'Y', color='lime', ha='center', va='top', fontweight='bold', fontsize=12)
+        # Set aspect equal to ensure circular color wheel
+        ax_legend_spot.set_aspect('equal')
+        ax_legend_spot.set_xlim(-1.2, 1.2)
+        ax_legend_spot.set_ylim(-1.2, 1.2)
 
-        # X axis (Red) - pointing Right
-        ax_legend_spot.arrow(0.5, 0.7, 0.4, 0, head_width=0.05, head_length=0.05, fc='red', ec='red', width=0.01)
-        ax_legend_spot.text(0.95, 0.7, 'X', color='red', ha='left', va='center', fontweight='bold', fontsize=12)
+        # Draw RGB Color Wheel
+        # Fixed Standard Color Wheel (Direction Legend)
+        # Explicitly ignore flow magnitude for the wheel itself
         
-        # Z axis (Blue) - Dot
-        ax_legend_spot.plot(0.5, 0.7, 'o', color='blue', markersize=15)
-        ax_legend_spot.text(0.45, 0.75, 'Z', color='blue', ha='right', va='bottom', fontweight='bold', fontsize=12)
+        # Use simple polar loop to draw segments or a mesh
+        # Make the wheel smaller: r from 0.12 to 0.12
+        x_wheel = np.linspace(-0.12, 0.12, 100) 
+        y_wheel = np.linspace(-0.12, 0.12, 100)
+        XW, YW = np.meshgrid(x_wheel, y_wheel)
+        RW = np.sqrt(XW**2 + YW**2)
+        TW = np.arctan2(YW, XW)
+        TW[TW < 0] += 2*np.pi
         
-        # Add Range Text
-        range_text = f"Displacement\nRange:\n[-{max_mag:.1f}, {max_mag:.1f}]"
-        ax_legend_spot.text(0.5, 0.9, range_text, ha='center', va='center', fontsize=12, fontweight='bold', color='black')
+        HW = TW / (2*np.pi)
+        SW = np.ones_like(HW)
+        VW = np.ones_like(HW)
+        # Create mask for ring - Make it smaller/thinner? 
+        # User said "光圈图例改成实心的，中间的白色去掉" (solid circle, remove white center). 
+        # Let's make outer radius 0.12, inner 0.0
+        mask = (RW <= 0.12)
+        
+        HSV_W = np.stack((HW, SW, VW), axis=-1)
+        RGB_W = hsv_to_rgb(HSV_W)
+        # Apply alpha channel for mask
+        RGBA_W = np.concatenate([RGB_W, mask[..., None].astype(float)], axis=-1)
+        
+        # Extent matches the meshgrid range
+        ax_legend_spot.imshow(RGBA_W, extent=[-0.12, 0.12, -0.12, 0.12], origin='lower')
 
-        # Row 3: Label Analysis
+        # Draw 3D Axes - Keep consistent
+        # Origin
+        o_x, o_y = 0, 0
+        
+        # Perspective projection manually:
+        # X: right-down
+        # Y: left-down
+        # Z: up
+        
+        # Vectors (x, y components for 2D plot)
+        # Adjust these angles to match the 3D look in example
+        vec_x = np.array([0.5, -0.2])  # Right and slightly down
+        vec_y = np.array([-0.4, -0.25]) # Left and slightly down
+        vec_z = np.array([0.0, 0.5])   # Up
+        
+        # Increase arrow length by 30% (0.24 * 1.3 = 0.312)
+        scale = 0.312
+        
+        # Draw Arrows
+        ax_legend_spot.arrow(o_x, o_y, vec_x[0]*scale, vec_x[1]*scale, head_width=0.024, head_length=0.03, fc='black', ec='black')
+        ax_legend_spot.arrow(o_x, o_y, vec_y[0]*scale, vec_y[1]*scale, head_width=0.024, head_length=0.03, fc='black', ec='black')
+        ax_legend_spot.arrow(o_x, o_y, vec_z[0]*scale, vec_z[1]*scale, head_width=0.024, head_length=0.03, fc='black', ec='black')
+        
+        # Labels
+        # Offset labels slightly from arrow tips (increase distance)
+        ax_legend_spot.text(vec_x[0]*scale*1.6, vec_x[1]*scale*1.6, 'x', fontweight='bold', fontsize=16, ha='center', va='center')
+        ax_legend_spot.text(vec_y[0]*scale*1.6, vec_y[1]*scale*1.6, 'y', fontweight='bold', fontsize=16, ha='center', va='center')
+        ax_legend_spot.text(vec_z[0]*scale*1.6, vec_z[1]*scale*1.4, 'z', fontweight='bold', fontsize=16, ha='center', va='bottom')
+        
+        # Add Range Text at bottom
+        range_text = f"[{ -max_mag:.2f}, {max_mag:.2f}]"
+        ax_legend_spot.text(0, -0.35, range_text, ha='center', va='center', fontsize=16, fontweight='bold', color='black')
+
+        # 7. [1,2] Overlay Warped Label on Target Image (Result vs GT)
         if has_labels:
-            # Color definitions
-            # 5 distinct hues.
-            # Base colors for fixed (GT) labels - Deep/Dark saturated colors for clear visibility on grey
-            # 1: Liver, 2: Spleen, 3: R-Kidney, 4: L-Kidney
-            # Deep/Dark saturated colors for clear visibility on grey
+             # Color definitions
             base_colors = {
                 1: '#8B0000', # Dark Red (Liver)
-                2: '#006400', # Dark Green (Spleen)
+                2: '#228B22', # Forest Green (Spleen) - Brighter than Dark Green
                 3: '#4682B4', # Steel Blue (R-Kidney) - Lighter/Darker Blue mix, easier to see than Dark Blue
-                4: '#B8860B', # Dark Goldenrod (L-Kidney) - Darker but related to yellow/gold
+                4: '#DAA520', # Goldenrod (L-Kidney) - Brighter than Dark Goldenrod
                 5: '#008B8B'  # Dark Cyan
             }
             # Bright colors for moving/warped (source/pred) labels - Standard colors, closer to Base than Neon
@@ -461,59 +491,112 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
                 4: '#FFD700', # Gold
                 5: '#00FFFF'  # Cyan
             }
-            
-            def plot_label_contour(ax, bg_img, label_img, title, color_lookup):
+            # Dark colors for text to ensure readability
+            text_colors = {
+                1: '#A52A2A', # Brown/Red (Higher saturation than 660000)
+                2: '#2E8B57', # Sea Green (Higher saturation than 1A521A)
+                3: '#4682B4', # Steel Blue (Lower saturation than Royal Blue)
+                4: '#CD853F', # Peru/Golden (Higher saturation than 8B6914)
+                5: '#20B2AA'  # Light Sea Green (Higher saturation than 005C5C)
+            }
+        
+        axes[1, 2].imshow(warped_slice, cmap='gray')
+        
+        if has_labels and tgt_lbl_slice is not None and warped_lbl_slice is not None:
+             unique_labels = np.unique(np.concatenate([tgt_lbl_slice, warped_lbl_slice]))
+             unique_labels = unique_labels[unique_labels > 0]
+             
+             # Calculate total width needed for horizontal layout
+             num_labels = len(unique_labels)
+             
+             dice_results = []
+             for lbl in unique_labels:
+                 mask_tgt = (tgt_lbl_slice == lbl)
+                 c_base = base_colors.get(int(lbl), 'white')
+                 if np.any(mask_tgt):
+                     # Solid line for GT (Target)
+                     axes[1, 2].contour(mask_tgt, colors=[c_base], linewidths=1.5, linestyles='solid')
+                     
+                 mask_warp = (warped_lbl_slice == lbl)
+                 c_bright = bright_colors.get(int(lbl), 'white')
+                 if np.any(mask_warp):
+                     # Solid line for Prediction
+                     axes[1, 2].contour(mask_warp, colors=[c_bright], linewidths=1.5, linestyles='solid')
+                     
+                 # Calculate and display Dice
+                 intersection = np.logical_and(mask_warp, mask_tgt).sum()
+                 union = mask_warp.sum() + mask_tgt.sum()
+                 if union > 0:
+                     dice = 2.0 * intersection / union
+                     c_text = text_colors.get(int(lbl), 'white')
+                     dice_results.append((dice, c_text))
+             
+             # Sort by dice descending
+             dice_results.sort(key=lambda x: x[0], reverse=True)
+             
+             spacing = 0.20 # Increased spacing
+             total_text_width = len(dice_results) * spacing
+             x_offset = (1.0 - total_text_width) / 2.0 + spacing / 2.0
+             
+             for dice, color in dice_results:
+                 axes[1, 2].text(x_offset, 0.02, f'{dice:.2f}', color=color, transform=axes[1, 2].transAxes, fontsize=24, fontweight='bold', ha='center')
+                 x_offset += spacing
+
+        axes[1, 2].set_title('Result vs GT')
+        axes[1, 2].axis('off')
+        
+        # 8. [1,3] Empty or something else
+        axes[1, 3].axis('off')
+
+        # --- Row 3: Label Overlays (Individual) ---
+        if has_labels:
+            def plot_label_contour(ax, bg_img, label_img, title, color_lookup, target_img=None):
                 ax.imshow(bg_img, cmap='gray')
                 if label_img is not None:
-                     unique_labels = np.unique(label_img)
+                     if target_img is not None:
+                         unique_labels = np.unique(np.concatenate([label_img, target_img]))
+                     else:
+                         unique_labels = np.unique(label_img)
                      unique_labels = unique_labels[unique_labels > 0]
+                     
+                     dice_results = []
                      for lbl in unique_labels:
                          mask = (label_img == lbl)
                          c = color_lookup.get(int(lbl), 'white')
                          if np.any(mask):
                              ax.contour(mask, colors=[c], linewidths=1.2)
+                             
+                         if target_img is not None:
+                             mask_tgt = (target_img == lbl)
+                             intersection = np.logical_and(mask, mask_tgt).sum()
+                             union = mask.sum() + mask_tgt.sum()
+                             if union > 0:
+                                 dice = 2.0 * intersection / union
+                                 c_text = text_colors.get(int(lbl), 'white')
+                                 dice_results.append((dice, c_text))
+                     
+                     if dice_results:
+                         dice_results.sort(key=lambda x: x[0], reverse=True)
+                         spacing = 0.20 # Increased spacing
+                         total_text_width = len(dice_results) * spacing
+                         x_offset = (1.0 - total_text_width) / 2.0 + spacing / 2.0
+                         
+                         for dice, color in dice_results:
+                             ax.text(x_offset, 0.02, f'{dice:.2f}', color=color, transform=ax.transAxes, fontsize=24, fontweight='bold', ha='center')
+                             x_offset += spacing
                 ax.set_title(title)
                 ax.axis('off')
 
-            # 9. Source + Label Overlay (Contour, Bright)
-            plot_label_contour(axes[2, 0], src_slice, src_lbl_slice, 'Source + Labels', bright_colors)
+            # 9. [2,0] Source + Labels
+            plot_label_contour(axes[2, 0], src_slice, src_lbl_slice, 'Source + Labels', bright_colors, target_img=tgt_lbl_slice)
             
-            # 10. Target + Label Overlay (Contour, Base)
+            # 10. [2,1] Target + Labels
             plot_label_contour(axes[2, 1], tgt_slice, tgt_lbl_slice, 'Target + Labels', base_colors)
             
-            # 11. Warped Source + Warped Label (Contour, Bright - same as Source)
-            plot_label_contour(axes[2, 2], warped_slice, warped_lbl_slice, 'Deformed + Deformed Labels', bright_colors)
+            # 11. [2,2] Warped Source + Warped Labels
+            plot_label_contour(axes[2, 2], warped_slice, warped_lbl_slice, 'Deformed + Labels', bright_colors, target_img=tgt_lbl_slice)
             
-            # 12. Overlay Warped Label on Target Image
-            # Logic: Show Warped Image (Result) in Gray. 
-            # Show Target Labels (GT) as contours (Base Colors, Dashed).
-            # Show Warped Labels (Pred) as contours (Bright Colors, Solid).
-            axes[2, 3].imshow(warped_slice, cmap='gray')
-            
-            # Ground Truth Contours
-            if tgt_lbl_slice is not None:
-                 unique_labels = np.unique(tgt_lbl_slice)
-                 unique_labels = unique_labels[unique_labels > 0]
-                 for lbl in unique_labels:
-                     mask = (tgt_lbl_slice == lbl)
-                     c = base_colors.get(int(lbl), 'white')
-                     if np.any(mask):
-                         # Dashed line for GT (Target)
-                         # Increase dash spacing via linestyles tuple (offset, (on_off_seq))
-                         # 'dashed' is roughly (0, (5, 5)). Let's make it distinct.
-                         axes[2, 3].contour(mask, colors=[c], linewidths=1.5, linestyles='dashed')
-            
-            # Prediction Contours
-            if warped_lbl_slice is not None:
-                 unique_labels = np.unique(warped_lbl_slice)
-                 unique_labels = unique_labels[unique_labels > 0]
-                 for lbl in unique_labels:
-                     mask = (warped_lbl_slice == lbl)
-                     c = bright_colors.get(int(lbl), 'white')
-                     if np.any(mask):
-                         axes[2, 3].contour(mask, colors=[c], linewidths=1.5, linestyles='solid')
-
-            axes[2, 3].set_title('Deformed Image + Target(Dash) & Deformed(Solid)')
+            # 12. [2,3] Empty
             axes[2, 3].axis('off')
 
         plt.suptitle(f'Epoch {epoch} - Sample {name_tag} (Slice Z={slice_idx})', fontsize=16)
