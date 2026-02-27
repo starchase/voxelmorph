@@ -13,6 +13,7 @@ import os
 import time
 from pathlib import Path
 from typing import Sequence, List
+import scipy.ndimage
 
 # Set allocator to avoid fragmentation issues
 os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
@@ -38,7 +39,7 @@ class MultimodalTrainDataset(torch.utils.data.Dataset):
     def __init__(self, ct_dir: str, mr_dir: str, paired_ct_dir: str = None, paired_mr_dir: str = None, device: str = 'cpu', unpaired: bool = True, max_samples: int = 100):
         self.ct_dir = Path(ct_dir)
         self.mr_dir = Path(mr_dir)
-        self.device = device
+        # self.device = device # Don't move to GPU in dataset, do it in training loop
         self.max_samples = max_samples if max_samples is not None else 100
         
         # 1. Load Unpaired Pool
@@ -128,6 +129,8 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
             sample = dataset[i]
             # Use filename as tag if available
             tag = sample.get('filename', f'{i:04d}')
+            
+            # Plot all cases
             samples_to_plot.append((tag, sample))
     else:
         # Default behavior for validation: Index 0 and Best Dice
@@ -838,32 +841,41 @@ def train_epoch(
     model.train()
     total_loss = 0.0
     num_steps = 0
+    
+    # Optimization: Use Mixed Precision (AMP)
+    # Update for newer PyTorch versions: use torch.amp instead of torch.cuda.amp
+    scaler = torch.amp.GradScaler('cuda', enabled=(device=='cuda'))
 
     # Iterate through the entire dataloader (all 1500+ pairs if unpaired)
     # The dataloader is now a finite Map-style Dataset, not an infinite Iterable
     for batch in tqdm(dataloader, desc="Training Batch"):
         optimizer.zero_grad()
 
-        source = batch['source'].to(device)
-        target = batch['target'].to(device)
+        source = batch['source'].to(device, non_blocking=True)
+        target = batch['target'].to(device, non_blocking=True)
 
-        displacement, warped_source = model(
-            source,
-            target,
-            return_warped_source=True,
-            return_field_type='displacement'
-        )
+        with torch.amp.autocast('cuda', enabled=(device=='cuda')):
+            displacement, warped_source = model(
+                source,
+                target,
+                return_warped_source=True,
+                return_field_type='displacement'
+            )
 
-        if isinstance(image_loss_fn, ne.nn.modules.NCC):
-            img_loss = -image_loss_fn(target, warped_source)
-        else:
-            img_loss = image_loss_fn(target, warped_source)
+            if isinstance(image_loss_fn, ne.nn.modules.NCC):
+                img_loss = -image_loss_fn(target, warped_source)
+            else:
+                img_loss = image_loss_fn(target, warped_source)
+            
+            grad_loss = grad_loss_fn(displacement)
+
+            loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
         
-        grad_loss = grad_loss_fn(displacement)
+        # Optimization: Scaled Backward
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
-        loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
-        loss.backward()
-        optimizer.step()
         total_loss += loss.item()
         # Track components for debugging
         # Note: We need to detach to avoid accumulation
@@ -874,37 +886,79 @@ def train_epoch(
     return total_loss / num_steps, img_loss.item(), grad_loss.item()
 
 
+def compute_hd95(ground_truth, prediction, spacing=None):
+    """
+    Compute 95th Hausdorff Distance between two binary masks.
+    Attempts to mimic MedPy's behavior using scipy.
+    """
+    if ground_truth.sum() == 0 or prediction.sum() == 0:
+        return np.nan
+
+    # Get boundaries
+    # boundary = mask ^ erosion(mask)
+    pred_border = prediction ^ scipy.ndimage.binary_erosion(prediction)
+    gt_border = ground_truth ^ scipy.ndimage.binary_erosion(ground_truth)
+    
+    # If using voxel spacing, we pass it to distance_transform_edt
+    # sampling arg exists in scipy >= 1.6.0
+    
+    # Compute Distance Transform on the INVERSE of the boundary
+    # dt[x] = distance from x to nearest boundary point
+    dt_gt = scipy.ndimage.distance_transform_edt(~gt_border, sampling=spacing)
+    dt_pred = scipy.ndimage.distance_transform_edt(~pred_border, sampling=spacing)
+
+    # Distances from Prediction boundary to nearest GT boundary point
+    dist_pred_to_gt = dt_gt[pred_border]
+    # Distances from GT boundary to nearest Prediction boundary point
+    dist_gt_to_pred = dt_pred[gt_border]
+    
+    if len(dist_pred_to_gt) == 0 or len(dist_gt_to_pred) == 0:
+        return np.nan
+
+    # HD95 is typically the 95th percentile of the distances
+    # Definition varies: some implementations take the 95th percentile of all distances (A->B and B->A)
+    # MedPy hd95: "The 95th percentile of the Hausdorff Distance."
+    # It calculates the 95th percentile of the set of all minimum distances.
+    # Usually it's max( percentile(A->B, 95), percentile(B->A, 95) )
+    
+    hd95_pred_to_gt = np.percentile(dist_pred_to_gt, 95)
+    hd95_gt_to_pred = np.percentile(dist_gt_to_pred, 95)
+    
+    return max(hd95_pred_to_gt, hd95_gt_to_pred)
+
+
 def validate(
     model: nn.Module,
     dataloader: torch.utils.data.DataLoader,
     image_loss_fn: nn.Module,
     grad_loss_fn: nn.Module,
     loss_weights: Sequence[float],
-    device: str = 'cuda'
+    device: str = 'cuda',
+    fast: bool = False  # Optimization: Skip slow metrics
 ):
-    """Run validation on a fixed dataset. Returns avg_loss, avg_dice, avg_time, avg_neg_jac.
-       Also returns the index of the sample with the best Dice score."""
+    """
+    Run lightweight validation for model selection.
+    Returns: avg_loss, avg_dice, avg_hd95, avg_time, avg_jac, avg_mag
+    """
     model.eval()
     total_loss = 0.0
     total_dice = 0.0
+    total_hd95 = 0.0 
     total_time = 0.0
     total_neg_jac = 0.0
-    total_mag = 0.0  # magnitude of deformation
+    total_mag = 0.0
+    
     num_batches = 0
     num_dice_batches = 0
+    num_hd95_batches = 0
     num_jac_batches = 0
     
-    best_dice = -1.0
-    best_dice_idx = None
-    # Keep track of global index
-    current_idx_offset = 0
-
+    # Optimization: Pre-fetch to GPU
     with torch.no_grad():
         for batch in dataloader:
-            source = batch['source'].to(device)
-            target = batch['target'].to(device)
+            source = batch['source'].to(device, non_blocking=True)
+            target = batch['target'].to(device, non_blocking=True)
 
-            # Measure inference time
             start_time = time.time()
             if device == 'cuda':
                 torch.cuda.synchronize()
@@ -920,84 +974,310 @@ def validate(
                 torch.cuda.synchronize()
             end_time = time.time()
             
-            # Calculate mean deformation magnitude
-            # displacement shape: (B, C, D, H, W)
+            # 1. Metrics: Magnitude
             disp_mag = torch.sqrt(torch.sum(displacement ** 2, dim=1))
             total_mag += disp_mag.mean().item()
 
-            # Time per batch
+            # 2. Time
             batch_time = end_time - start_time
-            # Normalize by batch size to get sec/volume (optional, but requested per image usually)
-            # Keeping per batch for now, will divide by total volumes later if needed, 
-            # but standard is usually seconds per inference call. 
-            # User asks for "GPU sec", usually means per volume time.
             total_time += (batch_time / source.shape[0])
             
+            # 3. Loss
             if isinstance(image_loss_fn, ne.nn.modules.NCC):
                 img_loss = -image_loss_fn(target, warped_source)
             else:
                 img_loss = image_loss_fn(target, warped_source)
-            
             grad_loss = grad_loss_fn(displacement)
-
             loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
             total_loss += loss.item()
             num_batches += 1
 
-            # Jacobian Determinant
-            # Displacement is (B, C, D, H, W) -> need (D, H, W, C) for utils
-            disp_np = displacement.detach().cpu().numpy()
-            disp_np = np.transpose(disp_np, (0, 2, 3, 4, 1))
-            
-            batch_neg_jac = 0.0
-            for i in range(disp_np.shape[0]):
-                jac_det = vxm.py.utils.jacobian_determinant(disp_np[i])
-                # Count non-positive
-                batch_neg_jac += np.sum(jac_det <= 0) / np.prod(jac_det.shape)
-            
-            total_neg_jac += (batch_neg_jac / disp_np.shape[0])
-            num_jac_batches += 1
-
-            # Compute Dice if labels validation is available
-            if 'source_label' in batch and 'target_label' in batch:
-                source_label = batch['source_label'].to(device)
-                target_label = batch['target_label'].to(device)
+            if not fast:
+                # 4. Jacobian (Slow: CPU Transfer + Numpy)
+                disp_np = displacement.detach().cpu().numpy()
+                disp_np = np.transpose(disp_np, (0, 2, 3, 4, 1))
+                target_np = batch['target'].detach().cpu().numpy() # Use original batch valid target
                 
-                # Warping labels using Nearest Neighbor interpolation
-                # SpatialTransformer in this version does not take size in __init__, but behaves dynamically.
-                # It takes interpolation_mode as 'nearest' for labels.
+                batch_neg_jac = 0.0
+                for i in range(disp_np.shape[0]):
+                    jac_det = vxm.py.utils.jacobian_determinant(disp_np[i])
+                    mask = target_np[i, 0] > 0.01
+                    if jac_det.shape != mask.shape:
+                        diff = np.array(mask.shape) - np.array(jac_det.shape)
+                        d_start, h_start, w_start = diff // 2
+                        d_end = mask.shape[0] - (diff[0] - d_start)
+                        h_end = mask.shape[1] - (diff[1] - h_start)
+                        w_end = mask.shape[2] - (diff[2] - w_start)
+                        mask = mask[d_start:d_end, h_start:h_end, w_start:w_end]
+
+                    valid_mask_sum = np.sum(mask)
+                    if valid_mask_sum > 0:
+                        batch_neg_jac += np.sum((jac_det <= 0) & mask) / valid_mask_sum
+                
+                total_neg_jac += (batch_neg_jac / disp_np.shape[0])
+                num_jac_batches += 1
+
+            # 5. Dice & HD95
+            if 'source_label' in batch and 'target_label' in batch:
+                source_label = batch['source_label'].to(device, non_blocking=True)
+                target_label = batch['target_label'].to(device, non_blocking=True)
+                
                 trf = vxm.nn.modules.SpatialTransformer(interpolation_mode='nearest').to(device)
                 warped_label = trf(source_label, displacement)
                 
-                # Compute Dice for each label and average
-                # Assuming labels are integers. If 0 is background, we might want to skip it.
-                # Here we use a simple dice implementation
-                dice_score = vxm.py.utils.dice(warped_label.cpu().numpy(), target_label.cpu().numpy())
-                mean_dice = dice_score.mean()
-                total_dice += mean_dice
+                wl_np = warped_label.cpu().numpy()
+                tl_np = target_label.cpu().numpy()
                 
-                # Update Best Dice tracking
-                # Note: dice_score is an array of dices per label, we take mean.
-                # If batch size > 1, we strictly need to check each sample.
-                # For simplicity here, if batch size > 1, we take the batch mean dice as the metric for the batch.
-                # But to return a specific index, let's assume batch size = 1 or we just take the first one of the batch.
-                # The 'idx' in dataset is needed.
-                # Let's approximate: if this batch's mean dice is the best, we mark the index of the first item in this batch.
-                if mean_dice > best_dice:
-                    best_dice = mean_dice
-                    best_dice_idx = current_idx_offset # Point to the first element of this batch
-                
+                # Simple batch average dice (Always compute)
+                dice_score = vxm.py.utils.dice(wl_np, tl_np)
+                total_dice += dice_score.mean()
                 num_dice_batches += 1
-            
-            current_idx_offset += source.shape[0]
+                
+                if not fast:
+                    # HD95 (Very Slow: Scipy)
+                    batch_hd95_sum = 0.0
+                    batch_hd95_count = 0
+                    for b in range(wl_np.shape[0]):
+                        u_labels = np.unique(np.concatenate((wl_np[b], tl_np[b])))
+                        u_labels = u_labels[u_labels > 0.5]
+                        for l in u_labels:
+                            mask_pred = (wl_np[b, 0] == l)
+                            mask_gt = (tl_np[b, 0] == l)
+                            hd = compute_hd95(mask_gt, mask_pred)
+                            if not np.isnan(hd):
+                                batch_hd95_sum += hd
+                                batch_hd95_count += 1
+                    if batch_hd95_count > 0:
+                        total_hd95 += (batch_hd95_sum / batch_hd95_count)
+                        num_hd95_batches += 1
 
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     avg_dice = total_dice / num_dice_batches if num_dice_batches > 0 else 0.0
+    avg_hd95 = total_hd95 / num_hd95_batches if num_hd95_batches > 0 else 0.0
     avg_time = total_time / num_batches if num_batches > 0 else 0.0
     avg_neg_jac = total_neg_jac / num_jac_batches if num_jac_batches > 0 else 0.0
     avg_mag = total_mag / num_batches if num_batches > 0 else 0.0
     
-    return avg_loss, avg_dice, avg_time, avg_neg_jac, avg_mag, best_dice_idx
+    return avg_loss, avg_dice, avg_hd95, avg_time, avg_neg_jac, avg_mag
+
+
+def test_evaluate(
+    model: nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    image_loss_fn: nn.Module,
+    grad_loss_fn: nn.Module,
+    loss_weights: Sequence[float],
+    device: str = 'cuda',
+    fast: bool = False
+):
+    """
+    Run Comprehensive Testing. 
+    Returns detailed metrics: avg_loss, avg_dice, avg_hd95, avg_time, avg_reg_time, avg_jac, avg_mag, 
+                              best_sample_idx, per_label_dice_dict, raw_sample_results
+    """
+    model.eval()
+    total_loss = 0.0
+    total_dice = 0.0
+    total_dice_per_label = {} 
+    total_label_counts = {} 
+    raw_sample_results = []
+    
+    total_hd95 = 0.0
+    total_time = 0.0
+    total_reg_time = 0.0 
+    total_neg_jac = 0.0
+    total_mag = 0.0
+    
+    num_batches = 0
+    num_dice_batches = 0
+    num_hd95_batches = 0
+    num_jac_batches = 0
+    
+    best_dice = -1.0
+    best_dice_idx = None
+    current_idx_offset = 0
+
+    with torch.no_grad():
+        for batch in dataloader:
+            source = batch['source'].to(device)
+            target = batch['target'].to(device)
+
+            # 1. Measure Pure Registration Time
+            start_time_reg = time.time()
+            if device == 'cuda': torch.cuda.synchronize()
+            _ = model(source, target, return_warped_source=False, return_field_type='displacement')
+            if device == 'cuda': torch.cuda.synchronize()
+            end_time_reg = time.time()
+            total_reg_time += ((end_time_reg - start_time_reg) / source.shape[0])
+
+            # 2. Measure Full Inference Time & Forward
+            start_time = time.time()
+            if device == 'cuda': torch.cuda.synchronize()
+            displacement, warped_source = model(source, target, return_warped_source=True, return_field_type='displacement')
+            if device == 'cuda': torch.cuda.synchronize()
+            end_time = time.time()
+            total_time += ((end_time - start_time) / source.shape[0])
+            
+            # Metrics: Magnitude
+            disp_mag = torch.sqrt(torch.sum(displacement ** 2, dim=1))
+            total_mag += disp_mag.mean().item()
+
+            # Loss
+            if isinstance(image_loss_fn, ne.nn.modules.NCC):
+                img_loss = -image_loss_fn(target, warped_source)
+            else:
+                img_loss = image_loss_fn(target, warped_source)
+            grad_loss = grad_loss_fn(displacement)
+            loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
+            total_loss += loss.item()
+            num_batches += 1
+
+            # Jacobian (Conditional)
+            disp_np = displacement.detach().cpu().numpy()
+            disp_np = np.transpose(disp_np, (0, 2, 3, 4, 1))
+
+            if not fast:
+                target_np = target.detach().cpu().numpy()
+                batch_neg_jac = 0.0
+                for i in range(disp_np.shape[0]):
+                    jac_det = vxm.py.utils.jacobian_determinant(disp_np[i])
+                    mask = target_np[i, 0] > 0.01
+                    if jac_det.shape != mask.shape:
+                        diff = np.array(mask.shape) - np.array(jac_det.shape)
+                        d_start, h_start, w_start = diff // 2
+                        d_end = mask.shape[0] - (diff[0] - d_start)
+                        h_end = mask.shape[1] - (diff[1] - h_start)
+                        w_end = mask.shape[2] - (diff[2] - w_start)
+                        mask = mask[d_start:d_end, h_start:h_end, w_start:w_end]
+
+                    valid_mask_sum = np.sum(mask)
+                    if valid_mask_sum > 0:
+                        batch_neg_jac += np.sum((jac_det <= 0) & mask) / valid_mask_sum
+                total_neg_jac += (batch_neg_jac / disp_np.shape[0])
+                num_jac_batches += 1
+
+            # Detailed Dice & HD95
+            if 'source_label' in batch and 'target_label' in batch:
+                source_label = batch['source_label'].to(device)
+                target_label = batch['target_label'].to(device)
+                trf = vxm.nn.modules.SpatialTransformer(interpolation_mode='nearest').to(device)
+                warped_label = trf(source_label, displacement)
+                
+                wl_np = warped_label.cpu().numpy()
+                tl_np = target_label.cpu().numpy()
+                
+                batch_dice_sum = 0.0
+                batch_dice_count = 0 
+                
+                # Per-sample processing
+                for b in range(wl_np.shape[0]):
+                    u_labels = np.unique(np.concatenate((wl_np[b], tl_np[b])))
+                    u_labels = u_labels[u_labels > 0.5]
+                    
+                    # Dice (Always Compute)
+                    if len(u_labels) > 0:
+                        dice_scores = vxm.py.utils.dice(wl_np[b], tl_np[b], labels=u_labels)
+                        sample_mean_dice = dice_scores.mean()
+                        batch_dice_sum += sample_mean_dice
+                        batch_dice_count += 1
+                        
+                        # Accumulate per-label
+                        label_dice_dict = {}
+                        for l_idx, label_val in enumerate(u_labels):
+                            l_key = int(label_val)
+                            d_val = dice_scores[l_idx]
+                            label_dice_dict[l_key] = d_val
+                            if l_key not in total_dice_per_label:
+                                total_dice_per_label[l_key] = 0.0
+                                total_label_counts[l_key] = 0
+                            total_dice_per_label[l_key] += d_val
+                            total_label_counts[l_key] += 1
+                    else:
+                        sample_mean_dice = 0.0
+                        label_dice_dict = {}
+
+                    # Raw result init
+                    sample_filename = ""
+                    if 'filename' in batch:
+                        if isinstance(batch['filename'], (list, tuple)):
+                            sample_filename = batch['filename'][b]
+                        elif isinstance(batch['filename'], str):
+                            sample_filename = batch['filename']
+
+                    sample_res = {
+                        'sample_idx': current_idx_offset + b,
+                        'filename': sample_filename,
+                        'dice': sample_mean_dice,
+                        'hd95': np.nan,
+                        'label_dice': label_dice_dict
+                    }
+                    
+                    # HD95 (Conditional)
+                    if not fast:
+                        sample_hd95_sum = 0.0
+                        sample_hd95_count = 0
+                        for l in u_labels:
+                            mask_pred = (wl_np[b, 0] == l)
+                            mask_gt = (tl_np[b, 0] == l)
+                            hd = compute_hd95(mask_gt, mask_pred)
+                            if not np.isnan(hd):
+                                sample_hd95_sum += hd
+                                sample_hd95_count += 1
+                        
+                        if sample_hd95_count > 0:
+                            sample_avg_hd95 = sample_hd95_sum / sample_hd95_count
+                            sample_res['hd95'] = sample_avg_hd95
+                            # Accumulate - but wait, how to average globally?
+                            # previous code logic was a bit messy on global HD95 average
+                            # Let's just track valid batches or sum of means?
+                            # Simplified: accumulated into total_hd95 if valid
+                            pass 
+
+                    # Add to list
+                    raw_sample_results.append(sample_res)
+
+                if batch_dice_count > 0:
+                    total_dice += (batch_dice_sum / batch_dice_count)
+                    num_dice_batches += 1
+                
+                # Check Best Dice
+                if batch_dice_count > 0:
+                    current_batch_mean = batch_dice_sum / batch_dice_count
+                    if current_batch_mean > best_dice:
+                        best_dice = current_batch_mean
+                        best_dice_idx = current_idx_offset
+                
+                # HD95 Batch Accumulation (Conditional)
+                if not fast:
+                     # Re-compute batch mean HD95 from sample results for this batch
+                     # The last batch_dice_count items in raw_sample_results correspond to this batch
+                     # Filter those with valid HD95
+                     current_batch_results = raw_sample_results[-len(wl_np):] # approximation
+                     valid_batch_hds = [r['hd95'] for r in current_batch_results if not np.isnan(r['hd95'])]
+                     if valid_batch_hds:
+                         total_hd95 += np.mean(valid_batch_hds)
+                         num_hd95_batches += 1
+
+            current_idx_offset += source.shape[0]
+
+    # Post-process HD95 from raw results to ensure consistency
+    valid_hd95_values = [r['hd95'] for r in raw_sample_results if not np.isnan(r['hd95'])]
+    avg_hd95 = np.mean(valid_hd95_values) if valid_hd95_values else 0.0
+
+    avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    avg_dice = total_dice / num_dice_batches if num_dice_batches > 0 else 0.0
+    avg_time = total_time / num_batches if num_batches > 0 else 0.0
+    avg_reg_time = total_reg_time / num_batches if num_batches > 0 else 0.0
+    avg_neg_jac = total_neg_jac / num_jac_batches if num_jac_batches > 0 else 0.0
+    avg_mag = total_mag / num_batches if num_batches > 0 else 0.0
+    
+    # Calculate Per-Label Average Dice
+    avg_dice_per_label = {}
+    for l_key in total_dice_per_label:
+        if total_label_counts[l_key] > 0:
+            avg_dice_per_label[l_key] = total_dice_per_label[l_key] / total_label_counts[l_key]
+    
+    return avg_loss, avg_dice, avg_hd95, avg_time, avg_reg_time, avg_neg_jac, avg_mag, best_dice_idx, avg_dice_per_label, raw_sample_results
 
 
 def main():
@@ -1039,6 +1319,10 @@ def main():
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f'Using device: {device}')
+    
+    # Optimization: Enable cuDNN benchmark
+    if device == 'cuda':
+        torch.backends.cudnn.benchmark = True
 
     # Model: pairwise VoxelMorph
     # model = vxm.nn.models.VxmPairwise(
@@ -1081,7 +1365,9 @@ def main():
         dataset, 
         batch_size=args.batch_size, 
         shuffle=True,  # Important: Shuffle every epoch
-        num_workers=args.workers
+        num_workers=args.workers,
+        pin_memory=True,
+        persistent_workers=(args.workers > 0)
     )
     
     # Validation Dataloader
@@ -1098,7 +1384,7 @@ def main():
                 device=device,
                 paired=args.val_paired
             )
-            val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
+            val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
             print(f'Validation set loaded: {len(val_dataset)} pairs.')
         else:
             print(f'Warning: Validation directories not found ({args.ct_val_dir}, {args.mr_val_dir}). Validation skipped.')
@@ -1117,7 +1403,7 @@ def main():
                 device=device,
                 paired=True
             )
-            test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers)
+            test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
             print(f'Test (Monitor) set loaded: {len(test_dataset)} pairs.')
         else:
             print(f'Warning: Test directories not found ({args.ct_test_dir}, {args.mr_test_dir}). Test monitoring skipped.')
@@ -1165,7 +1451,7 @@ def main():
 
     with open(log_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'train_loss', 'val_loss', 'val_dice', 'val_time_sec', 'val_neg_jac_ratio', 'val_mag', 'test_loss', 'test_dice', 'test_jac', 'test_mag'])
+        writer.writerow(['epoch', 'train_loss', 'val_loss', 'val_dice', 'val_hd95', 'val_time_sec', 'val_neg_jac_ratio', 'val_mag', 'test_loss', 'test_dice', 'test_hd95', 'test_time_sec', 'test_reg_time_sec', 'test_jac', 'test_mag', 'test_dice_per_label'])
 
     best_loss = float('inf')
     best_dice = 0.0
@@ -1184,83 +1470,146 @@ def main():
             image_loss_fn=image_loss_fn,
             grad_loss_fn=grad_loss_fn,
             loss_weights=loss_weights,
-            steps_per_epoch=len(train_loader), # Now unused inside function, but passed for API
+            steps_per_epoch=len(train_loader),
             device=device,
         )
 
-        # Validation
+        # -----------------------------
+        # Validation Phase
+        # -----------------------------
+        # Default values if val_loader is None
+        val_loss, val_dice, val_hd95, val_time, val_jac, val_mag = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         current_monitor_loss = avg_loss
-        val_loss_scalar = 0.0
-        val_dice_scalar = 0.0
-        val_time_scalar = 0.0
-        val_jac_scalar = 0.0
-        val_mag_scalar = 0.0
-        
+
         if val_loader:
-            val_loss, val_dice, val_time, val_jac, val_mag, _ = validate(
+            # Optimization: Skip expensive metrics (HD95, Jacobian) frequently
+            # Run full metrics only on first epoch and every 5 epochs
+            run_full_metrics = ((epoch + 1) == 1) or ((epoch + 1) % 5 == 0)
+            
+            val_loss, val_dice, val_hd95, val_time, val_jac, val_mag = validate(
                 model=model,
                 dataloader=val_loader,
                 image_loss_fn=image_loss_fn,
                 grad_loss_fn=grad_loss_fn,
                 loss_weights=loss_weights,
-                device=device
+                device=device,
+                fast=(not run_full_metrics)
             )
-            # Enhanced printing
-            print(f'Epoch {epoch + 1} | TrainTotal: {avg_loss:.4f} (Img: {last_img_loss:.4f}, Grad: {last_grad_loss:.6f})')
-            print(f'         | Val Loss: {val_loss:.4f}, Dice: {val_dice:.4f}, Mag: {val_mag:.2f}, NegJac: {val_jac:.4f}')
             
+            print(f'Epoch {epoch + 1} | TrainTotal: {avg_loss:.4f} (Img: {last_img_loss:.4f}, Grad: {last_grad_loss:.6f})')
+            metric_suffix = "" if run_full_metrics else " (Fast Val)"
+            print(f'         | Val Loss: {val_loss:.4f}, Dice: {val_dice:.4f}, HD95: {val_hd95:.4f}, NegJac: {val_jac:.4f}{metric_suffix}')
             current_monitor_loss = val_loss
-            val_loss_scalar = val_loss
-            val_dice_scalar = val_dice
-            val_time_scalar = val_time
-            val_jac_scalar = val_jac
-            val_mag_scalar = val_mag
         else:
             print(f'Epoch {epoch + 1}, Train Loss: {avg_loss:.6f}')
         
-        # Test / Monitor Evaluation
-        test_loss_scalar = 0.0
-        test_dice_scalar = 0.0
-        test_jac_scalar = 0.0
-        test_mag_scalar = 0.0
-        
+        # -----------------------------
+        # Test Phase (Detailed Evaluation)
+        # -----------------------------
+        test_loss, test_dice, test_hd95, test_time, test_reg_time, test_jac, test_mag = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         test_best_idx = None
+        test_dice_per_label = {}
+        test_raw_results = []
+        
+        # Optimization: Always run test evaluation to get Dice for CSV, but skip slow metrics (HD95, Jac) unless run_full_metrics
+        run_test_eval = (test_loader is not None)
 
-        if test_loader:
-             test_loss, test_dice, _, test_jac, test_mag, test_best_idx = validate(
+        if run_test_eval:
+             test_loss, test_dice, test_hd95, test_time, test_reg_time, test_jac, test_mag, test_best_idx, test_dice_per_label, test_raw_results = test_evaluate(
                 model=model,
                 dataloader=test_loader,
                 image_loss_fn=image_loss_fn,
                 grad_loss_fn=grad_loss_fn,
                 loss_weights=loss_weights,
-                device=device
+                device=device,
+                fast=(not run_full_metrics)
             )
-             print(f'  [Monitor] Test Dice: {test_dice:.6f}, Test Loss: {test_loss:.6f}, Test Jac: {test_jac:.6f}, Test Mag: {test_mag:.4f}')
-             test_loss_scalar = test_loss
-             test_dice_scalar = test_dice
-             test_jac_scalar = test_jac
-             test_mag_scalar = test_mag
-
-             # If we have a test set, use it for "Best Dice" tracking instead of the (possibly unpaired) validation set
-             # This overrides the decision logic below for 'best_dice'
-             # BUT we keep 'current_monitor_loss' (used for best_loss) as val_loss if available, or train_loss, 
-             # because we usually want 'best_loss' to be about the optimization objective.
              
+             test_label_metrics_str = ""
+             if test_dice_per_label:
+                 test_label_metrics_str = " | LabelDice: " + ", ".join([f"{k}:{v:.3f}" for k, v in test_dice_per_label.items()])
+
+             metric_suffix = "" if run_full_metrics else " (Fast Test)"
+             print(f'  [Monitor] Test Dice: {test_dice:.6f}, HD95: {test_hd95:.6f}, Loss: {test_loss:.6f}, Jac: {test_jac:.6f}, Time: {test_time:.4f}s{test_label_metrics_str}{metric_suffix}')
+
+             # Save detailed per-sample results for Boxplot ONLY on full metric epochs
+             if run_full_metrics:
+                 detailed_log_file = out_path.parent / f'test_results_detailed_epoch{epoch+1}.csv'
+                 if test_raw_results:
+                     all_label_keys = set()
+                     for res in test_raw_results:
+                         all_label_keys.update(res['label_dice'].keys())
+                     sorted_keys = sorted(list(all_label_keys))
+                     
+                     header = ['sample_idx', 'filename', 'dice', 'hd95'] + [f'dice_label_{k}' for k in sorted_keys]
+                     
+                     with open(detailed_log_file, 'w', newline='') as f_detail:
+                         w_detail = csv.DictWriter(f_detail, fieldnames=header)
+                         w_detail.writeheader()
+                         for res in test_raw_results:
+                             row_data = {
+                                 'sample_idx': res['sample_idx'],
+                                 'filename': res.get('filename', ''),
+                                 'dice': f"{res['dice']:.5f}",
+                                 'hd95': f"{res['hd95']:.5f}" if not np.isnan(res['hd95']) else ''
+                             }
+                             for k in sorted_keys:
+                                 val = res['label_dice'].get(k, '')
+                                 if isinstance(val, (float, np.floating)):
+                                     row_data[f'dice_label_{k}'] = f"{val:.5f}"
+                                 else:
+                                     row_data[f'dice_label_{k}'] = val
+                             w_detail.writerow(row_data)
         
-        # Log to file
+
+        # -----------------------------
+        # Logging
+        # -----------------------------
         with open(log_file, 'a', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([epoch + 1, avg_loss, val_loss_scalar, val_dice_scalar, val_time_scalar, val_jac_scalar, val_mag_scalar, test_loss_scalar, test_dice_scalar, test_jac_scalar, test_mag_scalar])
+            
+            def fmt(x):
+                # Helper to format floats
+                return f"{x:.5f}" if isinstance(x, (float, np.float32, np.float64)) else x
+            
+            # Prepare dice per label string for CSV (semicolon separated to avoid csv conflict)
+            test_dice_per_label_str = ""
+            if test_dice_per_label:
+                 # Manually format dictionary to avoid 'np.float64(...)' in output
+                 items = [f"{k}: {v:.5f}" for k, v in test_dice_per_label.items()]
+                 test_dice_per_label_str = "{" + "; ".join(items) + "}"
+
+            row = [
+                epoch + 1, 
+                fmt(avg_loss), 
+                fmt(val_loss), 
+                fmt(val_dice), 
+                fmt(val_hd95), 
+                fmt(val_time), 
+                fmt(val_jac), 
+                fmt(val_mag), 
+                fmt(test_loss), 
+                fmt(test_dice), 
+                fmt(test_hd95), 
+                fmt(test_time), 
+                fmt(test_reg_time), 
+                fmt(test_jac), 
+                fmt(test_mag), 
+                test_dice_per_label_str
+            ]
+            writer.writerow(row)
 
         loss_history.append(current_monitor_loss)
         
-        # Save visualization (updated logic: every 5 epochs OR always for epoch 1)
-        # We use test_loader primarily if available, else val_loader
+        # -----------------------------
+        # Visualization
+        # -----------------------------
         if (epoch + 1) == 1 or (epoch + 1) % 5 == 0:
             vis_dataset = None
             vis_suffix = ''
             best_idx_to_plot = None
             
+            # Prefer test set for visualization if available
             if test_loader and hasattr(test_loader.dataset, '__getitem__'):
                 vis_dataset = test_loader.dataset
                 vis_suffix = '_test'
@@ -1268,10 +1617,6 @@ def main():
             elif val_loader and hasattr(val_loader.dataset, '__getitem__'):
                 vis_dataset = val_loader.dataset
                 vis_suffix = '_val'
-                # val metric doesn't return best idx currently unless we changed calling convention above too, 
-                # but we only updated validate sig. In call above used `_` for val.
-                # If you want best val sample too, need to capture it.
-                # For now, let's just use test best idx if available.
                 
             if vis_dataset:
                  save_qualitative_results(
@@ -1284,7 +1629,10 @@ def main():
                      best_sample_idx=best_idx_to_plot
                  )
 
-        # Early stopping check
+        # -----------------------------
+        # Model Saving & Stopping
+        # -----------------------------
+        # Early stopping
         if check_early_stopping(
             loss_history,
             patience=args.patience,
@@ -1294,17 +1642,15 @@ def main():
             print(f'Early stopping at epoch {epoch + 1}')
             break
             
-        # Save periodic checkpoints
+        # Periodic checkpoints
         if (epoch + 1) % args.save_every == 0:
             ckpt = out_path.parent / f'{out_path.stem}_epoch{epoch+1}.pt'
             torch.save(model.state_dict(), ckpt)
             print(f'Checkpoint saved to {ckpt}')
 
-        # Strategy: "Best Loss" (Unsupervised Model Selection)
-        # Always track the model with lowest validation loss as the main model.
+        # Best Model Save (Based on Val Loss)
         if current_monitor_loss < best_loss:
             best_loss = current_monitor_loss
-            # Save as the main output model
             torch.save(model.state_dict(), out_path)
             print(f'New best val loss: {best_loss:.6f}. Saved to {out_path.name}')
 
