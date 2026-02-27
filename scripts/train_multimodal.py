@@ -12,7 +12,7 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Sequence, List
+from typing import Sequence, List, Optional
 import scipy.ndimage
 
 # Set allocator to avoid fragmentation issues
@@ -130,8 +130,9 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
             # Use filename as tag if available
             tag = sample.get('filename', f'{i:04d}')
             
-            # Plot all cases
-            samples_to_plot.append((tag, sample))
+            # Only plot cases 3, 4, 5
+            if any(case_id in tag for case_id in ['0003', '0004', '0005']):
+                samples_to_plot.append((tag, sample))
     else:
         # Default behavior for validation: Index 0 and Best Dice
         sample_default = dataset[0]
@@ -836,25 +837,36 @@ def train_epoch(
     grad_loss_fn: nn.Module,
     loss_weights: Sequence[float],
     steps_per_epoch: int,   # Used only for progress bar calculation now if we iterate full loader
+    scaler: Optional[torch.amp.GradScaler] = None,
     device: str = 'cuda'
 ) -> float:
     model.train()
     total_loss = 0.0
     num_steps = 0
-    
-    # Optimization: Use Mixed Precision (AMP)
-    # Update for newer PyTorch versions: use torch.amp instead of torch.cuda.amp
-    scaler = torch.amp.GradScaler('cuda', enabled=(device=='cuda'))
+    total_grad_norm = 0.0
+    num_grad_norm = 0
+    effective_update_steps = 0
+    nonfinite_steps = 0
+
+    # Keep AMP scaler persistent across epochs. If not provided, fallback to local scaler.
+    if scaler is None:
+        scaler = torch.amp.GradScaler('cuda', enabled=(device == 'cuda'))
+
+    # Prefer bfloat16 for better numeric range when available (especially for MI/localMI).
+    amp_dtype = torch.bfloat16 if (device == 'cuda' and torch.cuda.is_bf16_supported()) else torch.float16
+
+    # Track a reference parameter to monitor whether optimizer steps are actually changing weights.
+    ref_param = next((p for p in model.parameters() if p.requires_grad), None)
 
     # Iterate through the entire dataloader (all 1500+ pairs if unpaired)
     # The dataloader is now a finite Map-style Dataset, not an infinite Iterable
     for batch in tqdm(dataloader, desc="Training Batch"):
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
 
         source = batch['source'].to(device, non_blocking=True)
         target = batch['target'].to(device, non_blocking=True)
 
-        with torch.amp.autocast('cuda', enabled=(device=='cuda')):
+        with torch.amp.autocast('cuda', enabled=(device=='cuda'), dtype=amp_dtype):
             displacement, warped_source = model(
                 source,
                 target,
@@ -866,15 +878,52 @@ def train_epoch(
                 img_loss = -image_loss_fn(target, warped_source)
             else:
                 img_loss = image_loss_fn(target, warped_source)
-            
-            grad_loss = grad_loss_fn(displacement)
 
+            grad_loss = grad_loss_fn(displacement)
             loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
+
+        if not torch.isfinite(loss):
+            optimizer.zero_grad(set_to_none=True)
+            nonfinite_steps += 1
+            num_steps += 1
+            continue
         
         # Optimization: Scaled Backward
         scaler.scale(loss).backward()
+
+        # Unscale before grad-norm computation so the value is meaningful.
+        if scaler.is_enabled():
+            scaler.unscale_(optimizer)
+
+        grad_sq_sum = 0.0
+        has_nonfinite_grad = False
+        for p in model.parameters():
+            if p.grad is not None:
+                g = p.grad.detach()
+                if not torch.isfinite(g).all():
+                    has_nonfinite_grad = True
+                    break
+                grad_sq_sum += torch.sum(g * g).item()
+
+        if has_nonfinite_grad:
+            optimizer.zero_grad(set_to_none=True)
+            nonfinite_steps += 1
+            num_steps += 1
+            continue
+
+        if grad_sq_sum > 0 and np.isfinite(grad_sq_sum):
+            total_grad_norm += grad_sq_sum ** 0.5
+            num_grad_norm += 1
+
+        # Monitor whether parameters are updated this step.
+        before_ref = ref_param.detach().clone() if ref_param is not None else None
         scaler.step(optimizer)
         scaler.update()
+
+        if before_ref is not None:
+            delta = (ref_param.detach() - before_ref).abs().mean().item()
+            if delta > 0:
+                effective_update_steps += 1
 
         total_loss += loss.item()
         # Track components for debugging
@@ -883,7 +932,11 @@ def train_epoch(
         
     # Return breakdown (approximated from last batch or accumulate if needed, 
     # but strictly we just need to see the scale)
-    return total_loss / num_steps, img_loss.item(), grad_loss.item()
+    avg_grad_norm = total_grad_norm / num_grad_norm if num_grad_norm > 0 else 0.0
+    update_ratio = effective_update_steps / max(num_steps, 1)
+    if nonfinite_steps > 0:
+        print(f'  [Warning] Non-finite train steps: {nonfinite_steps}/{num_steps}. Consider reducing lr or disabling AMP for this loss.')
+    return total_loss / num_steps, img_loss.item(), grad_loss.item(), avg_grad_norm, update_ratio
 
 
 def compute_hd95(ground_truth, prediction, spacing=None):
@@ -1451,7 +1504,7 @@ def main():
 
     with open(log_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'train_loss', 'val_loss', 'val_dice', 'val_hd95', 'val_time_sec', 'val_neg_jac_ratio', 'val_mag', 'test_loss', 'test_dice', 'test_hd95', 'test_time_sec', 'test_reg_time_sec', 'test_jac', 'test_mag', 'test_dice_per_label'])
+        writer.writerow(['epoch', 'train_loss', 'train_grad_norm', 'train_update_ratio', 'val_loss', 'val_dice', 'val_hd95', 'val_time_sec', 'val_neg_jac_ratio', 'val_mag', 'test_loss', 'test_dice', 'test_hd95', 'test_time_sec', 'test_reg_time_sec', 'test_jac', 'test_mag', 'test_dice_per_label'])
 
     best_loss = float('inf')
     best_dice = 0.0
@@ -1461,9 +1514,12 @@ def main():
     
     loss_history: List[float] = []
 
+    # Persistent scaler across all epochs (important for stable AMP training)
+    scaler = torch.amp.GradScaler('cuda', enabled=(device == 'cuda'))
+
     print(f'Training for {args.epochs} epochs...')
     for epoch in range(args.epochs):
-        avg_loss, last_img_loss, last_grad_loss = train_epoch(
+        avg_loss, last_img_loss, last_grad_loss, avg_grad_norm, update_ratio = train_epoch(
             model=model,
             dataloader=train_loader,
             optimizer=optimizer,
@@ -1471,6 +1527,7 @@ def main():
             grad_loss_fn=grad_loss_fn,
             loss_weights=loss_weights,
             steps_per_epoch=len(train_loader),
+            scaler=scaler,
             device=device,
         )
 
@@ -1496,12 +1553,15 @@ def main():
                 fast=(not run_full_metrics)
             )
             
-            print(f'Epoch {epoch + 1} | TrainTotal: {avg_loss:.4f} (Img: {last_img_loss:.4f}, Grad: {last_grad_loss:.6f})')
+            print(f'Epoch {epoch + 1} | TrainTotal: {avg_loss:.4f} (Img: {last_img_loss:.4f}, Grad: {last_grad_loss:.6f}) | GradNorm: {avg_grad_norm:.6f}, UpdateRatio: {update_ratio:.2%}')
             metric_suffix = "" if run_full_metrics else " (Fast Val)"
             print(f'         | Val Loss: {val_loss:.4f}, Dice: {val_dice:.4f}, HD95: {val_hd95:.4f}, NegJac: {val_jac:.4f}{metric_suffix}')
             current_monitor_loss = val_loss
         else:
-            print(f'Epoch {epoch + 1}, Train Loss: {avg_loss:.6f}')
+            print(f'Epoch {epoch + 1}, Train Loss: {avg_loss:.6f}, GradNorm: {avg_grad_norm:.6f}, UpdateRatio: {update_ratio:.2%}')
+
+        if update_ratio < 0.1:
+            print(f'  [Warning] Low effective update ratio ({update_ratio:.2%}). Model parameters may not be updating properly.')
         
         # -----------------------------
         # Test Phase (Detailed Evaluation)
@@ -1582,6 +1642,8 @@ def main():
             row = [
                 epoch + 1, 
                 fmt(avg_loss), 
+                fmt(avg_grad_norm),
+                fmt(update_ratio),
                 fmt(val_loss), 
                 fmt(val_dice), 
                 fmt(val_hd95), 
