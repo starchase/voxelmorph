@@ -102,17 +102,10 @@ class MultimodalTrainDataset(torch.utils.data.Dataset):
         ct_np = ct_nii.get_fdata().astype(np.float32)
         mr_np = mr_nii.get_fdata().astype(np.float32)
 
-        # Robust Min-Max Normalization to force background to 0
-        # This fixes "Background Warping" by ensuring empty space is actually 0.
-        def normalize(vol):
-            v_min = vol.min()
-            v_max = vol.max()
-            if v_max - v_min > 1e-6:
-                return (vol - v_min) / (v_max - v_min)
-            return vol
-
-        ct_np = normalize(ct_np)
-        mr_np = normalize(mr_np)
+        # Data is already normalized to [0, 1] during preprocessing (e.g. normalize_for_abdomenmrct.py)
+        # Bounding to expected range just in case of float drifts
+        ct_np = np.clip(ct_np, 0.0, 1.0)
+        mr_np = np.clip(mr_np, 0.0, 1.0)
 
         ct = torch.from_numpy(ct_np).float().unsqueeze(0)
         mr = torch.from_numpy(mr_np).float().unsqueeze(0)
@@ -130,9 +123,8 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
             # Use filename as tag if available
             tag = sample.get('filename', f'{i:04d}')
             
-            # Only plot cases 3, 4, 5
-            if any(case_id in tag for case_id in ['0003', '0004', '0005']):
-                samples_to_plot.append((tag, sample))
+            # Plot all test cases
+            samples_to_plot.append((tag, sample))
     else:
         # Default behavior for validation: Index 0 and Best Dice
         sample_default = dataset[0]
@@ -781,16 +773,10 @@ class MultimodalValidationDataset(torch.utils.data.Dataset):
         ct_np = ct_nii.get_fdata().astype(np.float32)
         mr_np = mr_nii.get_fdata().astype(np.float32)
         
-        # Robust Min-Max Normalization to force background to 0
-        def normalize(vol):
-            v_min = vol.min()
-            v_max = vol.max()
-            if v_max - v_min > 1e-6:
-                return (vol - v_min) / (v_max - v_min)
-            return vol
-
-        ct_np = normalize(ct_np)
-        mr_np = normalize(mr_np)
+        # Data is already normalized to [0, 1] during preprocessing
+        # Bounding to expected range just in case of float drifts
+        ct_np = np.clip(ct_np, 0.0, 1.0)
+        mr_np = np.clip(mr_np, 0.0, 1.0)
 
         ct = torch.from_numpy(ct_np).float().unsqueeze(0)
         mr = torch.from_numpy(mr_np).float().unsqueeze(0)
@@ -866,7 +852,9 @@ def train_epoch(
         source = batch['source'].to(device, non_blocking=True)
         target = batch['target'].to(device, non_blocking=True)
 
-        with torch.amp.autocast('cuda', enabled=(device=='cuda'), dtype=amp_dtype):
+        # 禁用 AMP, 避免 Local_MI 和 MI 计算因为半精度溢出产生 NaN
+        # with torch.amp.autocast('cuda', enabled=(device=='cuda'), dtype=amp_dtype):
+        if True:
             displacement, warped_source = model(
                 source,
                 target,
@@ -1218,13 +1206,17 @@ def test_evaluate(
                 
                 wl_np = warped_label.cpu().numpy()
                 tl_np = target_label.cpu().numpy()
+                sl_np = source_label.cpu().numpy()
                 
                 batch_dice_sum = 0.0
                 batch_dice_count = 0 
                 
                 # Per-sample processing
                 for b in range(wl_np.shape[0]):
-                    u_labels = np.unique(np.concatenate((wl_np[b], tl_np[b])))
+                    # 只评价源图像和目标图像中同时存在的标签 (Fair Dice)
+                    u_s = np.unique(sl_np[b])
+                    u_t = np.unique(tl_np[b])
+                    u_labels = np.intersect1d(u_s, u_t)
                     u_labels = u_labels[u_labels > 0.5]
                     
                     # Dice (Always Compute)
@@ -1335,18 +1327,18 @@ def test_evaluate(
 
 def main():
     parser = argparse.ArgumentParser(description='Train multimodal CT->MR VoxelMorph')
-    parser.add_argument('--ct-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/train/images/ct', help='CT train images (source)')
-    parser.add_argument('--mr-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/train/images/mr', help='MR train images (target)')
-    parser.add_argument('--paired-ct-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/trainPairs/images/ct', help='Paired CT train images (source)')
-    parser.add_argument('--paired-mr-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/trainPairs/images/mr', help='Paired MR train images (target)')
-    parser.add_argument('--ct-val-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/val/images/ct', help='Validation CT images')
-    parser.add_argument('--mr-val-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/val/images/mr', help='Validation MR images')
-    parser.add_argument('--ct-val-label-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/val/labels/ct', help='Validation CT labels')
-    parser.add_argument('--mr-val-label-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/val/labels/mr', help='Validation MR labels')
-    parser.add_argument('--ct-test-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/test/images/ct', help='Test CT images (for monitoring)')
-    parser.add_argument('--mr-test-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/test/images/mr', help='Test MR images (for monitoring)')
-    parser.add_argument('--ct-test-label-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/test/labels/ct', help='Test CT labels')
-    parser.add_argument('--mr-test-label-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm/test/labels/mr', help='Test MR labels')
+    parser.add_argument('--ct-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm_300/train/images/ct', help='CT train images (source)')
+    parser.add_argument('--mr-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm_300/train/images/mr', help='MR train images (target)')
+    parser.add_argument('--paired-ct-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm_300/trainPairs/images/ct', help='Paired CT train images (source)')
+    parser.add_argument('--paired-mr-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm_300/trainPairs/images/mr', help='Paired MR train images (target)')
+    parser.add_argument('--ct-val-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm_300/val/images/ct', help='Validation CT images')
+    parser.add_argument('--mr-val-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm_300/val/images/mr', help='Validation MR images')
+    parser.add_argument('--ct-val-label-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm_300/val/labels/ct', help='Validation CT labels')
+    parser.add_argument('--mr-val-label-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm_300/val/labels/mr', help='Validation MR labels')
+    parser.add_argument('--ct-test-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm_300/test/images/ct', help='Test CT images (for monitoring)')
+    parser.add_argument('--mr-test-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm_300/test/images/mr', help='Test MR images (for monitoring)')
+    parser.add_argument('--ct-test-label-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm_300/test/labels/ct', help='Test CT labels')
+    parser.add_argument('--mr-test-label-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm_300/test/labels/mr', help='Test MR labels')
     parser.add_argument('--output', type=str, default='/root/autodl-tmp/models/multimodal_vxm.pt', help='Output model path')
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--workers', type=int, default=8, help='Number of workers')
@@ -1389,9 +1381,11 @@ def main():
         ndim=3,
         source_channels=1,
         target_channels=1,
-        # Symmetric 5-level UNet (Encoder: [16, 32, 32, 32, 32] -> Decoder auto-reversed)
-        # This provides standard VoxelMorph capacity (5 downsamples) without crashing on image size.
-        nb_features=[16, 32, 32, 32, 32], 
+        # Expanded UNet capacity. 
+        # Note: Neurite BasicUNet requires: len(down_features) == len(up_features) - 1
+        # Down: [16, 32, 32, 32, 32] (Length 5)
+        # Up:   [32, 32, 32, 32, 32] (Length 5 -> num_blocks = 5)
+        nb_features=([16, 32, 32, 32, 32], [32, 32, 32, 32, 32]),
         integration_steps=7,
     ).to(device)
 
@@ -1489,6 +1483,7 @@ def main():
     with open(config_file, 'w') as f:
         f.write(f"Training Configuration:\n")
         f.write(f"Timestamp: {timestamp}\n")
+        f.write(f"Dataset: {Path(args.ct_dir).parent.parent.parent.name}\n")
         f.write(f"Device: {device}\n")
         f.write(f"Epochs: {args.epochs}\n")
         f.write(f"Batch Size: {args.batch_size}\n")
