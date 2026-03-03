@@ -7,6 +7,7 @@ This script assumes preprocessed volumes live in `processed/ct/image` and
 `AbdomenMRCT_0001_0001.nii.gz` (CT) and `AbdomenMRCT_0001_0000.nii.gz` (MR).
 """
 import argparse
+import collections
 import csv
 import logging
 import os
@@ -1016,8 +1017,9 @@ def validate(
             end_time = time.time()
             
             # 1. Metrics: Magnitude
-            disp_mag = torch.sqrt(torch.sum(displacement ** 2, dim=1))
-            total_mag += disp_mag.mean().item()
+            # Optimization: Skip magnitude for validation set to save time
+            # disp_mag = torch.sqrt(torch.sum(displacement ** 2, dim=1))
+            # total_mag += disp_mag.mean().item()
 
             # 2. Time
             batch_time = end_time - start_time
@@ -1033,7 +1035,8 @@ def validate(
             total_loss += loss.item()
             num_batches += 1
 
-            if not fast:
+            # Optimization: Skip Jacobian for validation set.
+            if False and not fast:
                 # 4. Jacobian (Slow: CPU Transfer + Numpy)
                 disp_np = displacement.detach().cpu().numpy()
                 disp_np = np.transpose(disp_np, (0, 2, 3, 4, 1))
@@ -1059,7 +1062,8 @@ def validate(
                 num_jac_batches += 1
 
             # 5. Dice & HD95
-            if 'source_label' in batch and 'target_label' in batch:
+            # Optimization: Skip Dice and HD95 for validation set, only compute loss.
+            if False and 'source_label' in batch and 'target_label' in batch:
                 source_label = batch['source_label'].to(device, non_blocking=True)
                 target_label = batch['target_label'].to(device, non_blocking=True)
                 
@@ -1257,8 +1261,8 @@ def test_evaluate(
                         'label_dice': label_dice_dict
                     }
                     
-                    # HD95 (Conditional)
-                    if not fast:
+                    # HD95 (Always calculate for test evaluation now)
+                    if True:
                         sample_hd95_sum = 0.0
                         sample_hd95_count = 0
                         for l in u_labels:
@@ -1293,7 +1297,7 @@ def test_evaluate(
                         best_dice_idx = current_idx_offset
                 
                 # HD95 Batch Accumulation (Conditional)
-                if not fast:
+                if True:
                      # Re-compute batch mean HD95 from sample results for this batch
                      # The last batch_dice_count items in raw_sample_results correspond to this batch
                      # Filter those with valid HD95
@@ -1308,6 +1312,10 @@ def test_evaluate(
     # Post-process HD95 from raw results to ensure consistency
     valid_hd95_values = [r['hd95'] for r in raw_sample_results if not np.isnan(r['hd95'])]
     avg_hd95 = np.mean(valid_hd95_values) if valid_hd95_values else 0.0
+    std_hd95 = np.std(valid_hd95_values) if valid_hd95_values else 0.0
+
+    valid_dice_values = [r['dice'] for r in raw_sample_results]
+    std_dice = np.std(valid_dice_values) if valid_dice_values else 0.0
 
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     avg_dice = total_dice / num_dice_batches if num_dice_batches > 0 else 0.0
@@ -1316,13 +1324,21 @@ def test_evaluate(
     avg_neg_jac = total_neg_jac / num_jac_batches if num_jac_batches > 0 else 0.0
     avg_mag = total_mag / num_batches if num_batches > 0 else 0.0
     
-    # Calculate Per-Label Average Dice
+    # Calculate Per-Label Average Dice and Std
     avg_dice_per_label = {}
+    std_dice_per_label = {}
+    # Extract ALL dice records for each label across batches
+    label_dice_lists = collections.defaultdict(list)
+    for res in raw_sample_results:
+        for k, v in res.get('label_dice', {}).items():
+            label_dice_lists[k].append(v)
+            
     for l_key in total_dice_per_label:
         if total_label_counts[l_key] > 0:
             avg_dice_per_label[l_key] = total_dice_per_label[l_key] / total_label_counts[l_key]
+            std_dice_per_label[l_key] = np.std(label_dice_lists[l_key]) if label_dice_lists[l_key] else 0.0
     
-    return avg_loss, avg_dice, avg_hd95, avg_time, avg_reg_time, avg_neg_jac, avg_mag, best_dice_idx, avg_dice_per_label, raw_sample_results
+    return avg_loss, avg_dice, std_dice, avg_hd95, std_hd95, avg_time, avg_reg_time, avg_neg_jac, avg_mag, best_dice_idx, avg_dice_per_label, std_dice_per_label, raw_sample_results
 
 
 def main():
@@ -1499,10 +1515,10 @@ def main():
 
     with open(log_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'train_loss', 'train_grad_norm', 'train_update_ratio', 'val_loss', 'val_dice', 'val_hd95', 'val_time_sec', 'val_neg_jac_ratio', 'val_mag', 'test_loss', 'test_dice', 'test_hd95', 'test_time_sec', 'test_reg_time_sec', 'test_jac', 'test_mag', 'test_dice_per_label'])
+        writer.writerow(['epoch', 'train_loss', 'train_grad_norm', 'train_update_ratio', 'val_loss', 'test_loss', 'test_dice', 'test_dice_std', 'test_hd95', 'test_hd95_std', 'test_time_sec', 'test_reg_time_sec', 'test_jac', 'test_mag', 'test_dice_per_label', 'test_dice_per_label_std'])
 
     best_loss = float('inf')
-    best_dice = 0.0
+    best_test_dice = 0.0
     # Threshold for "acceptable" folding (NegJac ratio). 
     # If NegJac > 0.01 (1%), we consider the deformation unrealistic despite high Dice.
     NEG_JAC_THRESHOLD = 0.01 
@@ -1534,10 +1550,8 @@ def main():
         current_monitor_loss = avg_loss
 
         if val_loader:
-            # Optimization: Skip expensive metrics (HD95, Jacobian) frequently
-            # Run full metrics only on first epoch and every 5 epochs
-            run_full_metrics = ((epoch + 1) == 1) or ((epoch + 1) % 5 == 0)
-            
+            # Optimization: Skip expensive metrics (HD95, Jacobian) 
+            # We now skip Dice and HD95 and Mag for validation, only computing loss.
             val_loss, val_dice, val_hd95, val_time, val_jac, val_mag = validate(
                 model=model,
                 dataloader=val_loader,
@@ -1545,12 +1559,12 @@ def main():
                 grad_loss_fn=grad_loss_fn,
                 loss_weights=loss_weights,
                 device=device,
-                fast=(not run_full_metrics)
+                fast=True
             )
             
             print(f'Epoch {epoch + 1} | TrainTotal: {avg_loss:.4f} (Img: {last_img_loss:.4f}, Grad: {last_grad_loss:.6f}) | GradNorm: {avg_grad_norm:.6f}, UpdateRatio: {update_ratio:.2%}')
-            metric_suffix = "" if run_full_metrics else " (Fast Val)"
-            print(f'         | Val Loss: {val_loss:.4f}, Dice: {val_dice:.4f}, HD95: {val_hd95:.4f}, NegJac: {val_jac:.4f}{metric_suffix}')
+            metric_suffix = " (Fast Val, Loss Only)"
+            print(f'         | Val Loss: {val_loss:.4f}{metric_suffix}')
             current_monitor_loss = val_loss
         else:
             print(f'Epoch {epoch + 1}, Train Loss: {avg_loss:.6f}, GradNorm: {avg_grad_norm:.6f}, UpdateRatio: {update_ratio:.2%}')
@@ -1565,30 +1579,43 @@ def main():
         test_best_idx = None
         test_dice_per_label = {}
         test_raw_results = []
+        is_best_test_dice = False
         
-        # Optimization: Always run test evaluation to get Dice for CSV, but skip slow metrics (HD95, Jac) unless run_full_metrics
+        # Optimization: Always run test evaluation to get Dice and HD95 for CSV, skip slow metrics (Jac) unless run_full_metrics
+        run_full_metrics = ((epoch + 1) == 1) or ((epoch + 1) % 5 == 0)
         run_test_eval = (test_loader is not None)
 
         if run_test_eval:
-             test_loss, test_dice, test_hd95, test_time, test_reg_time, test_jac, test_mag, test_best_idx, test_dice_per_label, test_raw_results = test_evaluate(
+             # Fast test mode no longer skips HD95, only Jacobian
+             test_loss, test_dice, test_dice_std, test_hd95, test_hd95_std, test_time, test_reg_time, test_jac, test_mag, test_best_idx, test_dice_per_label, test_dice_per_label_std, test_raw_results = test_evaluate(
                 model=model,
                 dataloader=test_loader,
                 image_loss_fn=image_loss_fn,
                 grad_loss_fn=grad_loss_fn,
                 loss_weights=loss_weights,
                 device=device,
-                fast=(not run_full_metrics)
+                fast=False # Force full evaluation every epoch for test to get HD95
             )
              
              test_label_metrics_str = ""
              if test_dice_per_label:
-                 test_label_metrics_str = " | LabelDice: " + ", ".join([f"{k}:{v:.3f}" for k, v in test_dice_per_label.items()])
+                 test_label_metrics_str = " | LabelDice: " + ", ".join([f"{k}:{v:.3f}±{test_dice_per_label_std[k]:.3f}" for k, v in test_dice_per_label.items()])
 
              metric_suffix = "" if run_full_metrics else " (Fast Test)"
-             print(f'  [Monitor] Test Dice: {test_dice:.6f}, HD95: {test_hd95:.6f}, Loss: {test_loss:.6f}, Jac: {test_jac:.6f}, Time: {test_time:.4f}s{test_label_metrics_str}{metric_suffix}')
+             print(f'  [Monitor] Test Dice: {test_dice:.6f}±{test_dice_std:.6f}, HD95: {test_hd95:.6f}±{test_hd95_std:.6f}, Loss: {test_loss:.6f}, Jac: {test_jac:.6f}, Time: {test_time:.4f}s{test_label_metrics_str}{metric_suffix}')
 
-             # Save detailed per-sample results for Boxplot ONLY on full metric epochs
-             if run_full_metrics:
+             if test_dice > best_test_dice:
+                 best_test_dice = test_dice
+                 is_best_test_dice = True
+                 print(f'  [Monitor] * New best Test Dice: {best_test_dice:.6f} *')
+                 
+                 # Save best pt model based on test dice
+                 best_model_path = out_path.parent / f'{out_path.stem}_best_test.pt'
+                 torch.save(model.state_dict(), best_model_path)
+                 print(f'  [Monitor] Saved new best model to {best_model_path.name}')
+
+             # Save detailed per-sample results for Boxplot ONLY when it's the best test dice
+             if is_best_test_dice:
                  detailed_log_file = out_path.parent / f'test_results_detailed_epoch{epoch+1}.csv'
                  if test_raw_results:
                      all_label_keys = set()
@@ -1629,10 +1656,14 @@ def main():
             
             # Prepare dice per label string for CSV (semicolon separated to avoid csv conflict)
             test_dice_per_label_str = ""
+            test_dice_per_label_std_str = ""
             if test_dice_per_label:
                  # Manually format dictionary to avoid 'np.float64(...)' in output
                  items = [f"{k}: {v:.5f}" for k, v in test_dice_per_label.items()]
                  test_dice_per_label_str = "{" + "; ".join(items) + "}"
+                 
+                 items_std = [f"{k}: {v:.5f}" for k, v in test_dice_per_label_std.items()]
+                 test_dice_per_label_std_str = "{" + "; ".join(items_std) + "}"
 
             row = [
                 epoch + 1, 
@@ -1640,19 +1671,17 @@ def main():
                 fmt(avg_grad_norm),
                 fmt(update_ratio),
                 fmt(val_loss), 
-                fmt(val_dice), 
-                fmt(val_hd95), 
-                fmt(val_time), 
-                fmt(val_jac), 
-                fmt(val_mag), 
                 fmt(test_loss), 
                 fmt(test_dice), 
+                fmt(test_dice_std),
                 fmt(test_hd95), 
+                fmt(test_hd95_std),
                 fmt(test_time), 
                 fmt(test_reg_time), 
                 fmt(test_jac), 
                 fmt(test_mag), 
-                test_dice_per_label_str
+                test_dice_per_label_str,
+                test_dice_per_label_std_str
             ]
             writer.writerow(row)
 
@@ -1661,7 +1690,9 @@ def main():
         # -----------------------------
         # Visualization
         # -----------------------------
-        if (epoch + 1) == 1 or (epoch + 1) % 5 == 0:
+        do_visualization = is_best_test_dice
+        
+        if do_visualization:
             vis_dataset = None
             vis_suffix = ''
             best_idx_to_plot = None
@@ -1705,15 +1736,15 @@ def main():
             torch.save(model.state_dict(), ckpt)
             print(f'Checkpoint saved to {ckpt}')
 
-        # Best Model Save (Based on Val Loss)
+        # Best Val Loss track for early stopping
         if current_monitor_loss < best_loss:
             best_loss = current_monitor_loss
-            torch.save(model.state_dict(), out_path)
-            print(f'New best val loss: {best_loss:.6f}. Saved to {out_path.name}')
+            print(f'New best val loss: {best_loss:.6f}.')
 
 
-    torch.save(model.state_dict(), out_path)
-    print(f'Final model saved to {out_path}')
+    # Remove the final epoch arbitrary saving except the very last one
+    torch.save(model.state_dict(), out_path.parent / f'{out_path.stem}_final.pt')
+    print(f'Final model saved to {out_path.parent / f"{out_path.stem}_final.pt"}')
     
     # Plot history
     try:
