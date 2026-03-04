@@ -632,8 +632,8 @@ def plot_history(log_file, output_dir):
             epochs.append(int(row['epoch']))
             train_loss.append(float(row['train_loss']))
             val_loss.append(float(row['val_loss']))
-            val_dice.append(float(row['val_dice']))
-            val_jac.append(float(row['val_neg_jac_ratio']))
+            val_dice.append(float(row.get('val_dice', 0.0)))
+            val_jac.append(float(row.get('val_neg_jac_ratio', 0.0)))
             # Handle potentially missing columns if log file format changed mid-way
             val_mag.append(float(row.get('val_mag', 0.0)))
             test_loss.append(float(row.get('test_loss', 0.0)))
@@ -931,37 +931,29 @@ def train_epoch(
 def compute_hd95(ground_truth, prediction, spacing=None):
     """
     Compute 95th Hausdorff Distance between two binary masks.
-    Attempts to mimic MedPy's behavior using scipy.
+    Uses K-D tree for much faster computation.
     """
     if ground_truth.sum() == 0 or prediction.sum() == 0:
         return np.nan
 
-    # Get boundaries
-    # boundary = mask ^ erosion(mask)
     pred_border = prediction ^ scipy.ndimage.binary_erosion(prediction)
     gt_border = ground_truth ^ scipy.ndimage.binary_erosion(ground_truth)
     
-    # If using voxel spacing, we pass it to distance_transform_edt
-    # sampling arg exists in scipy >= 1.6.0
-    
-    # Compute Distance Transform on the INVERSE of the boundary
-    # dt[x] = distance from x to nearest boundary point
-    dt_gt = scipy.ndimage.distance_transform_edt(~gt_border, sampling=spacing)
-    dt_pred = scipy.ndimage.distance_transform_edt(~pred_border, sampling=spacing)
-
-    # Distances from Prediction boundary to nearest GT boundary point
-    dist_pred_to_gt = dt_gt[pred_border]
-    # Distances from GT boundary to nearest Prediction boundary point
-    dist_gt_to_pred = dt_pred[gt_border]
-    
-    if len(dist_pred_to_gt) == 0 or len(dist_gt_to_pred) == 0:
+    pts_pred = np.argwhere(pred_border)
+    pts_gt = np.argwhere(gt_border)
+    if pts_pred.shape[0] == 0 or pts_gt.shape[0] == 0:
         return np.nan
-
-    # HD95 is typically the 95th percentile of the distances
-    # Definition varies: some implementations take the 95th percentile of all distances (A->B and B->A)
-    # MedPy hd95: "The 95th percentile of the Hausdorff Distance."
-    # It calculates the 95th percentile of the set of all minimum distances.
-    # Usually it's max( percentile(A->B, 95), percentile(B->A, 95) )
+        
+    if spacing is not None:
+        pts_pred = pts_pred * np.array(spacing)
+        pts_gt = pts_gt * np.array(spacing)
+        
+    from scipy.spatial import cKDTree
+    tree_gt = cKDTree(pts_gt)
+    tree_pred = cKDTree(pts_pred)
+    
+    dist_pred_to_gt, _ = tree_gt.query(pts_pred, k=1)
+    dist_gt_to_pred, _ = tree_pred.query(pts_gt, k=1)
     
     hd95_pred_to_gt = np.percentile(dist_pred_to_gt, 95)
     hd95_gt_to_pred = np.percentile(dist_gt_to_pred, 95)
@@ -1261,8 +1253,8 @@ def test_evaluate(
                         'label_dice': label_dice_dict
                     }
                     
-                    # HD95 (Always calculate for test evaluation now)
-                    if True:
+                    # HD95 (Conditional)
+                    if not fast:
                         sample_hd95_sum = 0.0
                         sample_hd95_count = 0
                         for l in u_labels:
@@ -1297,7 +1289,7 @@ def test_evaluate(
                         best_dice_idx = current_idx_offset
                 
                 # HD95 Batch Accumulation (Conditional)
-                if True:
+                if not fast:
                      # Re-compute batch mean HD95 from sample results for this batch
                      # The last batch_dice_count items in raw_sample_results correspond to this batch
                      # Filter those with valid HD95
@@ -1316,6 +1308,9 @@ def test_evaluate(
 
     valid_dice_values = [r['dice'] for r in raw_sample_results]
     std_dice = np.std(valid_dice_values) if valid_dice_values else 0.0
+
+    valid_jac_values = [r['jac'] for r in raw_sample_results if 'jac' in r]
+    std_neg_jac = np.std(valid_jac_values) if valid_jac_values else 0.0
 
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
     avg_dice = total_dice / num_dice_batches if num_dice_batches > 0 else 0.0
@@ -1338,7 +1333,7 @@ def test_evaluate(
             avg_dice_per_label[l_key] = total_dice_per_label[l_key] / total_label_counts[l_key]
             std_dice_per_label[l_key] = np.std(label_dice_lists[l_key]) if label_dice_lists[l_key] else 0.0
     
-    return avg_loss, avg_dice, std_dice, avg_hd95, std_hd95, avg_time, avg_reg_time, avg_neg_jac, avg_mag, best_dice_idx, avg_dice_per_label, std_dice_per_label, raw_sample_results
+    return avg_loss, avg_dice, std_dice, avg_hd95, std_hd95, avg_time, avg_reg_time, avg_neg_jac, std_neg_jac, avg_mag, best_dice_idx, avg_dice_per_label, std_dice_per_label, raw_sample_results
 
 
 def main():
@@ -1498,7 +1493,7 @@ def main():
     config_file = out_path.parent / 'config.txt'
     with open(config_file, 'w') as f:
         f.write(f"Training Configuration:\n")
-        f.write(f"Timestamp: {timestamp}\n")
+        f.write(f"Start Time: {timestamp}\n")
         f.write(f"Dataset: {Path(args.ct_dir).parent.parent.parent.name}\n")
         f.write(f"Device: {device}\n")
         f.write(f"Epochs: {args.epochs}\n")
@@ -1515,7 +1510,7 @@ def main():
 
     with open(log_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'train_loss', 'train_grad_norm', 'train_update_ratio', 'val_loss', 'test_loss', 'test_dice', 'test_dice_std', 'test_hd95', 'test_hd95_std', 'test_time_sec', 'test_reg_time_sec', 'test_jac', 'test_mag', 'test_dice_per_label', 'test_dice_per_label_std'])
+        writer.writerow(['epoch', 'train_loss', 'train_grad_norm', 'train_update_ratio', 'val_loss', 'test_loss', 'test_dice', 'test_dice_std', 'test_hd95', 'test_hd95_std', 'test_time_sec', 'test_reg_time_sec', 'test_jac', 'test_jac_std', 'test_mag', 'test_dice_per_label', 'test_dice_per_label_std'])
 
     best_loss = float('inf')
     best_test_dice = 0.0
@@ -1586,36 +1581,49 @@ def main():
         run_test_eval = (test_loader is not None)
 
         if run_test_eval:
-             # Fast test mode no longer skips HD95, only Jacobian
-             test_loss, test_dice, test_dice_std, test_hd95, test_hd95_std, test_time, test_reg_time, test_jac, test_mag, test_best_idx, test_dice_per_label, test_dice_per_label_std, test_raw_results = test_evaluate(
+             # Evaluate on the test dataset
+             fast_eval = not run_full_metrics
+             test_loss, test_dice, test_dice_std, test_hd95, test_hd95_std, test_time, test_reg_time, test_jac, test_jac_std, test_mag, test_best_idx, test_dice_per_label, test_dice_per_label_std, test_raw_results = test_evaluate(
                 model=model,
                 dataloader=test_loader,
                 image_loss_fn=image_loss_fn,
                 grad_loss_fn=grad_loss_fn,
                 loss_weights=loss_weights,
                 device=device,
-                fast=False # Force full evaluation every epoch for test to get HD95
-            )
+                fast=fast_eval # HD95 only calculated if fast=False
+             )
              
-             test_label_metrics_str = ""
-             if test_dice_per_label:
-                 test_label_metrics_str = " | LabelDice: " + ", ".join([f"{k}:{v:.3f}±{test_dice_per_label_std[k]:.3f}" for k, v in test_dice_per_label.items()])
-
-             metric_suffix = "" if run_full_metrics else " (Fast Test)"
-             print(f'  [Monitor] Test Dice: {test_dice:.6f}±{test_dice_std:.6f}, HD95: {test_hd95:.6f}±{test_hd95_std:.6f}, Loss: {test_loss:.6f}, Jac: {test_jac:.6f}, Time: {test_time:.4f}s{test_label_metrics_str}{metric_suffix}')
-
              if test_dice > best_test_dice:
                  best_test_dice = test_dice
                  is_best_test_dice = True
                  print(f'  [Monitor] * New best Test Dice: {best_test_dice:.6f} *')
-                 
+                 if fast_eval:
+                     print(f"  [Monitor] New best Test Dice detected, re-evaluating to compute HD95...")
+                     _, _, _, test_hd95, test_hd95_std, _, _, test_jac, test_jac_std, _, _, _, _, test_raw_results = test_evaluate(
+                        model=model,
+                        dataloader=test_loader,
+                        image_loss_fn=image_loss_fn,
+                        grad_loss_fn=grad_loss_fn,
+                        loss_weights=loss_weights,
+                        device=device,
+                        fast=False
+                     )
+
+             test_label_metrics_str = ""
+             if test_dice_per_label:
+                 test_label_metrics_str = " | LabelDice: " + ", ".join([f"{k}:{v:.3f}±{test_dice_per_label_std[k]:.3f}" for k, v in test_dice_per_label.items()])
+
+             metric_suffix = "" if run_full_metrics else (" (Fast Test -> Full)" if is_best_test_dice else " (Fast Test)")
+             print(f'  [Monitor] Test Dice: {test_dice:.6f}±{test_dice_std:.6f}, HD95: {test_hd95:.6f}±{test_hd95_std:.6f}, Loss: {test_loss:.6f}, Jac: {test_jac:.6f}±{test_jac_std:.6f}, Time: {test_time:.4f}s{test_label_metrics_str}{metric_suffix}')
+             
+             if is_best_test_dice:
                  # Save best pt model based on test dice
                  best_model_path = out_path.parent / f'{out_path.stem}_best_test.pt'
                  torch.save(model.state_dict(), best_model_path)
                  print(f'  [Monitor] Saved new best model to {best_model_path.name}')
 
              # Save detailed per-sample results for Boxplot ONLY when it's the best test dice
-             if is_best_test_dice:
+             if is_best_test_dice or run_full_metrics:
                  detailed_log_file = out_path.parent / f'test_results_detailed_epoch{epoch+1}.csv'
                  if test_raw_results:
                      all_label_keys = set()
@@ -1623,7 +1631,7 @@ def main():
                          all_label_keys.update(res['label_dice'].keys())
                      sorted_keys = sorted(list(all_label_keys))
                      
-                     header = ['sample_idx', 'filename', 'dice', 'hd95'] + [f'dice_label_{k}' for k in sorted_keys]
+                     header = ['sample_idx', 'filename', 'dice', 'hd95', 'jac'] + [f'dice_label_{k}' for k in sorted_keys]
                      
                      with open(detailed_log_file, 'w', newline='') as f_detail:
                          w_detail = csv.DictWriter(f_detail, fieldnames=header)
@@ -1633,7 +1641,8 @@ def main():
                                  'sample_idx': res['sample_idx'],
                                  'filename': res.get('filename', ''),
                                  'dice': f"{res['dice']:.5f}",
-                                 'hd95': f"{res['hd95']:.5f}" if not np.isnan(res['hd95']) else ''
+                                 'hd95': f"{res.get('hd95', 0):.5f}" if 'hd95' in res and not np.isnan(res.get('hd95', np.nan)) else '',
+                                 'jac': f"{res['jac']:.5f}" if 'jac' in res else ''
                              }
                              for k in sorted_keys:
                                  val = res['label_dice'].get(k, '')
@@ -1679,6 +1688,7 @@ def main():
                 fmt(test_time), 
                 fmt(test_reg_time), 
                 fmt(test_jac), 
+                fmt(test_jac_std),
                 fmt(test_mag), 
                 test_dice_per_label_str,
                 test_dice_per_label_std_str
@@ -1690,7 +1700,7 @@ def main():
         # -----------------------------
         # Visualization
         # -----------------------------
-        do_visualization = is_best_test_dice
+        do_visualization = is_best_test_dice or run_full_metrics
         
         if do_visualization:
             vis_dataset = None
@@ -1746,6 +1756,13 @@ def main():
     torch.save(model.state_dict(), out_path.parent / f'{out_path.stem}_final.pt')
     print(f'Final model saved to {out_path.parent / f"{out_path.stem}_final.pt"}')
     
+    # Save end time to config
+    finish_utc = datetime.datetime.utcnow()
+    finish_beijing = finish_utc + datetime.timedelta(hours=8)
+    finish_timestamp = finish_beijing.strftime('%Y%m%d_%H%M%S')
+    with open(config_file, 'a') as f:
+        f.write(f"End Time: {finish_timestamp}\n")
+
     # Plot history
     try:
         plot_history(log_file, out_path.parent)
