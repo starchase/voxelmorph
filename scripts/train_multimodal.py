@@ -11,6 +11,7 @@ import collections
 import csv
 import logging
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import time
 from pathlib import Path
 from typing import Sequence, List, Optional
@@ -1414,6 +1415,7 @@ def main():
     grad_loss_fn = ne.nn.modules.SpatialGradient('l2')
     loss_weights = [1.0, args.lambda_param]
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
 
     # Dataloader
     # Switch to Map-style Dataset for consistent epoch definition
@@ -1750,6 +1752,11 @@ def main():
         if current_monitor_loss < best_loss:
             best_loss = current_monitor_loss
             print(f'New best val loss: {best_loss:.6f}.')
+
+        # Scheduler step based on Test Dice (maximize)
+        scheduler.step(test_dice)
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Current LR: {current_lr}")
 
 
     # Remove the final epoch arbitrary saving except the very last one
