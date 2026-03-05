@@ -1495,6 +1495,7 @@ def main():
     config_file = out_path.parent / 'config.txt'
     with open(config_file, 'w') as f:
         f.write(f"Training Configuration:\n")
+        f.write(f"Timestamp: {timestamp}\n")
         f.write(f"Start Time: {timestamp}\n")
         f.write(f"Dataset: {Path(args.ct_dir).parent.parent.parent.name}\n")
         f.write(f"Device: {device}\n")
@@ -1504,6 +1505,11 @@ def main():
         f.write(f"NCC Window: {args.ncc_win}\n")
         f.write(f"Lambda: {args.lambda_param}\n")
         f.write(f"LR: {args.lr}\n")
+        # Write integration steps info (using hardcoded value as it was set in the script, you might want to change it to dynamically get model param or args later)
+        if hasattr(args, 'integration_steps'):
+            f.write(f"Integration Steps: {args.integration_steps}\n")
+        else:
+            f.write(f"Integration Steps: 0\n")  # Fallback to current hardcoded integration_steps=0 based on context
         f.write(f"Unpaired: {args.unpaired}\n")
         f.write(f"Val Paired: {args.val_paired}\n")
         f.write(f"Model Architecture: VxmPairwise\n")
@@ -1702,7 +1708,7 @@ def main():
         # -----------------------------
         # Visualization
         # -----------------------------
-        do_visualization = is_best_test_dice or run_full_metrics
+        do_visualization = False # 快速验证超参期间关闭可视化 (原为: is_best_test_dice or run_full_metrics)
         
         if do_visualization:
             vis_dataset = None
