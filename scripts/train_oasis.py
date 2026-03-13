@@ -70,9 +70,9 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
                 
             if is_label:
                 # Filter labels to only include: 
-                # Lateral Ventricles (3, 22), Inf Lat Vent (4, 23)
+                # Lateral Ventricles (3, 22)
                 # 3rd Ventricle (11), Thalamus (7, 26), Hippocampus (14, 30)
-                labels_to_keep = [3, 4, 7, 11, 14, 22, 23, 26, 30]
+                labels_to_keep = [3, 7, 11, 14, 22, 26, 30]
                 mask = np.isin(slice_np, labels_to_keep)
                 slice_np = np.where(mask, slice_np, 0)
                 
@@ -123,12 +123,27 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
         # --- Row 2: Label Overlays & Result vs GT ---
         if has_labels:
             def get_color(lbl, is_fixed=False):
-                # Map label ID directly to tab20 so same labels get same colors
-                c = plt.get_cmap('tab20')(int(lbl) % 20)
-                if is_fixed:
-                    # Darken the color for fixed (Target) images
-                    return (c[0]*0.4, c[1]*0.4, c[2]*0.4, c[3])
-                return c
+                # Group Left/Right variants of the same structure to the same color
+                lbl_map = {3: 0, 22: 0, 7: 1, 26: 1, 11: 2, 14: 3, 30: 3}
+                mapped_lbl = lbl_map.get(int(lbl), int(lbl))
+                
+                # Hand-picked colors to ensure high visibility on gray images
+                # Format: (Source/Moving color, Target/Fixed color)
+                # Ensure they are same color family but explicitly distinguishable and both bright
+                color_pairs = {
+                    0: ('#1f77b4', '#00bfff'), # Dark Blue vs Deep Sky Blue
+                    1: ('#ff7f0e', '#ffd700'), # Orange vs Gold/Yellow
+                    2: ('#2ca02c', '#32cd32'), # Green vs Lime Green
+                    3: ('#d62728', '#ff69b4'), # Red vs Hot Pink
+                }
+                
+                if mapped_lbl in color_pairs:
+                    hex_color = color_pairs[mapped_lbl][1 if is_fixed else 0]
+                else:
+                    hex_color = '#ffffff'
+                    
+                import matplotlib.colors as mcolors
+                return mcolors.to_rgba(hex_color)
 
             def plot_label_contour(ax, bg_img, label_img, title, is_fixed=False):
                 ax.imshow(bg_img, cmap='gray')
@@ -363,10 +378,19 @@ def train_epoch(
         displacement, warped_source = out[0], out[1]
 
         img_loss = image_loss_fn(y, warped_source).mean()
+        
+        # If the loss function is NCC (which computes similarity), we need to minimize -NCC
+        if isinstance(image_loss_fn, ne.nn.modules.NCC):
+            img_loss = -img_loss
+            
         grad_loss = grad_loss_fn(displacement).mean()
 
         loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
         loss.backward()
+        
+        # 增加梯度裁剪，防止 NCC 在背景区域计算导致梯度爆炸
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
         optimizer.step()
         total_loss += loss.item()
 
@@ -377,10 +401,10 @@ def main():
     parser.add_argument('--output', type=str, default='/root/autodl-tmp/models/oasis_vxm.pt', help='Output model path')
     parser.add_argument('--epochs', type=int, default=200, help='Number of epochs')
     parser.add_argument('--workers', type=int, default=8, help='Number of workers')
-    parser.add_argument('--batch-size', type=int, default=2, help='Batch size')
+    parser.add_argument('--batch-size', type=int, default=1, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--loss', type=str, default='ncc', choices=['mse', 'ncc'], help='Image similarity loss')
-    parser.add_argument('--lambda', type=float, dest='lambda_param', default=1.0, help='Weight of gradient loss')
+    parser.add_argument('--lambda', type=float, dest='lambda_param', default=0.01, help='Weight of gradient loss')
     parser.add_argument('--gpu', type=str, default='0', help='GPU ID')
     parser.add_argument('--save-every', type=int, default=10, help='Checkpoint every N epochs')
     parser.add_argument('--patience', type=int, default=20, help='Early stopping patience')
@@ -395,18 +419,25 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f'Using device: {device}')
 
-    # Create model (using VoxelMorph-1 / VoxelMorph-2 standard capacity)
+    # Create model (using VoxelMorph-2 extended capacity)
     model = vxm.nn.models.VxmPairwise(
         ndim=3,
         source_channels=1,
         target_channels=1,
-        nb_features=[16, 32, 32, 32, 32],
+        # 使用更大的接收野和更宽的通道，这是能压平复杂脑回的关键
+        nb_features=[
+            # 编码器4层，刚好对应图像尺寸 160(可整除16)，避免空间维度拼接不匹配
+            [32, 64, 64, 64], 
+            # 解码器4层，与编码器对称
+            [64, 64, 64, 32]
+        ],
         integration_steps=0, # set to 7 if you want diffeomorphic fields
     ).to(device)
 
     # Setup losses and optimizer
     if args.loss.lower() == 'ncc':
-        image_loss_fn = ne.nn.modules.NCC()
+        # 增大 eps (默认是 1e-5)，防止由于图像大面积黑色背景(方差近乎 0)导致的除零/梯度爆炸
+        image_loss_fn = ne.nn.modules.NCC(eps=1e-3)
     else:
         image_loss_fn = ne.nn.modules.MSE()
         
@@ -421,8 +452,10 @@ def main():
     train_composed = transforms.Compose([trans.NumpyType((np.float32, np.int16))])
     val_composed = transforms.Compose([trans.NumpyType((np.float32, np.int16))])
     
-    train_set = datasets.OASISBrainDataset(glob.glob(args.train_dir + '*.pkl'), transforms=train_composed)
-    val_set = datasets.OASISBrainInferDataset(glob.glob(args.val_dir + '*.pkl'), transforms=val_composed)
+    train_pattern = os.path.join(args.train_dir, '*.pkl')
+    val_pattern = os.path.join(args.val_dir, '*.pkl')
+    train_set = datasets.OASISBrainDataset(glob.glob(train_pattern), transforms=train_composed)
+    val_set = datasets.OASISBrainInferDataset(glob.glob(val_pattern), transforms=val_composed)
     
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
     val_loader = DataLoader(val_set, batch_size=1, shuffle=False, num_workers=args.workers, pin_memory=True, drop_last=True)
@@ -469,6 +502,7 @@ def main():
     print(f'Training for {args.epochs} epochs...')
     best_dsc = 0.0
     loss_history = []
+    val_dsc_history = []
     
     for epoch in range(args.epochs):
         avg_loss = train_epoch(
@@ -488,6 +522,7 @@ def main():
             dataloader=val_loader,
             device=device
         )
+        val_dsc_history.append(val_dsc)
         
         # Step the learning rate scheduler
         scheduler.step()
@@ -524,6 +559,36 @@ def main():
             best_path = out_path.parent / f'{out_path.stem}_best.pt'
             torch.save(model.state_dict(), best_path)
             print(f'Saved new best model with DSC: {best_dsc:.6f}')
+
+        if (epoch + 1) % 10 == 0:
+            try:
+                fig, ax1 = plt.subplots(figsize=(10, 6))
+                
+                color = 'tab:red'
+                ax1.set_xlabel('Epoch')
+                ax1.set_ylabel('Train Loss', color=color)
+                ax1.plot(range(1, epoch + 2), loss_history, color=color, marker='o', markersize=4, label='Train Loss')
+                ax1.tick_params(axis='y', labelcolor=color)
+                
+                ax2 = ax1.twinx()
+                color = 'tab:blue'
+                ax2.set_ylabel('Val DSC', color=color)
+                ax2.plot(range(1, epoch + 2), val_dsc_history, color=color, marker='s', markersize=4, label='Val DSC')
+                ax2.tick_params(axis='y', labelcolor=color)
+                
+                lines, labels = ax1.get_legend_handles_labels()
+                lines2, labels2 = ax2.get_legend_handles_labels()
+                ax2.legend(lines + lines2, labels + labels2, loc='upper left' if loss_history[0] > loss_history[-1] else 'center right')
+                
+                plt.title(f'Learning Curves (Epoch 1 to {epoch + 1})')
+                fig.tight_layout()
+                ax1.grid(True, linestyle='--', alpha=0.6)
+                
+                plot_path = out_path.parent / f'learning_curves_epoch{epoch + 1}.png'
+                plt.savefig(str(plot_path), dpi=150)
+                plt.close(fig)
+            except Exception as e:
+                print(f"Failed to save learning curve plot: {e}")
 
     # Save final model
     torch.save(model.state_dict(), out_path)
