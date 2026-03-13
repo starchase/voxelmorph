@@ -1372,6 +1372,7 @@ def main():
     parser.add_argument(
         '--warm-start', type=int, default=10, help='Early stopping warm start steps'
     )
+    parser.add_argument('--integration-steps', type=int, default=0, help='number of integration steps for diffeomorphic registration')
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1398,7 +1399,7 @@ def main():
         # Down: [16, 32, 32, 32, 32] (Length 5)
         # Up:   [32, 32, 32, 32, 32] (Length 5 -> num_blocks = 5)
         nb_features=([16, 32, 32, 32, 32], [32, 32, 32, 32, 32]),
-        integration_steps=7,
+        integration_steps=args.integration_steps,
     ).to(device)
 
     # Losses
@@ -1505,11 +1506,7 @@ def main():
         f.write(f"NCC Window: {args.ncc_win}\n")
         f.write(f"Lambda: {args.lambda_param}\n")
         f.write(f"LR: {args.lr}\n")
-        # Write integration steps info (using hardcoded value as it was set in the script, you might want to change it to dynamically get model param or args later)
-        if hasattr(args, 'integration_steps'):
-            f.write(f"Integration Steps: {args.integration_steps}\n")
-        else:
-            f.write(f"Integration Steps: 0\n")  # Fallback to current hardcoded integration_steps=0 based on context
+        f.write(f"Integration Steps: {args.integration_steps}\n")
         f.write(f"Unpaired: {args.unpaired}\n")
         f.write(f"Val Paired: {args.val_paired}\n")
         f.write(f"Model Architecture: VxmPairwise\n")
@@ -1606,20 +1603,12 @@ def main():
                  is_best_test_dice = True
                  print(f'  [Monitor] * New best Test Dice: {best_test_dice:.6f} *')
                  if fast_eval:
-                     print(f"  [Monitor] New best Test Dice detected, re-evaluating to compute HD95...")
-                     _, _, _, test_hd95, test_hd95_std, _, _, test_jac, test_jac_std, _, _, _, _, test_raw_results = test_evaluate(
-                        model=model,
-                        dataloader=test_loader,
-                        image_loss_fn=image_loss_fn,
-                        grad_loss_fn=grad_loss_fn,
-                        loss_weights=loss_weights,
-                        device=device,
-                        fast=False
-                     )
+                     pass # 关掉新高test_dice时计算hd95和jac，最大程度加快进度
 
              test_label_metrics_str = ""
-             if test_dice_per_label:
-                 test_label_metrics_str = " | LabelDice: " + ", ".join([f"{k}:{v:.3f}±{test_dice_per_label_std[k]:.3f}" for k, v in test_dice_per_label.items()])
+             # 关掉明细dice打印
+             # if test_dice_per_label:
+             #    test_label_metrics_str = " | LabelDice: " + ", ".join([f"{k}:{v:.3f}±{test_dice_per_label_std[k]:.3f}" for k, v in test_dice_per_label.items()])
 
              metric_suffix = "" if run_full_metrics else (" (Fast Test -> Full)" if is_best_test_dice else " (Fast Test)")
              print(f'  [Monitor] Test Dice: {test_dice:.6f}±{test_dice_std:.6f}, HD95: {test_hd95:.6f}±{test_hd95_std:.6f}, Loss: {test_loss:.6f}, Jac: {test_jac:.6f}±{test_jac_std:.6f}, Time: {test_time:.4f}s{test_label_metrics_str}{metric_suffix}')
@@ -1631,34 +1620,34 @@ def main():
                  print(f'  [Monitor] Saved new best model to {best_model_path.name}')
 
              # Save detailed per-sample results for Boxplot ONLY when it's the best test dice
-             if is_best_test_dice or run_full_metrics:
-                 detailed_log_file = out_path.parent / f'test_results_detailed_epoch{epoch+1}.csv'
-                 if test_raw_results:
-                     all_label_keys = set()
-                     for res in test_raw_results:
-                         all_label_keys.update(res['label_dice'].keys())
-                     sorted_keys = sorted(list(all_label_keys))
-                     
-                     header = ['sample_idx', 'filename', 'dice', 'hd95', 'jac'] + [f'dice_label_{k}' for k in sorted_keys]
-                     
-                     with open(detailed_log_file, 'w', newline='') as f_detail:
-                         w_detail = csv.DictWriter(f_detail, fieldnames=header)
-                         w_detail.writeheader()
-                         for res in test_raw_results:
-                             row_data = {
-                                 'sample_idx': res['sample_idx'],
-                                 'filename': res.get('filename', ''),
-                                 'dice': f"{res['dice']:.5f}",
-                                 'hd95': f"{res.get('hd95', 0):.5f}" if 'hd95' in res and not np.isnan(res.get('hd95', np.nan)) else '',
-                                 'jac': f"{res['jac']:.5f}" if 'jac' in res else ''
-                             }
-                             for k in sorted_keys:
-                                 val = res['label_dice'].get(k, '')
-                                 if isinstance(val, (float, np.floating)):
-                                     row_data[f'dice_label_{k}'] = f"{val:.5f}"
-                                 else:
-                                     row_data[f'dice_label_{k}'] = val
-                             w_detail.writerow(row_data)
+             # if is_best_test_dice or run_full_metrics:
+             #     detailed_log_file = out_path.parent / f'test_results_detailed_epoch{epoch+1}.csv'
+             #     if test_raw_results:
+             #         all_label_keys = set()
+             #         for res in test_raw_results:
+             #             all_label_keys.update(res['label_dice'].keys())
+             #         sorted_keys = sorted(list(all_label_keys))
+             #         
+             #         header = ['sample_idx', 'filename', 'dice', 'hd95', 'jac'] + [f'dice_label_{k}' for k in sorted_keys]
+             #         
+             #         with open(detailed_log_file, 'w', newline='') as f_detail:
+             #             w_detail = csv.DictWriter(f_detail, fieldnames=header)
+             #             w_detail.writeheader()
+             #             for res in test_raw_results:
+             #                 row_data = {
+             #                     'sample_idx': res['sample_idx'],
+             #                     'filename': res.get('filename', ''),
+             #                     'dice': f"{res['dice']:.5f}",
+             #                     'hd95': f"{res.get('hd95', 0):.5f}" if 'hd95' in res and not np.isnan(res.get('hd95', np.nan)) else '',
+             #                     'jac': f"{res['jac']:.5f}" if 'jac' in res else ''
+             #                 }
+             #                 for k in sorted_keys:
+             #                     val = res['label_dice'].get(k, '')
+             #                     if isinstance(val, (float, np.floating)):
+             #                         row_data[f'dice_label_{k}'] = f"{val:.5f}"
+             #                     else:
+             #                         row_data[f'dice_label_{k}'] = val
+             #                 w_detail.writerow(row_data)
         
 
         # -----------------------------
