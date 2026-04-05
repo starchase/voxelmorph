@@ -1398,7 +1398,8 @@ def main():
         # Note: Neurite BasicUNet requires: len(down_features) == len(up_features) - 1
         # Down: [16, 32, 32, 32, 32] (Length 5)
         # Up:   [32, 32, 32, 32, 32] (Length 5 -> num_blocks = 5)
-        nb_features=([16, 32, 32, 32, 32], [32, 32, 32, 32, 32]),
+        # nb_features=([16, 32, 32, 32, 32], [32, 32, 32, 32, 32]),
+        nb_features=([32, 64, 64, 64], [64, 64, 64, 32]),
         integration_steps=args.integration_steps,
     ).to(device)
 
