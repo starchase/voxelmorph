@@ -21,6 +21,7 @@ from . import losses
 from . import models
 from . import modules
 from . import fpn
+from . import adaptive_fda
 
 __all__ = [
     "functional",
@@ -28,7 +29,9 @@ __all__ = [
     "models",
     "modules",
     "fpn",
+    "adaptive_fda",
 ]
 from .fpn import VxmFPN, FPNDecoder, SimpleFeatureExtractor
 from .fpn_siamese import SiameseFeatureExtractor
 from .siamese_baseline import SiameseUNetBaseline
+from .adaptive_fda import AdaptiveFDA3D
