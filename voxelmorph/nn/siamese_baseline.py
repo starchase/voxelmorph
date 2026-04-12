@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .modules import SpatialTransformer, IntegrateVelocityField
+from .adaptive_fda import AdaptiveFDA3D
 
 class ConvBlock(nn.Module):
     """
@@ -39,17 +40,70 @@ class SharedEncoder(nn.Module):
 
 class SiameseUNetBaseline(nn.Module):
     """
-    Vanilla Siamese U-Net Baseline.
-    - Shared Encoder
-    - Standard Unet Decoder (No Coarse-to-fine sub-flows yet)
-    - Concatenation-based Skip Connections (No Diff-Aware yet)
-    - No Frequency Domain Alignment yet
+    Vanilla Siamese U-Net Baseline with optional Adaptive FDA.
+
+    Architecture overview
+    ---------------------
+    - Shared Encoder (Siamese)
+    - Standard UNet Decoder (concatenation-based skip connections)
+    - Optional Adaptive FDA module at the input stage (Ablation 1)
+
+    Parameters
+    ----------
+    inshape : tuple
+        Spatial shape of the input volume, e.g. ``(D, H, W)``.
+    in_channels : int
+        Number of input image channels.
+    enc_nf : list of int
+        Number of feature maps at each encoder level.
+    dec_nf : list of int
+        Number of feature maps at each decoder level.
+    ndim : int
+        Number of spatial dimensions (3 for 3-D volumes).
+    int_steps : int
+        Number of integration steps for diffeomorphic registration.
+        ``0`` disables diffeomorphic integration (SVF).
+    use_fda : bool
+        Whether to prepend an :class:`~voxelmorph.nn.adaptive_fda.AdaptiveFDA3D`
+        module before the encoder.  When ``True``, the source image is adapted
+        towards the target's low-frequency appearance before feature extraction.
+    fda_beta_init : float
+        Initial beta bandwidth for the FDA module (only used when
+        ``use_fda=True``).
+    fda_mode : str
+        FDA operating mode: ``'fixed'``, ``'learnable'``, or ``'adaptive'``.
+        See :class:`~voxelmorph.nn.adaptive_fda.AdaptiveFDA3D` for details.
     """
-    def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0):
+
+    def __init__(
+        self,
+        inshape,
+        in_channels=1,
+        enc_nf=[16, 32, 32, 32],
+        dec_nf=[32, 32, 32, 16],
+        ndim=3,
+        int_steps=0,
+        use_fda: bool = False,
+        fda_beta_init: float = 0.1,
+        fda_mode: str = "learnable",
+    ):
         super().__init__()
         self.inshape = inshape
         self.ndim = ndim
         self.int_steps = int_steps
+
+        # --- [Ablation 1: Adaptive FDA] ---
+        # Decoupled as a stand-alone module so it can be removed cleanly for
+        # ablation experiments without touching the rest of the network.
+        self.fda = (
+            AdaptiveFDA3D(
+                beta_init=fda_beta_init,
+                mode=fda_mode,
+                in_channels=in_channels,
+            )
+            if use_fda
+            else None
+        )
 
         # 1. Shared Encoder
         self.encoder = SharedEncoder(in_channels, enc_nf, ndim)
@@ -89,8 +143,15 @@ class SiameseUNetBaseline(nn.Module):
             self.integrate = None
 
     def forward(self, source, target, return_warped_source=True, return_field_type='displacement'):
-        # --- [Ablation 1 Hook: FDA will go here] ---
-        source_input = source
+        # --- [Ablation 1: Adaptive FDA] ---
+        # Adapt source appearance towards target in the Fourier domain.
+        # When self.fda is None (use_fda=False) this is a no-op, giving the
+        # vanilla baseline.  The original source tensor is kept for warping
+        # at the end so that the output image is in the original source space.
+        if self.fda is not None:
+            source_input = self.fda(source, target)
+        else:
+            source_input = source
         target_input = target
         
         # 1. Feature Extraction (Shared)

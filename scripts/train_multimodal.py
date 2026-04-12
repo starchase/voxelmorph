@@ -1380,6 +1380,33 @@ def main():
         '--warm-start', type=int, default=10, help='Early stopping warm start steps'
     )
     parser.add_argument('--integration-steps', type=int, default=0, help='number of integration steps for diffeomorphic registration')
+    parser.add_argument(
+        '--fda-beta',
+        type=float,
+        default=None,
+        help=(
+            'Enable the Adaptive FDA module with this initial beta bandwidth (e.g. 0.1). '
+            'Beta controls the half-width of the low-frequency window used to transfer '
+            'amplitude statistics from target (MR) to source (CT). '
+            'When --fda-mode is "learnable" or "adaptive", this value is the starting '
+            'point and beta is further optimised end-to-end during training. '
+            'Omit this flag to disable FDA entirely (vanilla baseline).'
+        ),
+    )
+    parser.add_argument(
+        '--fda-mode',
+        type=str,
+        choices=['fixed', 'learnable', 'adaptive'],
+        default='learnable',
+        help=(
+            'Operating mode of the Adaptive FDA module (only used when --fda-beta is set). '
+            '"fixed": beta is a constant hyperparameter (no gradient, ablation baseline). '
+            '"learnable": beta is a single shared nn.Parameter trained end-to-end via SGD. '
+            '"adaptive": beta is predicted per-sample by a lightweight network conditioned '
+            'on the spectral difference between source and target. '
+            'Default: "learnable".'
+        ),
+    )
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1399,13 +1426,22 @@ def main():
     inshape = tuple(sample['source'].shape[1:])
 
     # Model: SiameseUNetBaseline
+    use_fda = args.fda_beta is not None
     model = vxm.nn.SiameseUNetBaseline(
         inshape=inshape,
         ndim=3,
         enc_nf=[32, 64, 64, 64],
         dec_nf=[64, 64, 64, 32],
         int_steps=args.integration_steps,
+        use_fda=use_fda,
+        fda_beta_init=args.fda_beta if use_fda else 0.1,
+        fda_mode=args.fda_mode,
     ).to(device)
+
+    if use_fda:
+        print(
+            f'Adaptive FDA enabled: mode={args.fda_mode}, beta_init={args.fda_beta:.4f}'
+        )
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'Model Total Trainable Parameters: {total_params:,}')
@@ -1513,6 +1549,8 @@ def main():
         f.write(f"Lambda: {args.lambda_param}\n")
         f.write(f"LR: {args.lr}\n")
         f.write(f"Integration Steps: {args.integration_steps}\n")
+        f.write(f"FDA Beta: {args.fda_beta}\n")
+        f.write(f"FDA Mode: {args.fda_mode}\n")
         f.write(f"Unpaired: {args.unpaired}\n")
         f.write(f"Val Paired: {args.val_paired}\n")
         f.write(f"Model Architecture: SiameseUNetBaseline\n")
