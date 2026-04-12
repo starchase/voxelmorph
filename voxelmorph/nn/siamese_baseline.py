@@ -1,0 +1,138 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from .modules import SpatialTransformer, IntegrateVelocityField
+
+class ConvBlock(nn.Module):
+    """
+    A specific convolutional block for UNet.
+    """
+    def __init__(self, ndim, in_channels, out_channels, stride=1):
+        super().__init__()
+        Conv = getattr(nn, f'Conv{ndim}d')
+        self.main = Conv(in_channels, out_channels, 3, stride, 1)
+        self.activation = nn.LeakyReLU(0.2)
+
+    def forward(self, x):
+        return self.activation(self.main(x))
+
+class SharedEncoder(nn.Module):
+    """
+    Shared dual-stream encoder for Siamese Network.
+    Extracts features identically for both Source and Target.
+    """
+    def __init__(self, in_channels=1, enc_nf=[16, 32, 32, 32], ndim=3):
+        super().__init__()
+        self.enc_blocks = nn.ModuleList()
+        prev_channels = in_channels
+        
+        for nf in enc_nf:
+            self.enc_blocks.append(ConvBlock(ndim, prev_channels, nf, stride=2))
+            prev_channels = nf
+
+    def forward(self, x):
+        features = []
+        for block in self.enc_blocks:
+            x = block(x)
+            features.append(x)
+        return features
+
+class SiameseUNetBaseline(nn.Module):
+    """
+    Vanilla Siamese U-Net Baseline.
+    - Shared Encoder
+    - Standard Unet Decoder (No Coarse-to-fine sub-flows yet)
+    - Concatenation-based Skip Connections (No Diff-Aware yet)
+    - No Frequency Domain Alignment yet
+    """
+    def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0):
+        super().__init__()
+        self.inshape = inshape
+        self.ndim = ndim
+        self.int_steps = int_steps
+
+        # 1. Shared Encoder
+        self.encoder = SharedEncoder(in_channels, enc_nf, ndim)
+        
+        # 2. Standard Decoder
+        self.dec_blocks = nn.ModuleList()
+        self.up_blocks = nn.ModuleList()
+        
+        prev_channels = enc_nf[-1] * 2  # The very bottom layer merges source and target
+        
+        for i, nf in enumerate(dec_nf):
+            # For ablation extensibility, we keep the decode path modular
+            # Normal skip connection includes: Upsampled features + Source Skip + Target Skip
+            skip_idx = len(enc_nf) - 2 - i
+            skip_channels = enc_nf[skip_idx] * 2 if skip_idx >= 0 else 0
+            
+            in_ch = prev_channels + skip_channels
+            
+            self.dec_blocks.append(ConvBlock(ndim, in_ch, nf, stride=1))
+            prev_channels = nf
+            
+        # 3. Final Flow Prediction (Only at full resolution)
+        Conv = getattr(nn, f'Conv{ndim}d')
+        # We might need a couple of extra convolutions to reach native resolution 
+        # because the encoder downsamples 4 times but decoder currently processes upsampled features.
+        self.flow_conv = Conv(dec_nf[-1], ndim, kernel_size=3, padding=1)
+        
+        # Initialize flow weights to very small values
+        self.flow_conv.weight.data.normal_(0, 1e-5)
+        self.flow_conv.bias.data.zero_()
+
+        # 4. Spatial Transformer
+        self.spatial_transform = SpatialTransformer()
+        if self.int_steps > 0:
+            self.integrate = IntegrateVelocityField(steps=self.int_steps)
+        else:
+            self.integrate = None
+
+    def forward(self, source, target, return_warped_source=True, return_field_type='displacement'):
+        # --- [Ablation 1 Hook: FDA will go here] ---
+        source_input = source
+        target_input = target
+        
+        # 1. Feature Extraction (Shared)
+        feat_s = self.encoder(source_input)
+        feat_t = self.encoder(target_input)
+        
+        # 2. Decoding (Standard U-Net Upsampling)
+        # Start from the bottom-most features
+        x = torch.cat([feat_s[-1], feat_t[-1]], dim=1)
+        
+        for i, block in enumerate(self.dec_blocks):
+            # Upsample
+            mode = 'trilinear' if self.ndim == 3 else 'bilinear'
+            x = F.interpolate(x, scale_factor=2.0, mode=mode, align_corners=False)
+            
+            # Skip connections
+            skip_idx = len(feat_s) - 2 - i
+            if skip_idx >= 0:
+                s_skip = feat_s[skip_idx]
+                t_skip = feat_t[skip_idx]
+                # --- [Ablation 2 Hook: Diff-Aware Skip will go here] ---
+                skip_concat = torch.cat([s_skip, t_skip], dim=1) 
+                x = torch.cat([x, skip_concat], dim=1)
+                
+            x = block(x)
+
+        # 3. Flow prediction (Only at full resolution)
+        # --- [Ablation 3 Hook: Coarse-to-fine FPN handling will replace this] ---
+        velocity = self.flow_conv(x)
+        
+        if self.integrate is not None:
+            displacement = self.integrate(velocity)
+        else:
+            displacement = velocity
+            
+        outputs = []
+        if return_field_type == 'displacement':
+            outputs.append(displacement)
+        else:
+            outputs.append(velocity)
+            
+        if return_warped_source:
+             outputs.append(self.spatial_transform(source, displacement))
+             
+        return tuple(outputs) if len(outputs) > 1 else outputs[0]

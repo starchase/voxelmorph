@@ -854,9 +854,7 @@ def train_epoch(
         source = batch['source'].to(device, non_blocking=True)
         target = batch['target'].to(device, non_blocking=True)
 
-        # 禁用 AMP, 避免 Local_MI 和 MI 计算因为半精度溢出产生 NaN
-        # with torch.amp.autocast('cuda', enabled=(device=='cuda'), dtype=amp_dtype):
-        if True:
+        with torch.amp.autocast('cuda', enabled=(scaler is not None)):
             displacement, warped_source = model(
                 source,
                 target,
@@ -864,12 +862,18 @@ def train_epoch(
                 return_field_type='displacement'
             )
 
+            # AMP 兼容性保护：强制将预测结果和 Loss 计算切回 float32。
+            # 这是配准任务的常见坑，因为形变场和损失求导在 float16 下极易精度溢出
+            target_float = target.float()
+            warped_source_float = warped_source.float()
+            displacement_float = displacement.float()
+            
+            img_loss = image_loss_fn(target_float, warped_source_float).mean()
+            
             if isinstance(image_loss_fn, ne.nn.modules.NCC):
-                img_loss = -image_loss_fn(target, warped_source)
-            else:
-                img_loss = image_loss_fn(target, warped_source)
-
-            grad_loss = grad_loss_fn(displacement)
+                img_loss = -img_loss
+                
+            grad_loss = grad_loss_fn(displacement_float).mean()
             loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
 
         if not torch.isfinite(loss):
@@ -882,8 +886,11 @@ def train_epoch(
         scaler.scale(loss).backward()
 
         # Unscale before grad-norm computation so the value is meaningful.
-        if scaler.is_enabled():
+        if scaler is not None and scaler.is_enabled():
             scaler.unscale_(optimizer)
+
+        # 增加梯度裁剪，防止黑背景区导致的除零或梯度爆炸
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
         grad_sq_sum = 0.0
         has_nonfinite_grad = False
@@ -1382,26 +1389,26 @@ def main():
     if device == 'cuda':
         torch.backends.cudnn.benchmark = True
 
-    # Model: pairwise VoxelMorph
-    # model = vxm.nn.models.VxmPairwise(
-    #     ndim=3,
-    #     source_channels=1,
-    #     target_channels=1,
-    #     nb_features=[16, 16, 16, 16, 16],
-    #     integration_steps=0,
-    # ).to(device)
-    model = vxm.nn.models.VxmPairwise(
+    # Dataloader Dataset Init (Before model to grab shape)
+    # Switch to Map-style Dataset for consistent epoch definition
+    dataset = MultimodalTrainDataset(args.ct_dir, args.mr_dir, paired_ct_dir=args.paired_ct_dir, paired_mr_dir=args.paired_mr_dir, device=device, unpaired=args.unpaired, max_samples=args.max_train_samples)
+    
+    # Grab inshape from dataset
+    sample = dataset[0]
+    # sample['source'] shape is (1, D, H, W). We want (D, H, W)
+    inshape = tuple(sample['source'].shape[1:])
+
+    # Model: SiameseUNetBaseline
+    model = vxm.nn.SiameseUNetBaseline(
+        inshape=inshape,
         ndim=3,
-        source_channels=1,
-        target_channels=1,
-        # Expanded UNet capacity. 
-        # Note: Neurite BasicUNet requires: len(down_features) == len(up_features) - 1
-        # Down: [16, 32, 32, 32, 32] (Length 5)
-        # Up:   [32, 32, 32, 32, 32] (Length 5 -> num_blocks = 5)
-        # nb_features=([16, 32, 32, 32, 32], [32, 32, 32, 32, 32]),
-        nb_features=([32, 64, 64, 64], [64, 64, 64, 32]),
-        integration_steps=args.integration_steps,
+        enc_nf=[32, 64, 64, 64],
+        dec_nf=[64, 64, 64, 32],
+        int_steps=args.integration_steps,
     ).to(device)
+
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'Model Total Trainable Parameters: {total_params:,}')
 
     # Losses
     if args.image_loss == 'mse':
@@ -1412,16 +1419,14 @@ def main():
         image_loss_fn = vxm.nn.losses.localMutualInformation(patch_size=args.patch_size, num_bin=args.mi_bins).to(device)
     else:
         # neurite NCC expects window size; default None will choose automatic
-        image_loss_fn = ne.nn.modules.NCC(window_size=args.ncc_win).to(device)
+        image_loss_fn = ne.nn.modules.NCC(window_size=args.ncc_win, eps=1e-3).to(device)
 
     grad_loss_fn = ne.nn.modules.SpatialGradient('l2')
     loss_weights = [1.0, args.lambda_param]
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
 
-    # Dataloader
-    # Switch to Map-style Dataset for consistent epoch definition
-    dataset = MultimodalTrainDataset(args.ct_dir, args.mr_dir, paired_ct_dir=args.paired_ct_dir, paired_mr_dir=args.paired_mr_dir, device=device, unpaired=args.unpaired, max_samples=args.max_train_samples)
+    # Dataloader Datasets were initialized above
     # Shuffle is KEY here: it mixes Easy and Hard pairs within each epoch
     train_loader = DataLoader(
         dataset, 
@@ -1510,7 +1515,8 @@ def main():
         f.write(f"Integration Steps: {args.integration_steps}\n")
         f.write(f"Unpaired: {args.unpaired}\n")
         f.write(f"Val Paired: {args.val_paired}\n")
-        f.write(f"Model Architecture: VxmPairwise\n")
+        f.write(f"Model Architecture: SiameseUNetBaseline\n")
+        f.write(f"Total Parameters: {total_params:,}\n")
         f.write(f"Output Path: {out_path}\n")
         f.write(f"Arguments: {vars(args)}\n")
 
@@ -1525,12 +1531,19 @@ def main():
     NEG_JAC_THRESHOLD = 0.01 
     
     loss_history: List[float] = []
+    epoch_times = []
 
     # Persistent scaler across all epochs (important for stable AMP training)
     scaler = torch.amp.GradScaler('cuda', enabled=(device == 'cuda'))
 
+    # 记录训练前的初始 GPU 显存
+    if device == 'cuda':
+        torch.cuda.reset_peak_memory_stats(device)
+
     print(f'Training for {args.epochs} epochs...')
     for epoch in range(args.epochs):
+        epoch_start_time = time.time()
+        
         avg_loss, last_img_loss, last_grad_loss, avg_grad_norm, update_ratio = train_epoch(
             model=model,
             dataloader=train_loader,
@@ -1752,7 +1765,12 @@ def main():
         # Scheduler step based on Test Dice (maximize)
         scheduler.step(test_dice)
         current_lr = optimizer.param_groups[0]['lr']
-        print(f"Current LR: {current_lr}")
+        
+        epoch_time = time.time() - epoch_start_time
+        epoch_times.append(epoch_time)
+        peak_gpu_mem = torch.cuda.max_memory_allocated(device) / (1024**2) if device == 'cuda' else 0.0
+        
+        print(f"Current LR: {current_lr:.6f} | Epoch Time: {epoch_time:.2f}s | Peak GPU Mem: {peak_gpu_mem:.2f} MB")
 
 
     # Remove the final epoch arbitrary saving except the very last one
@@ -1763,8 +1781,14 @@ def main():
     finish_utc = datetime.datetime.utcnow()
     finish_beijing = finish_utc + datetime.timedelta(hours=8)
     finish_timestamp = finish_beijing.strftime('%Y%m%d_%H%M%S')
+    
+    avg_epoch_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0.0
+    final_peak_mem = torch.cuda.max_memory_allocated(device) / (1024**2) if device == 'cuda' else 0.0
+
     with open(config_file, 'a') as f:
         f.write(f"End Time: {finish_timestamp}\n")
+        f.write(f"Average Epoch Time: {avg_epoch_time:.2f} s\n")
+        f.write(f"Peak GPU Memory: {final_peak_mem:.2f} MB\n")
 
     # Plot history
     try:

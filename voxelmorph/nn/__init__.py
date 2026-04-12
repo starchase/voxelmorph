@@ -20,10 +20,15 @@ from . import functional
 from . import losses
 from . import models
 from . import modules
+from . import fpn
 
 __all__ = [
     "functional",
     "losses",
     "models",
     "modules",
+    "fpn",
 ]
+from .fpn import VxmFPN, FPNDecoder, SimpleFeatureExtractor
+from .fpn_siamese import SiameseFeatureExtractor
+from .siamese_baseline import SiameseUNetBaseline

@@ -2,6 +2,7 @@
 
 import os
 import sys
+import time
 import argparse
 import glob
 import csv
@@ -355,10 +356,13 @@ def train_epoch(
     image_loss_fn: nn.Module,
     grad_loss_fn: nn.Module,
     loss_weights: list,
-    device: str = 'cuda'
+    device: str = 'cuda',
+    scaler = None,
+    amp_enabled: bool = True
 ) -> float:
     model.train()
     total_loss = 0.0
+    valid_batches = 0
 
     for batch_idx, data in enumerate(dataloader):
         optimizer.zero_grad()
@@ -368,33 +372,57 @@ def train_epoch(
         x = data[0].to(device)
         y = data[1].to(device)
 
-        # Get the displacement and the warped source image from the model
-        out = model(
-            x,
-            y,
-            return_warped_source=True,
-            return_field_type='displacement'
-        )
-        displacement, warped_source = out[0], out[1]
+        # 使用 AMP autocast
+        with torch.amp.autocast('cuda', enabled=amp_enabled):
+            # Get the displacement and the warped source image from the model
+            out = model(
+                x,
+                y,
+                return_warped_source=True,
+                return_field_type='displacement'
+            )
+            displacement, warped_source = out[0], out[1]
 
-        img_loss = image_loss_fn(y, warped_source).mean()
-        
-        # If the loss function is NCC (which computes similarity), we need to minimize -NCC
-        if isinstance(image_loss_fn, ne.nn.modules.NCC):
-            img_loss = -img_loss
+            # AMP 兼容性保护：强制将预测结果和 Loss 计算切回 float32。
+            # 这是配准任务的常见坑，因为形变场和损失求导在 float16 下极易精度溢出
+            img_loss = image_loss_fn(y.float(), warped_source.float()).mean()
             
-        grad_loss = grad_loss_fn(displacement).mean()
+            # If the loss function is NCC (which computes similarity), we need to minimize -NCC
+            if isinstance(image_loss_fn, ne.nn.modules.NCC):
+                img_loss = -img_loss
+                
+            grad_loss = grad_loss_fn(displacement.float()).mean()
 
-        loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
-        loss.backward()
-        
-        # 增加梯度裁剪，防止 NCC 在背景区域计算导致梯度爆炸
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        optimizer.step()
+            loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
+
+        # 数值稳定性保护：发现非有限值则跳过该 batch，避免污染整轮 loss
+        if not torch.isfinite(loss):
+            print(
+                f"[WARN] Non-finite loss at batch {batch_idx}: "
+                f"img_loss={img_loss.item()}, grad_loss={grad_loss.item()}, total={loss.item()}"
+            )
+            continue
+
+        if amp_enabled and scaler is not None:
+            # 缩放 loss，反向传播
+            scaler.scale(loss).backward()
+            # 在执行梯度裁剪前，必须先 unscale 梯度
+            scaler.unscale_(optimizer)
+            # 增加梯度裁剪，防止黑背景区导致的除零或梯度爆炸
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
         total_loss += loss.item()
+        valid_batches += 1
 
-    return total_loss / len(dataloader)
+    if valid_batches == 0:
+        return float('nan')
+    return total_loss / valid_batches
 
 def main():
     parser = argparse.ArgumentParser(description='Train 3D VoxelMorph on OASIS data')
@@ -403,9 +431,10 @@ def main():
     parser.add_argument('--workers', type=int, default=8, help='Number of workers')
     parser.add_argument('--batch-size', type=int, default=1, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-    parser.add_argument('--loss', type=str, default='ncc', choices=['mse', 'ncc'], help='Image similarity loss')
+    parser.add_argument('--loss', type=str, default='mse', choices=['mse', 'ncc'], help='Image similarity loss')
     parser.add_argument('--lambda', type=float, dest='lambda_param', default=0.01, help='Weight of gradient loss')
     parser.add_argument('--gpu', type=str, default='0', help='GPU ID')
+    parser.add_argument('--fusion-method', type=str, default='compress_concat', choices=['add', 'concat', 'compress_concat'], help='Feature fusion method for Siamese encoder')
     parser.add_argument('--save-every', type=int, default=10, help='Checkpoint every N epochs')
     parser.add_argument('--patience', type=int, default=20, help='Early stopping patience')
     parser.add_argument('--threshold', type=float, default=0.0, help='Early stopping threshold')
@@ -419,20 +448,39 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f'Using device: {device}')
 
-    # Create model (using VoxelMorph-2 extended capacity)
-    model = vxm.nn.models.VxmPairwise(
+    # Create model
+    # 注释掉原有的 VxmPairwise
+    # model = vxm.nn.models.VxmPairwise(
+    #     ndim=3,
+    #     source_channels=1,
+    #     target_channels=1,
+    #     # 使用更大的接收野和更宽的通道，这是能压平复杂脑回的关键
+    #     nb_features=[
+    #         # 编码器4层，刚好对应图像尺寸 160(可整除16)，避免空间维度拼接不匹配
+    #         [32, 64, 64, 64], 
+    #         # 解码器4层，与编码器对称
+    #         [64, 64, 64, 32]
+    #     ],
+    #     integration_steps=0, # set to 7 if you want diffeomorphic fields
+    # ).to(device)
+
+    # 1. 初始化双流特征编码器 (SiameseFeatureExtractor) - 现在改为使用 Vanilla Siamese Baseline
+    enc_channels = [32, 64, 64, 64] 
+    dec_channels = [64, 64, 64, 32] 
+    
+    inshape = (160, 192, 224) 
+    model = vxm.nn.SiameseUNetBaseline(
+        inshape=inshape,
+        in_channels=1,
+        enc_nf=enc_channels,
+        dec_nf=dec_channels,
         ndim=3,
-        source_channels=1,
-        target_channels=1,
-        # 使用更大的接收野和更宽的通道，这是能压平复杂脑回的关键
-        nb_features=[
-            # 编码器4层，刚好对应图像尺寸 160(可整除16)，避免空间维度拼接不匹配
-            [32, 64, 64, 64], 
-            # 解码器4层，与编码器对称
-            [64, 64, 64, 32]
-        ],
-        integration_steps=0, # set to 7 if you want diffeomorphic fields
+        int_steps=0
     ).to(device)
+
+    # 统计并打印参数量
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'Model Total Trainable Parameters: {total_params:,}')
 
     # Setup losses and optimizer
     if args.loss.lower() == 'ncc':
@@ -447,6 +495,11 @@ def main():
     
     # Scheduler: Cosine annealing to gradually lower LR
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    # 实例化 AMP 梯度缩放器
+    # NCC 在 3D 医学配准里更容易出现数值不稳定，默认关闭 AMP 以提高稳定性
+    amp_enabled = (device == 'cuda') and (args.loss.lower() != 'ncc')
+    scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
 
     # Dataloader identical to TransMorph
     train_composed = transforms.Compose([trans.NumpyType((np.float32, np.int16))])
@@ -487,6 +540,7 @@ def main():
     with open(config_file, 'w') as f:
         f.write(f"Training Configuration:\n")
         f.write(f"Device: {device}\n")
+        f.write(f"Total Parameters: {total_params:,}\n")
         f.write(f"Epochs: {args.epochs}\n")
         f.write(f"Batch Size: {args.batch_size}\n")
         f.write(f"Lambda: {args.lambda_param}\n")
@@ -504,7 +558,15 @@ def main():
     loss_history = []
     val_dsc_history = []
     
+    epoch_times = []
+    
+    # 记录训练前的初始 GPU 显存
+    if device == 'cuda':
+        torch.cuda.reset_peak_memory_stats(device)
+    
     for epoch in range(args.epochs):
+        epoch_start_time = time.time()
+        
         avg_loss = train_epoch(
             model=model,
             dataloader=train_loader,
@@ -512,7 +574,9 @@ def main():
             image_loss_fn=image_loss_fn,
             grad_loss_fn=grad_loss_fn,
             loss_weights=loss_weights,
-            device=device
+            device=device,
+            scaler=scaler,
+            amp_enabled=amp_enabled
         )
         loss_history.append(avg_loss)
         
@@ -527,8 +591,12 @@ def main():
         # Step the learning rate scheduler
         scheduler.step()
         
+        epoch_time = time.time() - epoch_start_time
+        epoch_times.append(epoch_time)
+        peak_gpu_mem = torch.cuda.max_memory_allocated(device) / (1024**2) if device == 'cuda' else 0.0
+        
         current_lr = optimizer.param_groups[0]['lr']
-        print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Val DSC: {val_dsc:.6f}, LR: {current_lr:.6f}')
+        print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Val DSC: {val_dsc:.6f}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s, Peak Mem: {peak_gpu_mem:.2f}MB')
 
         # Save visualizations
         try:
@@ -597,8 +665,14 @@ def main():
     finish_utc = datetime.datetime.utcnow()
     finish_beijing = finish_utc + datetime.timedelta(hours=8)
     finish_timestamp = finish_beijing.strftime('%Y%m%d_%H%M%S')
+    
+    avg_epoch_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0.0
+    final_peak_mem = torch.cuda.max_memory_allocated(device) / (1024**2) if device == 'cuda' else 0.0
+    
     with open(config_file, 'a') as f:
         f.write(f"End Time: {finish_timestamp}\n")
+        f.write(f"Average Epoch Time: {avg_epoch_time:.2f} s\n")
+        f.write(f"Peak GPU Memory: {final_peak_mem:.2f} MB\n")
 
 if __name__ == '__main__':
     main()
