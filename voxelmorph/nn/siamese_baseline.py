@@ -37,6 +37,50 @@ class SharedEncoder(nn.Module):
             features.append(x)
         return features
 
+
+class DecoupledEncoder(nn.Module):
+    """
+    Dual-stream encoder for Siamese Network with Appearance Decoupling.
+    Allows specifying the number of decoupled layers at the beginning.
+    """
+    def __init__(self, in_channels=1, enc_nf=[16, 32, 32, 32], ndim=3, decouple_layers=2):
+        super().__init__()
+        self.decouple_layers = decouple_layers
+        
+        self.enc_blocks_source = nn.ModuleList()
+        self.enc_blocks_target = nn.ModuleList()
+        self.shared_blocks = nn.ModuleList()
+        
+        prev_channels = in_channels
+        
+        for i, nf in enumerate(enc_nf):
+            if i < decouple_layers:
+                self.enc_blocks_source.append(ConvBlock(ndim, prev_channels, nf, stride=2))
+                self.enc_blocks_target.append(ConvBlock(ndim, prev_channels, nf, stride=2))
+            else:
+                self.shared_blocks.append(ConvBlock(ndim, prev_channels, nf, stride=2))
+            prev_channels = nf
+
+    def forward(self, source, target):
+        feat_s, feat_t = [], []
+        x_s, x_t = source, target
+        
+        # 1. Decoupled forward pass
+        for i in range(len(self.enc_blocks_source)):
+            x_s = self.enc_blocks_source[i](x_s)
+            x_t = self.enc_blocks_target[i](x_t)
+            feat_s.append(x_s)
+            feat_t.append(x_t)
+            
+        # 2. Shared forward pass
+        for i in range(len(self.shared_blocks)):
+            x_s = self.shared_blocks[i](x_s)
+            x_t = self.shared_blocks[i](x_t)
+            feat_s.append(x_s)
+            feat_t.append(x_t)
+            
+        return feat_s, feat_t
+
 class SiameseUNetBaseline(nn.Module):
     """
     Vanilla Siamese U-Net Baseline.
@@ -45,14 +89,14 @@ class SiameseUNetBaseline(nn.Module):
     - Concatenation-based Skip Connections (No Diff-Aware yet)
     - No Frequency Domain Alignment yet
     """
-    def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0):
+    def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2):
         super().__init__()
         self.inshape = inshape
         self.ndim = ndim
         self.int_steps = int_steps
 
         # 1. Shared Encoder
-        self.encoder = SharedEncoder(in_channels, enc_nf, ndim)
+        self.encoder = DecoupledEncoder(in_channels, enc_nf, ndim, decouple_layers=decouple_layers)
         
         # 2. Standard Decoder
         self.dec_blocks = nn.ModuleList()
@@ -93,9 +137,8 @@ class SiameseUNetBaseline(nn.Module):
         source_input = source
         target_input = target
         
-        # 1. Feature Extraction (Shared)
-        feat_s = self.encoder(source_input)
-        feat_t = self.encoder(target_input)
+        # 1. Feature Extraction (Decoupled/Shared)
+        feat_s, feat_t = self.encoder(source_input, target_input)
         
         # 2. Decoding (Standard U-Net Upsampling)
         # Start from the bottom-most features
