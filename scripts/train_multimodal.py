@@ -854,7 +854,7 @@ def train_epoch(
         source = batch['source'].to(device, non_blocking=True)
         target = batch['target'].to(device, non_blocking=True)
 
-        with torch.amp.autocast('cuda', enabled=(scaler is not None)):
+        with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=(scaler is not None)):
             displacement, warped_source = model(
                 source,
                 target,
@@ -862,19 +862,19 @@ def train_epoch(
                 return_field_type='displacement'
             )
 
-            # AMP 兼容性保护：强制将预测结果和 Loss 计算切回 float32。
-            # 这是配准任务的常见坑，因为形变场和损失求导在 float16 下极易精度溢出
-            target_float = target.float()
-            warped_source_float = warped_source.float()
-            displacement_float = displacement.float()
+        # AMP 兼容性保护：强制将预测结果和 Loss 计算切回 float32。
+        # 这是配准任务的常见坑，因为形变场和损失求导在 float16 下极易精度溢出
+        target_float = target.float()
+        warped_source_float = warped_source.float()
+        displacement_float = displacement.float()
+        
+        img_loss = image_loss_fn(target_float, warped_source_float).mean()
+        
+        if isinstance(image_loss_fn, ne.nn.modules.NCC):
+            img_loss = -img_loss
             
-            img_loss = image_loss_fn(target_float, warped_source_float).mean()
-            
-            if isinstance(image_loss_fn, ne.nn.modules.NCC):
-                img_loss = -img_loss
-                
-            grad_loss = grad_loss_fn(displacement_float).mean()
-            loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
+        grad_loss = grad_loss_fn(displacement_float).mean()
+        loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
 
         if not torch.isfinite(loss):
             optimizer.zero_grad(set_to_none=True)
@@ -903,6 +903,8 @@ def train_epoch(
                 grad_sq_sum += torch.sum(g * g).item()
 
         if has_nonfinite_grad:
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad(set_to_none=True)
             nonfinite_steps += 1
             num_steps += 1
