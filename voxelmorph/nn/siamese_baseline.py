@@ -146,13 +146,15 @@ class SiameseUNetBaseline(nn.Module):
         else:
             self.integrate = None
 
-    def forward(self, source, target, return_warped_source=True, return_field_type='displacement'):
+    def forward(self, source, target, return_warped_source=True, return_field_type='displacement', return_coarse_flows=False):
         # --- [Ablation 1 Hook: FDA will go here] ---
         source_input = source
         target_input = target
         
         # 1. Feature Extraction (Decoupled/Shared)
         feat_s, feat_t = self.encoder(source_input, target_input)
+        
+        coarse_flows = []
         
         # 2. Decoding (Standard U-Net Upsampling)
         # Start from the bottom-most features
@@ -173,6 +175,7 @@ class SiameseUNetBaseline(nn.Module):
                 if getattr(self, 'use_daps', False):
                     # a) Predict intermediate coarse flow
                     coarse_flow = self.coarse_flow_convs[i](x)
+                    coarse_flows.append(coarse_flow)
                     if coarse_flow.shape[2:] != s_skip.shape[2:]:
                         coarse_flow = F.interpolate(coarse_flow, size=s_skip.shape[2:], mode=mode, align_corners=False)
                         
@@ -208,5 +211,8 @@ class SiameseUNetBaseline(nn.Module):
             
         if return_warped_source:
              outputs.append(self.spatial_transform(source, displacement))
+             
+        if return_coarse_flows:
+             outputs.append(coarse_flows)
              
         return tuple(outputs) if len(outputs) > 1 else outputs[0]

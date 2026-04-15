@@ -379,9 +379,11 @@ def train_epoch(
                 x,
                 y,
                 return_warped_source=True,
-                return_field_type='displacement'
+                return_field_type='displacement',
+                return_coarse_flows=True
             )
             displacement, warped_source = out[0], out[1]
+            coarse_flows = out[2] if len(out) > 2 else []
 
             # AMP 兼容性保护：强制将预测结果和 Loss 计算切回 float32。
             # 这是配准任务的常见坑，因为形变场和损失求导在 float16 下极易精度溢出
@@ -392,8 +394,15 @@ def train_epoch(
                 img_loss = -img_loss
                 
             grad_loss = grad_loss_fn(displacement.float()).mean()
+            
+            # --- Deep Supervision for DAPS coarse flows ---
+            daps_reg_loss = 0.0
+            if len(coarse_flows) > 0:
+                for c_flow in coarse_flows:
+                    daps_reg_loss += grad_loss_fn(c_flow.float()).mean()
+                daps_reg_loss = daps_reg_loss / len(coarse_flows)
 
-            loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
+            loss = loss_weights[0] * img_loss + loss_weights[1] * (grad_loss + daps_reg_loss)
 
         # 数值稳定性保护：发现非有限值则跳过该 batch，避免污染整轮 loss
         if not torch.isfinite(loss):

@@ -855,11 +855,12 @@ def train_epoch(
         target = batch['target'].to(device, non_blocking=True)
 
         with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=(scaler is not None)):
-            displacement, warped_source = model(
+            displacement, warped_source, coarse_flows = model(
                 source,
                 target,
                 return_warped_source=True,
-                return_field_type='displacement'
+                return_field_type='displacement',
+                return_coarse_flows=True
             )
 
         # AMP 兼容性保护：强制将预测结果和 Loss 计算切回 float32。
@@ -874,7 +875,15 @@ def train_epoch(
             img_loss = -img_loss
             
         grad_loss = grad_loss_fn(displacement_float).mean()
-        loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
+        
+        # --- Deep Supervision for DAPS coarse flows ---
+        daps_reg_loss = 0.0
+        if len(coarse_flows) > 0:
+            for c_flow in coarse_flows:
+                daps_reg_loss += grad_loss_fn(c_flow.float()).mean()
+            daps_reg_loss = daps_reg_loss / len(coarse_flows)
+            
+        loss = loss_weights[0] * img_loss + loss_weights[1] * (grad_loss + daps_reg_loss)
 
         if not torch.isfinite(loss):
             optimizer.zero_grad(set_to_none=True)
@@ -935,7 +944,7 @@ def train_epoch(
     update_ratio = effective_update_steps / max(num_steps, 1)
     if nonfinite_steps > 0:
         print(f'  [Warning] Non-finite train steps: {nonfinite_steps}/{num_steps}. Consider reducing lr or disabling AMP for this loss.')
-    return total_loss / num_steps, img_loss.item(), grad_loss.item(), avg_grad_norm, update_ratio
+    return total_loss / num_steps, img_loss.item(), grad_loss.item() + (daps_reg_loss.item() if isinstance(daps_reg_loss, torch.Tensor) else 0), avg_grad_norm, update_ratio
 
 
 def compute_hd95(ground_truth, prediction, spacing=None):
