@@ -89,11 +89,12 @@ class SiameseUNetBaseline(nn.Module):
     - Concatenation-based Skip Connections (No Diff-Aware yet)
     - No Frequency Domain Alignment yet
     """
-    def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2):
+    def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False):
         super().__init__()
         self.inshape = inshape
         self.ndim = ndim
         self.int_steps = int_steps
+        self.use_daps = use_daps
 
         # 1. Shared Encoder
         self.encoder = DecoupledEncoder(in_channels, enc_nf, ndim, decouple_layers=decouple_layers)
@@ -102,13 +103,26 @@ class SiameseUNetBaseline(nn.Module):
         self.dec_blocks = nn.ModuleList()
         self.up_blocks = nn.ModuleList()
         
+        if self.use_daps:
+            self.coarse_flow_convs = nn.ModuleList()
+            self.daps_stn = SpatialTransformer()
+            Conv = getattr(nn, f'Conv{ndim}d')
+
         prev_channels = enc_nf[-1] * 2  # The very bottom layer merges source and target
         
         for i, nf in enumerate(dec_nf):
             # For ablation extensibility, we keep the decode path modular
             # Normal skip connection includes: Upsampled features + Source Skip + Target Skip
             skip_idx = len(enc_nf) - 2 - i
-            skip_channels = enc_nf[skip_idx] * 2 if skip_idx >= 0 else 0
+            
+            if self.use_daps:
+                skip_channels = enc_nf[skip_idx] * 3 if skip_idx >= 0 else 0
+                coarse_conv_layer = Conv(prev_channels, ndim, kernel_size=3, padding=1)
+                coarse_conv_layer.weight.data.normal_(0, 1e-5)
+                coarse_conv_layer.bias.data.zero_()
+                self.coarse_flow_convs.append(coarse_conv_layer)
+            else:
+                skip_channels = enc_nf[skip_idx] * 2 if skip_idx >= 0 else 0
             
             in_ch = prev_channels + skip_channels
             
