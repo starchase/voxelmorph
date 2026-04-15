@@ -475,7 +475,9 @@ def main():
         enc_nf=enc_channels,
         dec_nf=dec_channels,
         ndim=3,
-        int_steps=0
+        int_steps=0,
+        decouple_layers=2,
+        use_daps=True
     ).to(device)
 
     # 统计并打印参数量
