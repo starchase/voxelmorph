@@ -1400,13 +1400,27 @@ def main():
     # sample['source'] shape is (1, D, H, W). We want (D, H, W)
     inshape = tuple(sample['source'].shape[1:])
 
-    # Model: SiameseUNetBaseline
+    # Model: SiameseUNetBaseline (原双流共享权重编码器)
+    # model = vxm.nn.SiameseUNetBaseline(
+    #     inshape=inshape,
+    #     ndim=3,
+    #     enc_nf=[32, 64, 64, 64],
+    #     dec_nf=[64, 64, 64, 32],
+    #     int_steps=args.integration_steps,
+    # ).to(device)
+    
+    # 替换为：调用浅层独立深层共享编码器 (DecoupledEncoder)
+    enc_channels = [32, 64, 64, 64]
+    dec_channels = [64, 64, 64, 32]
     model = vxm.nn.SiameseUNetBaseline(
         inshape=inshape,
+        in_channels=1,
+        enc_nf=enc_channels,
+        dec_nf=dec_channels,
         ndim=3,
-        enc_nf=[32, 64, 64, 64],
-        dec_nf=[64, 64, 64, 32],
         int_steps=args.integration_steps,
+        decouple_layers=2,
+        use_daps=True
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

@@ -154,8 +154,25 @@ class SiameseUNetBaseline(nn.Module):
             if skip_idx >= 0:
                 s_skip = feat_s[skip_idx]
                 t_skip = feat_t[skip_idx]
-                # --- [Ablation 2 Hook: Diff-Aware Skip will go here] ---
-                skip_concat = torch.cat([s_skip, t_skip], dim=1) 
+                
+                # --- [Ablation 2: DAPS (Deformation-Aware Progressive Skip)] ---
+                if getattr(self, 'use_daps', False):
+                    # a) Predict intermediate coarse flow
+                    coarse_flow = self.coarse_flow_convs[i](x)
+                    if coarse_flow.shape[2:] != s_skip.shape[2:]:
+                        coarse_flow = F.interpolate(coarse_flow, size=s_skip.shape[2:], mode=mode, align_corners=False)
+                        
+                    # b) Warp the source skip feature
+                    s_skip_warped = self.daps_stn(s_skip, coarse_flow)
+                    
+                    # c) Calculate explicit absolute difference (Residual Error)
+                    diff = torch.abs(s_skip_warped - t_skip)
+                    
+                    # d) Concat: [warped_source, target, difference]
+                    skip_concat = torch.cat([s_skip_warped, t_skip, diff], dim=1)
+                else:
+                    skip_concat = torch.cat([s_skip, t_skip], dim=1)
+                    
                 x = torch.cat([x, skip_concat], dim=1)
                 
             x = block(x)
