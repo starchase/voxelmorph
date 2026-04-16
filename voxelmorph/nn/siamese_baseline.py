@@ -81,6 +81,45 @@ class DecoupledEncoder(nn.Module):
             
         return feat_s, feat_t
 
+class DAPS_PLR_Block(nn.Module):
+    """
+    Deformation-Aware Progressive Skip with Pyramid-Level Regularization (DAPS-PLR)
+    This module predicts a local deformation sub-flow, warps the source skip feature,
+    calculates the residual difference, and returns the concatenated feature along with
+    the predicted sub-flow for pyramid-level regularization (PLR).
+    """
+    def __init__(self, ndim, in_channels):
+        super().__init__()
+        Conv = getattr(nn, f'Conv{ndim}d')
+        self.flow_conv = Conv(in_channels, ndim, kernel_size=3, padding=1)
+        # Initialize sub-flow to identity (close to zero)
+        self.flow_conv.weight.data.normal_(0, 1e-5)
+        self.flow_conv.bias.data.zero_()
+        self.stn = SpatialTransformer()
+        self.ndim = ndim
+
+    def forward(self, x, s_skip, t_skip):
+        # a) Predict intermediate coarse flow
+        mode = 'trilinear' if self.ndim == 3 else 'bilinear'
+        coarse_flow = self.flow_conv(x)
+        
+        # Keep original sub-flow shape for PLR Return, but interpolate for warping if needed
+        warp_flow = coarse_flow
+        if warp_flow.shape[2:] != s_skip.shape[2:]:
+            warp_flow = F.interpolate(warp_flow, size=s_skip.shape[2:], mode=mode, align_corners=False)
+            
+        # b) Warp the source skip feature
+        s_skip_warped = self.stn(s_skip, warp_flow)
+        
+        # c) Calculate explicit absolute difference (Residual Error Map)
+        diff = torch.abs(s_skip_warped - t_skip)
+        
+        # d) Concat: [warped_source, target, difference]
+        skip_concat = torch.cat([s_skip_warped, t_skip, diff], dim=1)
+        
+        return skip_concat, coarse_flow
+
+
 class SiameseUNetBaseline(nn.Module):
     """
     Vanilla Siamese U-Net Baseline.
@@ -104,9 +143,7 @@ class SiameseUNetBaseline(nn.Module):
         self.up_blocks = nn.ModuleList()
         
         if self.use_daps:
-            self.coarse_flow_convs = nn.ModuleList()
-            self.daps_stn = SpatialTransformer()
-            Conv = getattr(nn, f'Conv{ndim}d')
+            self.daps_plr_blocks = nn.ModuleList()
 
         prev_channels = enc_nf[-1] * 2  # The very bottom layer merges source and target
         
@@ -117,10 +154,11 @@ class SiameseUNetBaseline(nn.Module):
             
             if self.use_daps:
                 skip_channels = enc_nf[skip_idx] * 3 if skip_idx >= 0 else 0
-                coarse_conv_layer = Conv(prev_channels, ndim, kernel_size=3, padding=1)
-                coarse_conv_layer.weight.data.normal_(0, 1e-5)
-                coarse_conv_layer.bias.data.zero_()
-                self.coarse_flow_convs.append(coarse_conv_layer)
+                if skip_idx >= 0:
+                    daps_block = DAPS_PLR_Block(ndim, prev_channels)
+                    self.daps_plr_blocks.append(daps_block)
+                else:
+                    self.daps_plr_blocks.append(None)
             else:
                 skip_channels = enc_nf[skip_idx] * 2 if skip_idx >= 0 else 0
             
@@ -171,22 +209,11 @@ class SiameseUNetBaseline(nn.Module):
                 s_skip = feat_s[skip_idx]
                 t_skip = feat_t[skip_idx]
                 
-                # --- [Ablation 2: DAPS (Deformation-Aware Progressive Skip)] ---
+                # --- [Ablation 2: DAPS-PLR (Deformation-Aware Progressive Skip w/ Pyramid-Level Regularization)] ---
                 if getattr(self, 'use_daps', False):
-                    # a) Predict intermediate coarse flow
-                    coarse_flow = self.coarse_flow_convs[i](x)
+                    # Process through the DAPS-PLR block
+                    skip_concat, coarse_flow = self.daps_plr_blocks[i](x, s_skip, t_skip)
                     coarse_flows.append(coarse_flow)
-                    if coarse_flow.shape[2:] != s_skip.shape[2:]:
-                        coarse_flow = F.interpolate(coarse_flow, size=s_skip.shape[2:], mode=mode, align_corners=False)
-                        
-                    # b) Warp the source skip feature
-                    s_skip_warped = self.daps_stn(s_skip, coarse_flow)
-                    
-                    # c) Calculate explicit absolute difference (Residual Error)
-                    diff = torch.abs(s_skip_warped - t_skip)
-                    
-                    # d) Concat: [warped_source, target, difference]
-                    skip_concat = torch.cat([s_skip_warped, t_skip, diff], dim=1)
                 else:
                     skip_concat = torch.cat([s_skip, t_skip], dim=1)
                     
