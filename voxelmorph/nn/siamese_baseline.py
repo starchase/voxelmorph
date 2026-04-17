@@ -7,14 +7,22 @@ class ConvBlock(nn.Module):
     """
     A specific convolutional block for UNet.
     """
-    def __init__(self, ndim, in_channels, out_channels, stride=1):
+    def __init__(self, ndim, in_channels, out_channels, stride=1, use_norm=False):
         super().__init__()
         Conv = getattr(nn, f'Conv{ndim}d')
         self.main = Conv(in_channels, out_channels, 3, stride, 1)
         self.activation = nn.LeakyReLU(0.2)
+        
+        self.use_norm = use_norm
+        if self.use_norm:
+            Norm = getattr(nn, f'InstanceNorm{ndim}d')
+            self.norm = Norm(out_channels)
 
     def forward(self, x):
-        return self.activation(self.main(x))
+        x = self.main(x)
+        if self.use_norm:
+            x = self.norm(x)
+        return self.activation(x)
 
 class SharedEncoder(nn.Module):
     """
@@ -43,9 +51,10 @@ class DecoupledEncoder(nn.Module):
     Dual-stream encoder for Siamese Network with Appearance Decoupling.
     Allows specifying the number of decoupled layers at the beginning.
     """
-    def __init__(self, in_channels=1, enc_nf=[16, 32, 32, 32], ndim=3, decouple_layers=2):
+    def __init__(self, in_channels=1, enc_nf=[16, 32, 32, 32], ndim=3, decouple_layers=2, use_dsin=False):
         super().__init__()
         self.decouple_layers = decouple_layers
+        self.use_dsin = use_dsin
         
         self.enc_blocks_source = nn.ModuleList()
         self.enc_blocks_target = nn.ModuleList()
@@ -54,18 +63,23 @@ class DecoupledEncoder(nn.Module):
         prev_channels = in_channels
         
         for i, nf in enumerate(enc_nf):
+            # DSIN: Apply norm only to the decoupled shallow layers (or conditionally all)
+            apply_norm = self.use_dsin and (i < decouple_layers)
+            
             if i < decouple_layers:
-                self.enc_blocks_source.append(ConvBlock(ndim, prev_channels, nf, stride=2))
-                self.enc_blocks_target.append(ConvBlock(ndim, prev_channels, nf, stride=2))
+                # Decoupled convolution weights + Decoupled (Domain-Specific) Instance Norms
+                self.enc_blocks_source.append(ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=apply_norm))
+                self.enc_blocks_target.append(ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=apply_norm))
             else:
-                self.shared_blocks.append(ConvBlock(ndim, prev_channels, nf, stride=2))
+                # Shared convolution weights, usually no norm here for cross-modal interactive consistency
+                self.shared_blocks.append(ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=False))
             prev_channels = nf
 
     def forward(self, source, target):
         feat_s, feat_t = [], []
         x_s, x_t = source, target
         
-        # 1. Decoupled forward pass
+        # 1. Decoupled forward pass (with DSIN if enabled)
         for i in range(len(self.enc_blocks_source)):
             x_s = self.enc_blocks_source[i](x_s)
             x_t = self.enc_blocks_target[i](x_t)
@@ -128,15 +142,20 @@ class SiameseUNetBaseline(nn.Module):
     - Concatenation-based Skip Connections (No Diff-Aware yet)
     - No Frequency Domain Alignment yet
     """
-    def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False):
+    def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False, use_dsin=False):
         super().__init__()
         self.inshape = inshape
         self.ndim = ndim
         self.int_steps = int_steps
         self.use_daps = use_daps
+        self.use_dsin = use_dsin
 
-        # 1. Shared Encoder
-        self.encoder = DecoupledEncoder(in_channels, enc_nf, ndim, decouple_layers=decouple_layers)
+        # 1. Shared Encoder with pluggable DSIN support
+        self.encoder = DecoupledEncoder(
+            in_channels, enc_nf, ndim, 
+            decouple_layers=decouple_layers, 
+            use_dsin=use_dsin
+        )
         
         # 2. Standard Decoder
         self.dec_blocks = nn.ModuleList()
