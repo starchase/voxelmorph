@@ -142,13 +142,14 @@ class SiameseUNetBaseline(nn.Module):
     - Concatenation-based Skip Connections (No Diff-Aware yet)
     - No Frequency Domain Alignment yet
     """
-    def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False, use_dsin=False):
+    def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False, use_dsin=False, use_cmim=False):
         super().__init__()
         self.inshape = inshape
         self.ndim = ndim
         self.int_steps = int_steps
         self.use_daps = use_daps
         self.use_dsin = use_dsin
+        self.use_cmim = use_cmim
 
         # 1. Shared Encoder with pluggable DSIN support
         self.encoder = DecoupledEncoder(
@@ -156,6 +157,15 @@ class SiameseUNetBaseline(nn.Module):
             decouple_layers=decouple_layers, 
             use_dsin=use_dsin
         )
+        
+        # 1.5 Cross-Modal Interaction Module (CMIM) at 1/8 and 1/16 scales
+        self.cmim_blocks = nn.ModuleList()
+        if self.use_cmim:
+            # Last layer (1/16 scale)
+            self.cmim_blocks.append(CrossModalInteractionModule(enc_nf[-1]))
+            # Second to last layer (1/8 scale)
+            self.cmim_blocks.append(CrossModalInteractionModule(enc_nf[-2]))
+
         
         # 2. Standard Decoder
         self.dec_blocks = nn.ModuleList()
@@ -214,7 +224,9 @@ class SiameseUNetBaseline(nn.Module):
         coarse_flows = []
         
         # 2. Decoding (Standard U-Net Upsampling)
-        # Start from the bottom-most features
+        # Start from the bottom-most features (1/16 scale)
+        if self.use_cmim:
+            feat_s[-1] = self.cmim_blocks[0](feat_s[-1], feat_t[-1])
         x = torch.cat([feat_s[-1], feat_t[-1]], dim=1)
         
         for i, block in enumerate(self.dec_blocks):
@@ -227,6 +239,10 @@ class SiameseUNetBaseline(nn.Module):
             if skip_idx >= 0:
                 s_skip = feat_s[skip_idx]
                 t_skip = feat_t[skip_idx]
+                
+                # --- [CMIM at 1/8 Scale] ---
+                if self.use_cmim and skip_idx == len(feat_s) - 2:
+                    s_skip = self.cmim_blocks[1](s_skip, t_skip)
                 
                 # --- [Ablation 2: DAPS-PLR (Deformation-Aware Progressive Skip w/ Pyramid-Level Regularization)] ---
                 if getattr(self, 'use_daps', False):
@@ -262,3 +278,51 @@ class SiameseUNetBaseline(nn.Module):
              outputs.append(coarse_flows)
              
         return tuple(outputs) if len(outputs) > 1 else outputs[0]
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class CrossModalInteractionModule(nn.Module):
+    """
+    Cross-Modal Interaction Module (CMIM)
+    Uses 3D Multi-Head Cross-Attention to dynamically align features
+    between Source and Target at deep layers (e.g., 1/8 and 1/16 scales)
+    where the spatial dimensions are small enough to avoid memory explosion.
+    """
+    def __init__(self, channels, num_heads=4):
+        super().__init__()
+        self.num_heads = num_heads
+        
+        # Linear projections for Query, Key, Value
+        self.q_conv = nn.Conv3d(channels, channels, 1)
+        self.k_conv = nn.Conv3d(channels, channels, 1)
+        self.v_conv = nn.Conv3d(channels, channels, 1)
+        
+        self.out_conv = nn.Conv3d(channels, channels, 1)
+        self.norm = nn.InstanceNorm3d(channels)
+        
+    def forward(self, source, target):
+        B, C, D, H, W = source.shape
+        N = D * H * W
+        
+        # Target acts as Query (where should target look in source?)
+        # Source acts as Key and Value
+        # Reshape to (B, heads, N, C/heads)
+        q = self.q_conv(target).view(B, self.num_heads, C // self.num_heads, N).transpose(-1, -2)
+        k = self.k_conv(source).view(B, self.num_heads, C // self.num_heads, N)
+        v = self.v_conv(source).view(B, self.num_heads, C // self.num_heads, N).transpose(-1, -2)
+        
+        # Scaled Dot-Product Attention: (B, heads, N, N)
+        attn = torch.matmul(q, k) / (C // self.num_heads) ** 0.5
+        attn = F.softmax(attn, dim=-1)
+        
+        # Output: (B, heads, N, C/heads) -> (B, C, D, H, W)
+        out = torch.matmul(attn, v)
+        out = out.transpose(-1, -2).reshape(B, C, D, H, W)
+        
+        # Residual connection + norm. 
+        # Since it's Target Querying Source, the output is aligned to Target geometry. 
+        # We add it to Source to create a "Target-Aware Source Feature"
+        out = self.out_conv(out)
+        return self.norm(source + out)
+

@@ -233,3 +233,80 @@ class localMutualInformation(torch.nn.Module):
 
     def forward(self,y_true, y_pred):
         return -self.local_mi(y_true, y_pred)
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class MINDLoss(nn.Module):
+    """
+    MIND-SSC (Modality Independent Neighbourhood Descriptor - Self Similarity Context) Loss.
+    This calculates the MIND descriptor for both moving and fixed images and returns the Mean Squared Error between them.
+    Suitable for multimodal image registration (e.g., CT-MRI).
+    """
+    def __init__(self, win=1, radius=2, dilation=2):
+        super(MINDLoss, self).__init__()
+        self.win = win
+        self.radius = radius
+        self.dilation = dilation
+        
+        # Define the displacement vectors (6-neighborhood in 3D)
+        self.six_neighbourhood = torch.Tensor([[0,1,0], [1,0,0], [0,0,1], [0,-1,0], [-1,0,0], [0,0,-1]]).long()
+
+    def pdist(self, x, y):
+        return torch.exp(-torch.mean((x - y) ** 2, dim=1, keepdim=True))
+        
+    def _mind_ssc(self, img):
+        # 1. Compute local variance (noise estimation)
+        # Using a simple 3x3x3 smoothing average
+        device = img.device
+        kernel = torch.ones(1, 1, 3, 3, 3, device=device) / 27.0
+        
+        # Pad image
+        pad = 1
+        img_pad = F.pad(img, (pad, pad, pad, pad, pad, pad), mode='replicate')
+        
+        # Local mean
+        mean_img = F.conv3d(img_pad, kernel, padding=0)
+        
+        # Local variance
+        var_img = F.conv3d((img_pad)**2, kernel, padding=0) - mean_img**2
+        var_img = torch.clamp(var_img, min=1e-5)
+        
+        # 2. Compute MIND-SSC
+        pad_d = self.dilation
+        img_pad_d = F.pad(img, (pad_d, pad_d, pad_d, pad_d, pad_d, pad_d), mode='replicate')
+        
+        ssc = []
+        for i in range(self.six_neighbourhood.shape[0]):
+            shift = self.six_neighbourhood[i]
+            # Shifted image
+            shifted_img = img_pad_d[:, :, 
+                pad_d + shift[0]*self.dilation : pad_d + shift[0]*self.dilation + img.shape[2],
+                pad_d + shift[1]*self.dilation : pad_d + shift[1]*self.dilation + img.shape[3],
+                pad_d + shift[2]*self.dilation : pad_d + shift[2]*self.dilation + img.shape[4]
+            ]
+            
+            # Squared difference
+            Dp = (img - shifted_img)**2
+            
+            # Smoothed squared difference
+            Dp_smooth = F.conv3d(F.pad(Dp, (pad, pad, pad, pad, pad, pad), mode='replicate'), kernel, padding=0)
+            
+            # Normalized response (Self-Similarity Context)
+            Cp = torch.exp(-Dp_smooth / var_img)
+            ssc.append(Cp)
+            
+        ssc = torch.cat(ssc, dim=1)
+        
+        # Normalize sum to 1
+        ssc = ssc / torch.max(ssc.max(dim=1, keepdim=True)[0], torch.tensor(1e-5, device=device))
+        return ssc
+
+    def forward(self, y_pred, y_true):
+        # Expecting shape [B, C=1, D, H, W]
+        mind_pred = self._mind_ssc(y_pred)
+        mind_true = self._mind_ssc(y_true)
+        
+        # Return Mean Absolute Error or Mean Squared Error of descriptors
+        return torch.mean((mind_pred - mind_true) ** 2)
+

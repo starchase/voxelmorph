@@ -871,7 +871,7 @@ def train_epoch(
         
         img_loss = image_loss_fn(target_float, warped_source_float).mean()
         
-        if isinstance(image_loss_fn, ne.nn.modules.NCC):
+        if isinstance(image_loss_fn, (ne.nn.modules.NCC, vxm.nn.losses.MutualInformation, vxm.nn.losses.localMutualInformation)):
             img_loss = -img_loss
             
         grad_loss = grad_loss_fn(displacement_float).mean()
@@ -1037,7 +1037,7 @@ def validate(
             total_time += (batch_time / source.shape[0])
             
             # 3. Loss
-            if isinstance(image_loss_fn, ne.nn.modules.NCC):
+            if isinstance(image_loss_fn, (ne.nn.modules.NCC, vxm.nn.losses.MutualInformation, vxm.nn.losses.localMutualInformation)):
                 img_loss = -image_loss_fn(target, warped_source)
             else:
                 img_loss = image_loss_fn(target, warped_source)
@@ -1179,7 +1179,7 @@ def test_evaluate(
             total_mag += disp_mag.mean().item()
 
             # Loss
-            if isinstance(image_loss_fn, ne.nn.modules.NCC):
+            if isinstance(image_loss_fn, (ne.nn.modules.NCC, vxm.nn.losses.MutualInformation, vxm.nn.losses.localMutualInformation)):
                 img_loss = -image_loss_fn(target, warped_source)
             else:
                 img_loss = image_loss_fn(target, warped_source)
@@ -1379,7 +1379,7 @@ def main():
     parser.add_argument('--lambda', type=float, dest='lambda_param', default=0.01, help='Regularization weight (0.01 for smooth, 1.0 for rigid)')
     parser.add_argument('--gpu', type=str, default='0', help='GPU ID')
     parser.add_argument('--save-every', type=int, default=10, help='Checkpoint every N epochs')
-    parser.add_argument('--image-loss', type=str, choices=['mse', 'ncc', 'mi', 'local_mi'], default='ncc', help='Image similarity loss')
+    parser.add_argument('--image-loss', type=str, choices=['mse', 'ncc', 'mi', 'local_mi', 'mind'], default='ncc', help='Image similarity loss')
     parser.add_argument('--ncc-win', type=int, default=9, help='NCC window size')
     parser.add_argument('--patch-size', type=int, default=9, help='Local Mutual Information patch size')
     parser.add_argument('--mi-bins', type=int, default=32, help='Bins for Mutual Information')
@@ -1429,7 +1429,9 @@ def main():
         ndim=3,
         int_steps=args.integration_steps,
         decouple_layers=2,
-        use_daps=True
+        use_daps=True,
+        use_dsin=True,
+        use_cmim=True
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1442,6 +1444,8 @@ def main():
         image_loss_fn = vxm.nn.losses.MutualInformation(num_bin=args.mi_bins).to(device)
     elif args.image_loss == 'local_mi':
         image_loss_fn = vxm.nn.losses.localMutualInformation(patch_size=args.patch_size, num_bin=args.mi_bins).to(device)
+    elif args.image_loss == 'mind':
+        image_loss_fn = vxm.nn.losses.MINDLoss().to(device)
     else:
         # neurite NCC expects window size; default None will choose automatic
         image_loss_fn = ne.nn.modules.NCC(window_size=args.ncc_win, eps=1e-3).to(device)
