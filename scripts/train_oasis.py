@@ -486,7 +486,8 @@ def main():
         ndim=3,
         int_steps=0,
         decouple_layers=2,
-        use_daps=True
+        use_daps=True,
+        use_dsin=True
     ).to(device)
 
     # 统计并打印参数量
