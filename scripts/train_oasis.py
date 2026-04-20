@@ -97,15 +97,19 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
         for ax in axes.flatten():
             ax.axis('off')
             
+        # Determine global min and max for consistent brightness plotting
+        vmax_val = max(np.max(src_slice), np.max(tgt_slice), np.max(warped_slice))
+        vmin_val = min(np.min(src_slice), np.min(tgt_slice), np.min(warped_slice))
+        
         # --- Row 1: Images & Differences ---
         
         # [0,0] Source Image
-        axes[0, 0].imshow(src_slice, cmap='gray')
+        axes[0, 0].imshow(src_slice, cmap='gray', vmin=vmin_val, vmax=vmax_val)
         axes[0, 0].set_title('Source Image')
         axes[0, 0].axis('off')
 
         # [0,1] Target Image
-        axes[0, 1].imshow(tgt_slice, cmap='gray')
+        axes[0, 1].imshow(tgt_slice, cmap='gray', vmin=vmin_val, vmax=vmax_val)
         axes[0, 1].set_title('Target Image')
         axes[0, 1].axis('off')
 
@@ -147,7 +151,7 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
                 return mcolors.to_rgba(hex_color)
 
             def plot_label_contour(ax, bg_img, label_img, title, is_fixed=False):
-                ax.imshow(bg_img, cmap='gray')
+                ax.imshow(bg_img, cmap='gray', vmin=vmin_val, vmax=vmax_val)
                 if label_img is not None:
                      unique_labels = np.unique(label_img)
                      unique_labels = unique_labels[unique_labels > 0]
@@ -165,7 +169,7 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
             plot_label_contour(axes[1, 2], warped_slice, warped_lbl_slice, 'Deformed + Labels', is_fixed=False)
             
         # [1,3] Overlay Warped Label on Target Image
-        axes[1, 3].imshow(warped_slice, cmap='gray')
+        axes[1, 3].imshow(warped_slice, cmap='gray', vmin=vmin_val, vmax=vmax_val)
         if has_labels:
              unique_labels = np.unique(np.concatenate([tgt_lbl_slice, warped_lbl_slice]))
              unique_labels = unique_labels[unique_labels > 0]
@@ -356,6 +360,7 @@ def train_epoch(
     image_loss_fn: nn.Module,
     grad_loss_fn: nn.Module,
     loss_weights: list,
+    pyramid_weight: float = 0.5,
     device: str = 'cuda',
     scaler = None,
     amp_enabled: bool = True
@@ -395,14 +400,35 @@ def train_epoch(
                 
             grad_loss = grad_loss_fn(displacement.float()).mean()
             
-            # --- Deep Supervision for DAPS coarse flows ---
-            daps_reg_loss = 0.0
+            # --- Deep Supervision for Pyramid/Coarse flows ---
+            deep_sup_loss = 0.0
             if len(coarse_flows) > 0:
                 for c_flow in coarse_flows:
-                    daps_reg_loss += grad_loss_fn(c_flow.float()).mean()
-                daps_reg_loss = daps_reg_loss / len(coarse_flows)
+                    # Scale to full resolution to evaluate image metric directly
+                    c_shape = c_flow.shape[2:]
+                    t_shape = displacement.shape[2:]
+                    if c_shape != t_shape:
+                        scale_factor = t_shape[0] / c_shape[0] # assuming square/cube
+                        mode = 'trilinear' if len(c_shape) == 3 else 'bilinear'
+                        c_flow_up = torch.nn.functional.interpolate(c_flow.float(), size=t_shape, mode=mode, align_corners=False) * scale_factor
+                    else:
+                        c_flow_up = c_flow.float()
+                        
+                    c_grad_loss = grad_loss_fn(c_flow_up).mean()
+                    
+                    # Warp using intermediate flow
+                    c_warp = model.spatial_transform(x.float(), c_flow_up)
+                    
+                    # 固化中间层的损失约束为稳健的 MSE，不用被主损失（如严格的NCC）拖累
+                    c_img_loss = torch.nn.functional.mse_loss(y.float(), c_warp)
+                        
+                    deep_sup_loss += (c_img_loss + loss_weights[1] * c_grad_loss)
+                
+                # 对整体深度监督求平均，并打上折扣权重（默认0.5）
+                deep_sup_loss = (deep_sup_loss / len(coarse_flows)) * pyramid_weight
 
-            loss = loss_weights[0] * img_loss + loss_weights[1] * (grad_loss + daps_reg_loss)
+            loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
+            loss = loss + deep_sup_loss # Add deep supervision component
 
         # 数值稳定性保护：发现非有限值则跳过该 batch，避免污染整轮 loss
         if not torch.isfinite(loss):
@@ -442,6 +468,9 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--loss', type=str, default='mse', choices=['mse', 'ncc'], help='Image similarity loss')
     parser.add_argument('--lambda', type=float, dest='lambda_param', default=0.01, help='Weight of gradient loss')
+    parser.add_argument('--pyramid-weight', type=float, default=0.5, help='Weight for intermediate pyramid deep supervision loss')
+    parser.add_argument('--use-pdaps', action='store_true', help='Use Pyramid-guided Deformation-Aware Progressive Skip')
+    parser.add_argument('--use-daps', action='store_true', help='Use original DAPS')
     parser.add_argument('--gpu', type=str, default='0', help='GPU ID')
     parser.add_argument('--fusion-method', type=str, default='compress_concat', choices=['add', 'concat', 'compress_concat'], help='Feature fusion method for Siamese encoder')
     parser.add_argument('--save-every', type=int, default=10, help='Checkpoint every N epochs')
@@ -486,8 +515,12 @@ def main():
         ndim=3,
         int_steps=0,
         decouple_layers=2,
-        use_daps=True,
-        use_dsin=True
+        use_daps=args.use_daps,
+        use_pdaps=args.use_pdaps,
+        use_dsin=True,
+        use_cmim=True,
+        use_wmca=True,
+        use_pyramid=True
     ).to(device)
 
     # 统计并打印参数量
@@ -586,6 +619,7 @@ def main():
             image_loss_fn=image_loss_fn,
             grad_loss_fn=grad_loss_fn,
             loss_weights=loss_weights,
+            pyramid_weight=args.pyramid_weight,
             device=device,
             scaler=scaler,
             amp_enabled=amp_enabled
