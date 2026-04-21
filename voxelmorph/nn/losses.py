@@ -7,6 +7,7 @@ import math
 
 # Third-party imports
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
@@ -233,80 +234,111 @@ class localMutualInformation(torch.nn.Module):
 
     def forward(self,y_true, y_pred):
         return -self.local_mi(y_true, y_pred)
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 class MINDLoss(nn.Module):
     """
-    MIND-SSC (Modality Independent Neighbourhood Descriptor - Self Similarity Context) Loss.
-    This calculates the MIND descriptor for both moving and fixed images and returns the Mean Squared Error between them.
-    Suitable for multimodal image registration (e.g., CT-MRI).
+    Standard 3D MIND-SSC (Modality Independent Neighbourhood Descriptor -
+    Self-Similarity Context) loss.
+
+    This implementation follows the common 12-channel formulation used in
+    deformable multimodal registration. It builds self-similarity descriptors
+    from pairwise patch SSDs in a 6-neighbourhood and compares descriptors with
+    a voxel-wise squared error.
     """
-    def __init__(self, win=1, radius=2, dilation=2):
+    def __init__(self, radius=2, dilation=2, eps=1e-8):
         super(MINDLoss, self).__init__()
-        self.win = win
         self.radius = radius
         self.dilation = dilation
-        
-        # Define the displacement vectors (6-neighborhood in 3D)
-        self.six_neighbourhood = torch.Tensor([[0,1,0], [1,0,0], [0,0,1], [0,-1,0], [-1,0,0], [0,0,-1]]).long()
+        self.eps = eps
 
-    def pdist(self, x, y):
-        return torch.exp(-torch.mean((x - y) ** 2, dim=1, keepdim=True))
-        
-    def _mind_ssc(self, img):
-        # 1. Compute local variance (noise estimation)
-        # Using a simple 3x3x3 smoothing average
-        device = img.device
-        kernel = torch.ones(1, 1, 3, 3, 3, device=device) / 27.0
-        
-        # Pad image
-        pad = 1
-        img_pad = F.pad(img, (pad, pad, pad, pad, pad, pad), mode='replicate')
-        
-        # Local mean
-        mean_img = F.conv3d(img_pad, kernel, padding=0)
-        
-        # Local variance
-        var_img = F.conv3d((img_pad)**2, kernel, padding=0) - mean_img**2
-        var_img = torch.clamp(var_img, min=1e-5)
-        
-        # 2. Compute MIND-SSC
-        pad_d = self.dilation
-        img_pad_d = F.pad(img, (pad_d, pad_d, pad_d, pad_d, pad_d, pad_d), mode='replicate')
-        
-        ssc = []
-        for i in range(self.six_neighbourhood.shape[0]):
-            shift = self.six_neighbourhood[i]
-            # Shifted image
-            shifted_img = img_pad_d[:, :, 
-                pad_d + shift[0]*self.dilation : pad_d + shift[0]*self.dilation + img.shape[2],
-                pad_d + shift[1]*self.dilation : pad_d + shift[1]*self.dilation + img.shape[3],
-                pad_d + shift[2]*self.dilation : pad_d + shift[2]*self.dilation + img.shape[4]
-            ]
-            
-            # Squared difference
-            Dp = (img - shifted_img)**2
-            
-            # Smoothed squared difference
-            Dp_smooth = F.conv3d(F.pad(Dp, (pad, pad, pad, pad, pad, pad), mode='replicate'), kernel, padding=0)
-            
-            # Normalized response (Self-Similarity Context)
-            Cp = torch.exp(-Dp_smooth / var_img)
-            ssc.append(Cp)
-            
-        ssc = torch.cat(ssc, dim=1)
-        
-        # Normalize sum to 1
-        ssc = ssc / torch.max(ssc.max(dim=1, keepdim=True)[0], torch.tensor(1e-5, device=device))
-        return ssc
+        neighbourhood = torch.tensor([
+            [0, 1, 1],
+            [1, 1, 0],
+            [1, 0, 1],
+            [1, 1, 2],
+            [2, 1, 1],
+            [1, 2, 1],
+        ], dtype=torch.long)
+        pairwise_dist = torch.sum(
+            (neighbourhood[:, None, :] - neighbourhood[None, :, :]) ** 2,
+            dim=-1,
+        )
+        pair_indices = torch.nonzero(
+            torch.triu((pairwise_dist == 2), diagonal=1),
+            as_tuple=False,
+        )
 
-    def forward(self, y_pred, y_true):
-        # Expecting shape [B, C=1, D, H, W]
+        kernel_1 = torch.zeros((pair_indices.shape[0], 1, 3, 3, 3), dtype=torch.float32)
+        kernel_2 = torch.zeros((pair_indices.shape[0], 1, 3, 3, 3), dtype=torch.float32)
+        for idx, (first, second) in enumerate(pair_indices):
+            kernel_1[idx, 0, neighbourhood[first, 0], neighbourhood[first, 1], neighbourhood[first, 2]] = 1.0
+            kernel_2[idx, 0, neighbourhood[second, 0], neighbourhood[second, 1], neighbourhood[second, 2]] = 1.0
+
+        self.register_buffer('kernel_1', kernel_1)
+        self.register_buffer('kernel_2', kernel_2)
+
+    def _mind_ssc(self, image):
+        if image.dim() != 5:
+            raise ValueError(f'MINDLoss expects 5D input [B, C, D, H, W], got shape {tuple(image.shape)}')
+        if image.shape[1] != 1:
+            raise ValueError(f'MINDLoss expects single-channel input, got {image.shape[1]} channels')
+
+        kernel_1 = self.kernel_1.to(dtype=image.dtype)
+        kernel_2 = self.kernel_2.to(dtype=image.dtype)
+
+        pad_size = self.dilation
+        image_pad = F.pad(image, (pad_size, pad_size, pad_size, pad_size, pad_size, pad_size), mode='replicate')
+
+        shifted_1 = F.conv3d(image_pad, kernel_1, dilation=self.dilation)
+        shifted_2 = F.conv3d(image_pad, kernel_2, dilation=self.dilation)
+        patch_ssd = (shifted_1 - shifted_2).pow(2)
+        patch_ssd = F.avg_pool3d(
+            patch_ssd,
+            kernel_size=2 * self.radius + 1,
+            stride=1,
+            padding=self.radius,
+        )
+
+        patch_ssd = patch_ssd - patch_ssd.amin(dim=1, keepdim=True)
+        mind_var = patch_ssd.mean(dim=1, keepdim=True)
+        mind_var = torch.clamp(mind_var, min=self.eps)
+        mind_var = torch.clamp(mind_var, min=mind_var.detach().mean() * 1e-3, max=mind_var.detach().mean() * 1e3)
+
+        descriptor = torch.exp(-patch_ssd / mind_var)
+        descriptor = descriptor / (descriptor.sum(dim=1, keepdim=True) + self.eps)
+        return descriptor
+
+    def forward(self, y_pred, y_true, mask=None):
         mind_pred = self._mind_ssc(y_pred)
         mind_true = self._mind_ssc(y_true)
+        mse = (mind_pred - mind_true) ** 2
         
-        # Return Mean Absolute Error or Mean Squared Error of descriptors
-        return torch.mean((mind_pred - mind_true) ** 2)
+        if mask is None:
+            # 自动生成前景 Mask，过滤掉医疗图像中大面积全黑背景区域的异常平方差运算
+            bg_val = y_true.amin()  # 自动推断背景值 (一般是 0 或 -1)
+            mask = (y_true > bg_val + 1e-3) | (y_pred > bg_val + 1e-3)
+            
+        mse = mse * mask
+        # 归一化仅针对前景区域
+        return torch.sum(mse) / (mask.sum() * mse.shape[1] + 1e-8)
 
+
+class JointMIMINDLoss(nn.Module):
+    """
+    Combines Mutual Information (global alignment) and MIND-SSC (local fine-grained alignment).
+    MI returns positive scalar to maximize -> Negated here for minimization.
+    MIND returns MSE distance to minimize -> Added normally.
+    """
+    def __init__(self, mi_bins=32, mind_radius=2, mind_dilation=2, mind_eps=1e-5, mi_weight=1.0, mind_weight=1.0):
+        super(JointMIMINDLoss, self).__init__()
+        self.mi_loss = MutualInformation(num_bin=mi_bins)
+        self.mind_loss = MINDLoss(radius=mind_radius, dilation=mind_dilation, eps=mind_eps)
+        self.mi_weight = mi_weight
+        self.mind_weight = mind_weight
+        
+    def forward(self, target, source):
+        # MutualInformation already returns -MI, so we minimize it directly
+        loss_mi = self.mi_loss(target, source)
+        loss_mind = self.mind_loss(target, source)
+        
+        return self.mi_weight * loss_mi + self.mind_weight * loss_mind

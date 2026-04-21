@@ -825,6 +825,7 @@ def train_epoch(
     grad_loss_fn: nn.Module,
     loss_weights: Sequence[float],
     steps_per_epoch: int,   # Used only for progress bar calculation now if we iterate full loader
+    pyramid_weight: float = 0.5,
     scaler: Optional[torch.amp.GradScaler] = None,
     device: str = 'cuda'
 ) -> float:
@@ -865,25 +866,32 @@ def train_epoch(
 
         # AMP 兼容性保护：强制将预测结果和 Loss 计算切回 float32。
         # 这是配准任务的常见坑，因为形变场和损失求导在 float16 下极易精度溢出
+        source_float = source.float()
         target_float = target.float()
         warped_source_float = warped_source.float()
         displacement_float = displacement.float()
         
         img_loss = image_loss_fn(target_float, warped_source_float).mean()
         
-        if isinstance(image_loss_fn, (ne.nn.modules.NCC, vxm.nn.losses.MutualInformation, vxm.nn.losses.localMutualInformation)):
+        if isinstance(image_loss_fn, ne.nn.modules.NCC):
             img_loss = -img_loss
             
         grad_loss = grad_loss_fn(displacement_float).mean()
         
-        # --- Deep Supervision for DAPS coarse flows ---
-        daps_reg_loss = 0.0
+        # --- Deep Supervision for DAPS/Pyramid coarse flows ---
+        deep_sup_loss = 0.0
         if len(coarse_flows) > 0:
             for c_flow in coarse_flows:
-                daps_reg_loss += grad_loss_fn(c_flow.float()).mean()
-            daps_reg_loss = daps_reg_loss / len(coarse_flows)
+                # 跨模态配准 (CT->MR) 中间层绝不能用 MSE 算 Image Loss！
+                # 因此我们只对提取出的多尺度中间“速度场 (SVF)”或“位移场”进行平滑性惩罚 (Gradient Loss)
+                # 这能保证网络在底层和中层生成的形变是平稳连续的
+                c_grad_loss = grad_loss_fn(c_flow.float()).mean()
+                deep_sup_loss += c_grad_loss
+                
+            deep_sup_loss = deep_sup_loss / len(coarse_flows)
             
-        loss = loss_weights[0] * img_loss + loss_weights[1] * (grad_loss + daps_reg_loss)
+        # 注意：这里的 deep_sup_loss 只包含平滑度惩罚，因此需要乘上平滑度权重 loss_weights[1]
+        loss = loss_weights[0] * img_loss + loss_weights[1] * (grad_loss + pyramid_weight * deep_sup_loss)
 
         if not torch.isfinite(loss):
             optimizer.zero_grad(set_to_none=True)
@@ -944,7 +952,7 @@ def train_epoch(
     update_ratio = effective_update_steps / max(num_steps, 1)
     if nonfinite_steps > 0:
         print(f'  [Warning] Non-finite train steps: {nonfinite_steps}/{num_steps}. Consider reducing lr or disabling AMP for this loss.')
-    return total_loss / num_steps, img_loss.item(), grad_loss.item() + (daps_reg_loss.item() if isinstance(daps_reg_loss, torch.Tensor) else 0), avg_grad_norm, update_ratio
+    return total_loss / num_steps, img_loss.item(), grad_loss.item() + (deep_sup_loss.item() if isinstance(deep_sup_loss, torch.Tensor) else 0), avg_grad_norm, update_ratio
 
 
 def compute_hd95(ground_truth, prediction, spacing=None):
@@ -1037,7 +1045,7 @@ def validate(
             total_time += (batch_time / source.shape[0])
             
             # 3. Loss
-            if isinstance(image_loss_fn, (ne.nn.modules.NCC, vxm.nn.losses.MutualInformation, vxm.nn.losses.localMutualInformation)):
+            if isinstance(image_loss_fn, ne.nn.modules.NCC):
                 img_loss = -image_loss_fn(target, warped_source)
             else:
                 img_loss = image_loss_fn(target, warped_source)
@@ -1179,7 +1187,7 @@ def test_evaluate(
             total_mag += disp_mag.mean().item()
 
             # Loss
-            if isinstance(image_loss_fn, (ne.nn.modules.NCC, vxm.nn.losses.MutualInformation, vxm.nn.losses.localMutualInformation)):
+            if isinstance(image_loss_fn, ne.nn.modules.NCC):
                 img_loss = -image_loss_fn(target, warped_source)
             else:
                 img_loss = image_loss_fn(target, warped_source)
@@ -1379,10 +1387,15 @@ def main():
     parser.add_argument('--lambda', type=float, dest='lambda_param', default=0.01, help='Regularization weight (0.01 for smooth, 1.0 for rigid)')
     parser.add_argument('--gpu', type=str, default='0', help='GPU ID')
     parser.add_argument('--save-every', type=int, default=10, help='Checkpoint every N epochs')
-    parser.add_argument('--image-loss', type=str, choices=['mse', 'ncc', 'mi', 'local_mi', 'mind'], default='ncc', help='Image similarity loss')
+    parser.add_argument('--image-loss', type=str, choices=['mse', 'ncc', 'mi', 'local_mi', 'mind', 'mi_mind'], default='ncc', help='Image similarity loss')
     parser.add_argument('--ncc-win', type=int, default=9, help='NCC window size')
     parser.add_argument('--patch-size', type=int, default=9, help='Local Mutual Information patch size')
     parser.add_argument('--mi-bins', type=int, default=32, help='Bins for Mutual Information')
+    parser.add_argument('--mind-radius', type=int, default=2, help='MIND-SSC local patch radius')
+    parser.add_argument('--mind-dilation', type=int, default=2, help='MIND-SSC neighbour dilation')
+    parser.add_argument('--mind-eps', type=float, default=1e-5, help='MIND-SSC numerical stability epsilon')
+    parser.add_argument('--mi-weight', type=float, default=1.0, help='Weight for MI loss in mi_mind (Default 1.0)')
+    parser.add_argument('--mind-weight', type=float, default=1.0, help='Weight for MIND loss in mi_mind (Default 1.0)')
     parser.add_argument('--unpaired', action='store_true', default=False, help='If set, force unpaired training even if filenames match.')
     parser.add_argument('--val-paired', action='store_true', default=False, help='Validation data is paired')
     parser.add_argument('--patience', type=int, default=20, help='Early stopping patience')
@@ -1391,6 +1404,14 @@ def main():
         '--warm-start', type=int, default=10, help='Early stopping warm start steps'
     )
     parser.add_argument('--integration-steps', type=int, default=0, help='number of integration steps for diffeomorphic registration')
+    parser.add_argument('--pyramid-weight', type=float, default=0.5, help='Weight for intermediate pyramid deep supervision loss')
+    parser.add_argument('--use-pdaps', action='store_true', help='Use Pyramid-guided Deformation-Aware Progressive Skip')
+    parser.add_argument('--use-daps', action='store_true', help='Use original DAPS')
+    parser.add_argument('--use-dsin', action='store_true', help='Use DSIN')
+    parser.add_argument('--use-cmim', action='store_true', help='Use CMIM')
+    parser.add_argument('--use-wmca', action='store_true', help='Use WMCA (Local Window Attention)')
+    parser.add_argument('--use-pyramid', action='store_true', help='Use Pyramid feature supervision')
+    parser.add_argument('--fusion-method', type=str, default='compress_concat', choices=['add', 'concat', 'compress_concat'], help='Feature fusion method for Siamese encoder')
     args = parser.parse_args()
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -1429,9 +1450,12 @@ def main():
         ndim=3,
         int_steps=args.integration_steps,
         decouple_layers=2,
-        use_daps=True,
-        use_dsin=True,
-        use_cmim=True
+        use_daps=args.use_daps,
+        use_pdaps=args.use_pdaps,
+        use_dsin=args.use_dsin,
+        use_cmim=args.use_cmim,
+        use_wmca=args.use_wmca,
+        use_pyramid=args.use_pyramid
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1445,7 +1469,20 @@ def main():
     elif args.image_loss == 'local_mi':
         image_loss_fn = vxm.nn.losses.localMutualInformation(patch_size=args.patch_size, num_bin=args.mi_bins).to(device)
     elif args.image_loss == 'mind':
-        image_loss_fn = vxm.nn.losses.MINDLoss().to(device)
+        image_loss_fn = vxm.nn.losses.MINDLoss(
+            radius=args.mind_radius,
+            dilation=args.mind_dilation,
+            eps=args.mind_eps,
+        ).to(device)
+    elif args.image_loss == 'mi_mind':
+        image_loss_fn = vxm.nn.losses.JointMIMINDLoss(
+            mi_bins=args.mi_bins,
+            mind_radius=args.mind_radius,
+            mind_dilation=args.mind_dilation,
+            mind_eps=args.mind_eps,
+            mi_weight=args.mi_weight,
+            mind_weight=args.mind_weight,
+        ).to(device)
     else:
         # neurite NCC expects window size; default None will choose automatic
         image_loss_fn = ne.nn.modules.NCC(window_size=args.ncc_win, eps=1e-3).to(device)
@@ -1539,6 +1576,13 @@ def main():
         f.write(f"Batch Size: {args.batch_size}\n")
         f.write(f"Image Loss: {args.image_loss}\n")
         f.write(f"NCC Window: {args.ncc_win}\n")
+        f.write(f"MI Bins: {args.mi_bins}\n")
+        f.write(f"Local MI Patch Size: {args.patch_size}\n")
+        f.write(f"MIND Radius: {args.mind_radius}\n")
+        f.write(f"MIND Dilation: {args.mind_dilation}\n")
+        f.write(f"MIND Eps: {args.mind_eps}\n")
+        f.write(f"MI Weight: {args.mi_weight}\n")
+        f.write(f"MIND Weight: {args.mind_weight}\n")
         f.write(f"Lambda: {args.lambda_param}\n")
         f.write(f"LR: {args.lr}\n")
         f.write(f"Integration Steps: {args.integration_steps}\n")
@@ -1581,6 +1625,7 @@ def main():
             grad_loss_fn=grad_loss_fn,
             loss_weights=loss_weights,
             steps_per_epoch=len(train_loader),
+            pyramid_weight=args.pyramid_weight,
             scaler=scaler,
             device=device,
         )
