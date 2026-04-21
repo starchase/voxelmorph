@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import sys
 import time
 import argparse
@@ -317,14 +318,39 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
         plt.savefig(str(out_file))
         plt.close(fig)
 
+import scipy.ndimage
+
+def compute_hd95(ground_truth, prediction, spacing=None):
+    if ground_truth.sum() == 0 or prediction.sum() == 0:
+        return np.nan
+    pred_border = prediction ^ scipy.ndimage.binary_erosion(prediction)
+    gt_border = ground_truth ^ scipy.ndimage.binary_erosion(ground_truth)
+    pts_pred = np.argwhere(pred_border)
+    pts_gt = np.argwhere(gt_border)
+    if pts_pred.shape[0] == 0 or pts_gt.shape[0] == 0:
+        return np.nan
+    if spacing is not None:
+        pts_pred = pts_pred * np.array(spacing)
+        pts_gt = pts_gt * np.array(spacing)
+    from scipy.spatial import cKDTree
+    kd_tree_gt = cKDTree(pts_gt)
+    distances_pred_to_gt, _ = kd_tree_gt.query(pts_pred)
+    kd_tree_pred = cKDTree(pts_pred)
+    distances_gt_to_pred, _ = kd_tree_pred.query(pts_gt)
+    return max(np.percentile(distances_pred_to_gt, 95), np.percentile(distances_gt_to_pred, 95))
+
 def validate(
 
     model: nn.Module,
     dataloader: DataLoader,
     device: str = 'cuda',
-) -> float:
+    compute_extra: bool = False
+) -> tuple:
     model.eval()
     eval_dsc = utils.AverageMeter()
+    eval_hd95 = utils.AverageMeter()
+    eval_jac = utils.AverageMeter()
+    eval_mag = utils.AverageMeter()
 
     # Spatial transformation for nearest neighbour
     reg_model = vxm.nn.modules.SpatialTransformer(interpolation_mode='nearest').to(device)
@@ -348,9 +374,53 @@ def validate(
             # Warp the segmentations with nearest neighbour
             def_out = reg_model(x_seg.float(), displacement)
 
+            # DSC
             dsc = utils.dice_val_VOI(def_out.long(), y_seg.long())
             eval_dsc.update(dsc.item(), x.size(0))
 
+            if compute_extra:
+                # Magnitude
+                disp_mag = torch.sqrt(torch.sum(displacement ** 2, dim=1))
+                eval_mag.update(disp_mag.mean().item(), x.size(0))
+
+                # Jacobian
+                disp_np = displacement.cpu().numpy()
+                disp_np = np.transpose(disp_np, (0, 2, 3, 4, 1))
+                target_np = y.cpu().numpy()
+                batch_neg_jac = 0.0
+                for i in range(disp_np.shape[0]):
+                    jac_det = vxm.py.utils.jacobian_determinant(disp_np[i])
+                    mask = target_np[i, 0] > 0.01
+                    if jac_det.shape != mask.shape:
+                        diff = np.array(mask.shape) - np.array(jac_det.shape)
+                        ds, hs, ws = diff // 2
+                        de, he, we = mask.shape[0] - (diff[0]-ds), mask.shape[1] - (diff[1]-hs), mask.shape[2] - (diff[2]-ws)
+                        mask = mask[ds:de, hs:he, ws:we]
+                    valid_sum = np.sum(mask)
+                    if valid_sum > 0:
+                        batch_neg_jac += np.sum((jac_det <= 0) & mask) / valid_sum
+                eval_jac.update(batch_neg_jac / disp_np.shape[0], x.size(0))
+
+                # HD95
+                wl_np = def_out.cpu().numpy()
+                tl_np = y_seg.cpu().numpy()
+                batch_hd95_sum = 0.0
+                batch_hd95_count = 0
+                for b in range(wl_np.shape[0]):
+                    u_labels = np.unique(np.concatenate((wl_np[b], tl_np[b])))
+                    u_labels = u_labels[u_labels > 0.5]
+                    for l in u_labels:
+                        mask_pred = (wl_np[b, 0] == l)
+                        mask_gt = (tl_np[b, 0] == l)
+                        hd = compute_hd95(mask_gt, mask_pred)
+                        if not np.isnan(hd):
+                            batch_hd95_sum += hd
+                            batch_hd95_count += 1
+                if batch_hd95_count > 0:
+                    eval_hd95.update(batch_hd95_sum / batch_hd95_count, x.size(0))
+
+    if compute_extra:
+        return eval_dsc.avg, eval_hd95.avg, eval_jac.avg, eval_mag.avg
     return eval_dsc.avg
 
 def train_epoch(
@@ -363,7 +433,9 @@ def train_epoch(
     pyramid_weight: float = 0.5,
     device: str = 'cuda',
     scaler = None,
-    amp_enabled: bool = True
+    amp_enabled: bool = True,
+    use_mask: bool = False,
+    loss_type: str = 'mse'
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -376,6 +448,8 @@ def train_epoch(
         # x: moving image, y: fixed image
         x = data[0].to(device)
         y = data[1].to(device)
+        # y_seg 常作为脑内部组织的金标准，适合当做高信度的前景色 Mask 候选
+        y_seg = data[3].to(device)
 
         # 使用 AMP autocast
         with torch.amp.autocast('cuda', enabled=amp_enabled):
@@ -390,13 +464,39 @@ def train_epoch(
             displacement, warped_source = out[0], out[1]
             coarse_flows = out[2] if len(out) > 2 else []
 
-            # AMP 兼容性保护：强制将预测结果和 Loss 计算切回 float32。
-            # 这是配准任务的常见坑，因为形变场和损失求导在 float16 下极易精度溢出
-            img_loss = image_loss_fn(y.float(), warped_source.float()).mean()
+            # AMP 兼容性保护：强制将预测结果和 Loss 计算切回 float32
+            target_float = y.float()
+            warped_float = warped_source.float()
             
-            # If the loss function is NCC (which computes similarity), we need to minimize -NCC
-            if isinstance(image_loss_fn, ne.nn.modules.NCC):
-                img_loss = -img_loss
+            # --- Mask 核心逻辑联动 ---
+            # Q: 前景 Mask 的过滤规则如果是按 > 0.01 背景排查，图像内部会有 0 体素吗？
+            # A: 会。脑室（CSF/脑脊液区域）、肿瘤病灶、或者是扫描伪影在某些 MRI 模态(如T1) 中，部分像素可能天然表现为黑(接近0)。
+            # 由于简单的硬阈值 `> 0.01` 会不小心在内部抠出“空洞”，一般用下述 2 种方案处理：
+            # 方法A (推荐): 如果你的数据集里自带真实器官的 Label `y_seg`，直接拿全器官 Label 生成 Mask `(y_seg > 0).float()` 即可完美覆盖目标实质区域！
+            # 方法B (常规): 依然用阈值提取背景，但做膨胀/闭运算填补内部空洞(morphological hole filling)。但深度学习中往往算算算嫌麻烦。
+            
+            if use_mask:
+                # 方案：既然你有 y_seg，直接使用有标注的组织所在合集作为精准的前景 Mask！
+                fg_mask = (y_seg > 0).float()
+                # 兜底：如果有些批次 y_seg 全0失效了，退化回阈值硬扣。这会保护防止分母为 0。
+                if fg_mask.sum() < 1e-3:
+                    fg_mask = (target_float > 0.01).float()
+            else:
+                # 也就是默认在全图 (Batchx1xHxWxD) 上一视同仁全部计算 Loss
+                fg_mask = torch.ones_like(target_float)
+            
+            if loss_type == 'mse':
+                # 手动计算前景/全局的加权 MSE
+                squared_diff = (target_float - warped_float) ** 2
+                img_loss = (squared_diff * fg_mask).sum() / (fg_mask.sum() + 1e-8)
+            elif loss_type == 'ncc':
+                if use_mask:
+                    # 屏蔽掉非脑范围，强制外围全黑，中心有效，使得 NCC 计算更稳定且聚焦大脑
+                    masked_target = target_float * fg_mask
+                    masked_warped = warped_float * fg_mask
+                    img_loss = -image_loss_fn(masked_target, masked_warped).mean()
+                else:
+                    img_loss = -image_loss_fn(target_float, warped_float).mean()
                 
             grad_loss = grad_loss_fn(displacement.float()).mean()
             
@@ -417,13 +517,25 @@ def train_epoch(
                     c_grad_loss = grad_loss_fn(c_flow_up).mean()
                     
                     # Warp using intermediate flow
-                    c_warp = model.spatial_transform(x.float(), c_flow_up)
+                    if getattr(model, 'integrate', None) is not None:
+                        c_disp = model.integrate(c_flow_up)
+                    else:
+                        c_disp = c_flow_up
+                    c_warp = model.spatial_transform(x.float(), c_disp)
                     
-                    # 固化中间层的损失约束为稳健的 MSE，不用被主损失（如严格的NCC）拖累
-                    c_img_loss = torch.nn.functional.mse_loss(y.float(), c_warp)
+                    # 金字塔中间层的损失约束同样跟随 user 的 Loss 策略
+                    c_warp_float = c_warp.float()
+                    if loss_type == 'mse':
+                        c_squared_diff = (target_float - c_warp_float) ** 2
+                        c_img_loss = (c_squared_diff * fg_mask).sum() / (fg_mask.sum() + 1e-8)
+                    else: # loss_type == 'ncc'
+                        if use_mask:
+                            masked_c_target = target_float * fg_mask
+                            masked_c_warp = c_warp_float * fg_mask
+                            c_img_loss = -image_loss_fn(masked_c_target, masked_c_warp).mean()
+                        else:
+                            c_img_loss = -image_loss_fn(target_float, c_warp_float).mean()
                         
-                    deep_sup_loss += (c_img_loss + loss_weights[1] * c_grad_loss)
-                
                 # 对整体深度监督求平均，并打上折扣权重（默认0.5）
                 deep_sup_loss = (deep_sup_loss / len(coarse_flows)) * pyramid_weight
 
@@ -436,6 +548,12 @@ def train_epoch(
                 f"[WARN] Non-finite loss at batch {batch_idx}: "
                 f"img_loss={img_loss.item()}, grad_loss={grad_loss.item()}, total={loss.item()}"
             )
+            # 彻底释放包含 NaN/Inf 计算图的所有局部变量，防止在遇到 NaN 直接 continue 时显存泄漏引发后续 OOM
+            optimizer.zero_grad(set_to_none=True)
+            del out, displacement, warped_source, coarse_flows, loss, img_loss, grad_loss, deep_sup_loss
+            if 'c_warp' in locals():
+                del c_disp, c_warp, c_img_loss, c_grad_loss, c_flow_up
+            torch.cuda.empty_cache()
             continue
 
         if amp_enabled and scaler is not None:
@@ -467,6 +585,8 @@ def main():
     parser.add_argument('--batch-size', type=int, default=1, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--loss', type=str, default='mse', choices=['mse', 'ncc'], help='Image similarity loss')
+    parser.add_argument('--use-mask', action='store_true', help='Use foreground mask to exclude black background in loss calculation')
+    parser.add_argument('--disable-amp', action='store_true', help='Force disable AMP (Automatic Mixed Precision)')
     parser.add_argument('--lambda', type=float, dest='lambda_param', default=0.01, help='Weight of gradient loss')
     parser.add_argument('--pyramid-weight', type=float, default=0.5, help='Weight for intermediate pyramid deep supervision loss')
     parser.add_argument('--use-pdaps', action='store_true', help='Use Pyramid-guided Deformation-Aware Progressive Skip')
@@ -477,6 +597,7 @@ def main():
     parser.add_argument('--patience', type=int, default=20, help='Early stopping patience')
     parser.add_argument('--threshold', type=float, default=0.0, help='Early stopping threshold')
     parser.add_argument('--warm-start', type=int, default=10, help='Early stopping warm start steps')
+    parser.add_argument('--integration-steps', type=int, default=0, help='number of integration steps for diffeomorphic registration')
     parser.add_argument('--train-dir', type=str, default='/root/autodl-tmp/OASIS_L2R_2021_task03/All/')
     parser.add_argument('--val-dir', type=str, default='/root/autodl-tmp/OASIS_L2R_2021_task03/Test/')
     args = parser.parse_args()
@@ -513,7 +634,7 @@ def main():
         enc_nf=enc_channels,
         dec_nf=dec_channels,
         ndim=3,
-        int_steps=0,
+        int_steps=args.integration_steps,
         decouple_layers=2,
         use_daps=args.use_daps,
         use_pdaps=args.use_pdaps,
@@ -527,7 +648,10 @@ def main():
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'Model Total Trainable Parameters: {total_params:,}')
 
-    # Setup losses and optimizer
+    # ==========================
+    # AMP & Loss & Mask 核心联动策略
+    # ==========================
+    # 1. 损失函数策略
     if args.loss.lower() == 'ncc':
         # 增大 eps (默认是 1e-5)，防止由于图像大面积黑色背景(方差近乎 0)导致的除零/梯度爆炸
         image_loss_fn = ne.nn.modules.NCC(eps=1e-3)
@@ -540,10 +664,15 @@ def main():
     
     # Scheduler: Cosine annealing to gradually lower LR
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
-
-    # 实例化 AMP 梯度缩放器
-    # NCC 在 3D 医学配准里更容易出现数值不稳定，默认关闭 AMP 以提高稳定性
-    amp_enabled = (device == 'cuda') and (args.loss.lower() != 'ncc')
+    
+    # 2. AMP 策略与防爆保护
+    amp_enabled = (device == 'cuda') and not args.disable_amp
+    if amp_enabled and (args.loss.lower() == 'ncc') and (args.integration_steps > 0):
+        print("\n\n[WARNING 🚨] 检测到高危配置组合：AMP(FP16) + NCC + DiffoIntegration(>0)")
+        print("          微分同胚 7次 Squaring 极易在 FP16 的浮点指数上乘爆，同时 NCC 的方差计算本身更容易溢出。")
+        print("          为了防止 NaN 崩盘，系统已强制关闭当前的 AMP 训练。\n\n")
+        amp_enabled = False
+        
     scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
 
     # Dataloader identical to TransMorph
@@ -590,12 +719,13 @@ def main():
         f.write(f"Batch Size: {args.batch_size}\n")
         f.write(f"Lambda: {args.lambda_param}\n")
         f.write(f"LR: {args.lr}\n")
+        f.write(f"Integration Steps: {args.integration_steps}\n")
         f.write(f"Arguments: {vars(args)}\n")
 
     # Initialize Logger
     with open(log_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'train_loss', 'val_dsc'])
+        writer.writerow(['epoch', 'train_loss', 'val_dsc', 'val_hd95', 'val_jac', 'val_mag'])
 
     # Training loop
     print(f'Training for {args.epochs} epochs...')
@@ -622,16 +752,26 @@ def main():
             pyramid_weight=args.pyramid_weight,
             device=device,
             scaler=scaler,
-            amp_enabled=amp_enabled
+            amp_enabled=amp_enabled,
+            use_mask=args.use_mask,
+            loss_type=args.loss.lower()
         )
         loss_history.append(avg_loss)
         
         # Calculate Validation metrics
-        val_dsc = validate(
+        compute_extra = ((epoch + 1) % 5 == 0)
+        val_res = validate(
             model=model,
             dataloader=val_loader,
-            device=device
+            device=device,
+            compute_extra=compute_extra
         )
+        if compute_extra:
+            val_dsc, val_hd95, val_jac, val_mag = val_res
+        else:
+            val_dsc = val_res
+            val_hd95, val_jac, val_mag = np.nan, np.nan, np.nan
+            
         val_dsc_history.append(val_dsc)
         
         # Step the learning rate scheduler
@@ -642,7 +782,10 @@ def main():
         peak_gpu_mem = torch.cuda.max_memory_allocated(device) / (1024**2) if device == 'cuda' else 0.0
         
         current_lr = optimizer.param_groups[0]['lr']
-        print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Val DSC: {val_dsc:.6f}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s, Peak Mem: {peak_gpu_mem:.2f}MB')
+        if compute_extra:
+            print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Val DSC: {val_dsc:.6f}, HD95: {val_hd95:.2f}, Jac: {val_jac:.4f}, Mag: {val_mag:.4f}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s, Peak: {peak_gpu_mem:.2f}MB')
+        else:
+            print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Val DSC: {val_dsc:.6f}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s, Peak: {peak_gpu_mem:.2f}MB')
 
         # Save visualizations
         try:
@@ -653,7 +796,14 @@ def main():
         # Logging
         with open(log_file, 'a', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([epoch + 1, f"{avg_loss:.6f}", f"{val_dsc:.6f}"])
+            writer.writerow([
+                epoch + 1, 
+                f"{avg_loss:.6f}", 
+                f"{val_dsc:.6f}", 
+                f"{val_hd95:.2f}" if compute_extra else "",
+                f"{val_jac:.6f}" if compute_extra else "",
+                f"{val_mag:.6f}" if compute_extra else ""
+            ])
 
         # Early stopping check based on average loss
         if len(loss_history) >= args.warm_start + args.patience + 1:
