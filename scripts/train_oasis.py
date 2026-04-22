@@ -501,7 +501,7 @@ def train_epoch(
             grad_loss = grad_loss_fn(displacement.float()).mean()
             
             # --- Deep Supervision for Pyramid/Coarse flows ---
-            deep_sup_loss = 0.0
+            deep_sup_loss = displacement.new_tensor(0.0)
             if len(coarse_flows) > 0:
                 for c_flow in coarse_flows:
                     # Scale to full resolution to evaluate image metric directly
@@ -535,6 +535,8 @@ def train_epoch(
                             c_img_loss = -image_loss_fn(masked_c_target, masked_c_warp).mean()
                         else:
                             c_img_loss = -image_loss_fn(target_float, c_warp_float).mean()
+
+                    deep_sup_loss = deep_sup_loss + c_img_loss + loss_weights[1] * c_grad_loss
                         
                 # 对整体深度监督求平均，并打上折扣权重（默认0.5）
                 deep_sup_loss = (deep_sup_loss / len(coarse_flows)) * pyramid_weight
@@ -591,6 +593,10 @@ def main():
     parser.add_argument('--pyramid-weight', type=float, default=0.5, help='Weight for intermediate pyramid deep supervision loss')
     parser.add_argument('--use-pdaps', action='store_true', help='Use Pyramid-guided Deformation-Aware Progressive Skip')
     parser.add_argument('--use-daps', action='store_true', help='Use original DAPS')
+    parser.add_argument('--use-dsin', action='store_true', help='Enable DSIN in the shallow decoupled encoder layers')
+    parser.add_argument('--use-cmim', action='store_true', help='Enable CMIM at deep decoder scales')
+    parser.add_argument('--use-wmca', action='store_true', help='Enable window cross-attention on shallow skip features')
+    parser.add_argument('--use-pyramid', action='store_true', help='Enable pyramid coarse-to-fine flow prediction')
     parser.add_argument('--gpu', type=str, default='0', help='GPU ID')
     parser.add_argument('--fusion-method', type=str, default='compress_concat', choices=['add', 'concat', 'compress_concat'], help='Feature fusion method for Siamese encoder')
     parser.add_argument('--save-every', type=int, default=10, help='Checkpoint every N epochs')
@@ -638,10 +644,10 @@ def main():
         decouple_layers=2,
         use_daps=args.use_daps,
         use_pdaps=args.use_pdaps,
-        use_dsin=True,
-        use_cmim=True,
-        use_wmca=True,
-        use_pyramid=True
+        use_dsin=args.use_dsin,
+        use_cmim=args.use_cmim,
+        use_wmca=args.use_wmca,
+        use_pyramid=args.use_pyramid
     ).to(device)
 
     # 统计并打印参数量
