@@ -26,6 +26,92 @@ import utils
 
 import matplotlib.pyplot as plt
 
+
+class VxmBaselineAdapter(nn.Module):
+    """Adapter that exposes the standard Voxelmorph baseline through the same interface as the Siamese model."""
+
+    def __init__(self, inshape, enc_nf, dec_nf, int_steps=0, device='cpu'):
+        super().__init__()
+        self.inshape = inshape
+        self.ndim = 3
+        self.use_pyramid = False
+        self.model = vxm.nn.models.VxmPairwise(
+            ndim=3,
+            source_channels=1,
+            target_channels=1,
+            nb_features=[enc_nf, dec_nf],
+            integration_steps=int_steps,
+            device=device,
+        )
+        self.integrate = getattr(self.model, 'velocity_field_integrator', None)
+        self.spatial_transform = self.model.spatial_transformer
+
+    def forward(
+        self,
+        source,
+        target,
+        return_warped_source=True,
+        return_warped_target=False,
+        return_field_type='displacement',
+        return_coarse_flows=False,
+    ):
+        out = self.model(
+            source,
+            target,
+            return_warped_source=return_warped_source,
+            return_warped_target=return_warped_target,
+            return_field_type=return_field_type,
+        )
+
+        outputs = list(out) if isinstance(out, tuple) else [out]
+        if return_coarse_flows:
+            outputs.append([])
+        return tuple(outputs) if len(outputs) > 1 else outputs[0]
+
+
+def build_registration_model(args, device):
+    """Create either the standard Voxelmorph baseline or the current Siamese dual-stream model."""
+    enc_channels = [32, 64, 64, 64]
+    dec_channels = [64, 64, 64, 32]
+    inshape = (160, 192, 224)
+
+    if args.model_config == 'voxelmorph_baseline':
+        ignored_flags = []
+        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_wmca', 'use_pyramid'):
+            if getattr(args, flag):
+                ignored_flags.append(f'--{flag.replace("_", "-")}')
+        if ignored_flags:
+            print(
+                '[INFO] voxelmorph_baseline mode ignores Siamese-specific options: '
+                + ', '.join(ignored_flags)
+            )
+
+        model = VxmBaselineAdapter(
+            inshape=inshape,
+            enc_nf=enc_channels,
+            dec_nf=dec_channels,
+            int_steps=args.integration_steps,
+            device=device,
+        )
+    else:
+        model = vxm.nn.SiameseUNetBaseline(
+            inshape=inshape,
+            in_channels=1,
+            enc_nf=enc_channels,
+            dec_nf=dec_channels,
+            ndim=3,
+            int_steps=args.integration_steps,
+            decouple_layers=args.decouple_layers,
+            use_daps=args.use_daps,
+            use_pdaps=args.use_pdaps,
+            use_dsin=args.use_dsin,
+            use_cmim=args.use_cmim,
+            use_wmca=args.use_wmca,
+            use_pyramid=args.use_pyramid
+        )
+
+    return model.to(device)
+
 def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', suffix='', best_sample_idx=None):
     """Save mid-slice images of samples."""
     
@@ -597,6 +683,8 @@ def main():
     parser.add_argument('--use-cmim', action='store_true', help='Enable CMIM at deep decoder scales')
     parser.add_argument('--use-wmca', action='store_true', help='Enable window cross-attention on shallow skip features')
     parser.add_argument('--use-pyramid', action='store_true', help='Enable pyramid coarse-to-fine flow prediction')
+    parser.add_argument('--model-config', type=str, default='dual_stream', choices=['dual_stream', 'voxelmorph_baseline'], help='Choose between the current dual-stream Siamese setup and the standard Voxelmorph baseline')
+    parser.add_argument('--decouple-layers', type=int, default=2, help='Number of shallow decoupled encoder layers used in dual-stream mode')
     parser.add_argument('--gpu', type=str, default='0', help='GPU ID')
     parser.add_argument('--fusion-method', type=str, default='compress_concat', choices=['add', 'concat', 'compress_concat'], help='Feature fusion method for Siamese encoder')
     parser.add_argument('--save-every', type=int, default=10, help='Checkpoint every N epochs')
@@ -614,41 +702,8 @@ def main():
     print(f'Using device: {device}')
 
     # Create model
-    # 注释掉原有的 VxmPairwise
-    # model = vxm.nn.models.VxmPairwise(
-    #     ndim=3,
-    #     source_channels=1,
-    #     target_channels=1,
-    #     # 使用更大的接收野和更宽的通道，这是能压平复杂脑回的关键
-    #     nb_features=[
-    #         # 编码器4层，刚好对应图像尺寸 160(可整除16)，避免空间维度拼接不匹配
-    #         [32, 64, 64, 64], 
-    #         # 解码器4层，与编码器对称
-    #         [64, 64, 64, 32]
-    #     ],
-    #     integration_steps=0, # set to 7 if you want diffeomorphic fields
-    # ).to(device)
-
-    # 1. 初始化双流特征编码器 (SiameseFeatureExtractor) - 现在改为使用 Vanilla Siamese Baseline
-    enc_channels = [32, 64, 64, 64] 
-    dec_channels = [64, 64, 64, 32] 
-    
-    inshape = (160, 192, 224) 
-    model = vxm.nn.SiameseUNetBaseline(
-        inshape=inshape,
-        in_channels=1,
-        enc_nf=enc_channels,
-        dec_nf=dec_channels,
-        ndim=3,
-        int_steps=args.integration_steps,
-        decouple_layers=2,
-        use_daps=args.use_daps,
-        use_pdaps=args.use_pdaps,
-        use_dsin=args.use_dsin,
-        use_cmim=args.use_cmim,
-        use_wmca=args.use_wmca,
-        use_pyramid=args.use_pyramid
-    ).to(device)
+    model = build_registration_model(args, device)
+    print(f'Model config: {args.model_config}')
 
     # 统计并打印参数量
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
