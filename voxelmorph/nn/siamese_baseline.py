@@ -386,11 +386,10 @@ class CrossModalInteractionModule(nn.Module):
         out = torch.matmul(attn, v)
         out = out.transpose(-1, -2).reshape(B, C, D, H, W)
         
-        # Residual connection + norm. 
-        # Since it's Target Querying Source, the output is aligned to Target geometry. 
-        # We add it to Source to create a "Target-Aware Source Feature"
+        # Attention output represents Source content warped into Target geometry.
+        # So we should add it as a residual to Target, not Source.
         out = self.out_conv(out)
-        return self.norm(source + out)
+        return self.norm(target + out)
 
 def window_partition_3d(x, window_size):
     """
@@ -468,7 +467,8 @@ class WindowCrossAttention3D(nn.Module):
         if pad_d > 0 or pad_h > 0 or pad_w > 0:
             x = x[:, :, :D, :H, :W]
             
-        # Residual connection to keep Original texture
-        x = self.norm(orig_moving + x)
+        # Attention output is aligned to fixed_windows (Target) spatial arrangement
+        # We should add it to x_fixed
+        x = self.norm(x_fixed[:, :, :D, :H, :W] + x)
             
         return x
