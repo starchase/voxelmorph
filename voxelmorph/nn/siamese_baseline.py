@@ -278,7 +278,14 @@ class SiameseUNetBaseline(nn.Module):
                         mode = 'trilinear' if self.ndim == 3 else 'bilinear'
                         flow_up = F.interpolate(pyramid_acc_flow, size=s_skip.shape[2:], mode=mode, align_corners=False)
                         flow_up = flow_up * 2.0  # Scale magnitude since resolution doubled
-                        s_skip_warped = self.spatial_transform(s_skip, flow_up)
+                        
+                        # Fix: integrate velocity field to displacement field before warping features
+                        if self.integrate is not None:
+                            disp_up = self.integrate(flow_up)
+                        else:
+                            disp_up = flow_up
+                            
+                        s_skip_warped = self.spatial_transform(s_skip, disp_up)
                         diff = torch.abs(s_skip_warped - t_skip)
                         skip_concat = torch.cat([s_skip_warped, t_skip, diff], dim=1)
                     else:

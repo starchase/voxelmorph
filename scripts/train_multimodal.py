@@ -44,6 +44,10 @@ class MultimodalTrainDataset(torch.utils.data.Dataset):
         # self.device = device # Don't move to GPU in dataset, do it in training loop
         self.max_samples = max_samples if max_samples is not None else 100
         
+        # --- 极速优化：开启内存全局缓存 ---
+        self.use_cache = True
+        self.cache = {}
+        
         # 1. Load Unpaired Pool
         self.ct_paths = sorted([p for p in self.ct_dir.iterdir() if p.suffix and not p.name.startswith('.')])
         self.mr_paths = sorted([p for p in self.mr_dir.iterdir() if p.suffix and not p.name.startswith('.')])
@@ -80,6 +84,15 @@ class MultimodalTrainDataset(torch.utils.data.Dataset):
         # Epoch length = Random Samples + Fixed Pairs
         return self.max_samples + len(self.fixed_pairs)
 
+    def _load_img(self, path):
+        if getattr(self, 'use_cache', False):
+            cache_key = str(path)
+            if cache_key not in self.cache:
+                img = torch.from_numpy(np.clip(nib.load(str(path)).get_fdata().astype(np.float32), 0.0, 1.0)).float().unsqueeze(0)
+                self.cache[cache_key] = img
+            return self.cache[cache_key]
+        return torch.from_numpy(np.clip(nib.load(str(path)).get_fdata().astype(np.float32), 0.0, 1.0)).float().unsqueeze(0)
+
     def __getitem__(self, idx):
         # Strategy: 
         # Indices [0 ... max_samples-1] -> Randomly sampled unpaired data
@@ -96,21 +109,8 @@ class MultimodalTrainDataset(torch.utils.data.Dataset):
             fixed_idx = idx - self.max_samples
             ct_path, mr_path = self.fixed_pairs[fixed_idx]
             
-        ct_nii = nib.load(str(ct_path))
-        mr_nii = nib.load(str(mr_path))
-
-        # print(f'Loaded CT: {ct_path.name}, MR: {mr_path.name}') # Too verbose for full training
-
-        ct_np = ct_nii.get_fdata().astype(np.float32)
-        mr_np = mr_nii.get_fdata().astype(np.float32)
-
-        # Data is already normalized to [0, 1] during preprocessing (e.g. normalize_for_abdomenmrct.py)
-        # Bounding to expected range just in case of float drifts
-        ct_np = np.clip(ct_np, 0.0, 1.0)
-        mr_np = np.clip(mr_np, 0.0, 1.0)
-
-        ct = torch.from_numpy(ct_np).float().unsqueeze(0)
-        mr = torch.from_numpy(mr_np).float().unsqueeze(0)
+        ct = self._load_img(ct_path)
+        mr = self._load_img(mr_path)
 
         return {'source': ct, 'target': mr}
 def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', suffix='', best_sample_idx=None):
@@ -696,6 +696,9 @@ class MultimodalValidationDataset(torch.utils.data.Dataset):
 
     def __init__(self, ct_dir: str, mr_dir: str, ct_label_dir: str = None, mr_label_dir: str = None, device: str = 'cpu', paired: bool = False):
         self.ct_dir = Path(ct_dir)
+        self.use_cache = True
+        self.cache = {}
+        self.lbl_cache = {}
         self.mr_dir = Path(mr_dir)
         self.ct_label_dir = Path(ct_label_dir) if ct_label_dir else None
         self.mr_label_dir = Path(mr_label_dir) if mr_label_dir else None
@@ -766,35 +769,42 @@ class MultimodalValidationDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.pairs)
 
+    def _load_img(self, path):
+        if getattr(self, 'use_cache', False):
+            cache_key = str(path)
+            if cache_key not in self.cache:
+                img = torch.from_numpy(np.clip(nib.load(str(path)).get_fdata().astype(np.float32), 0.0, 1.0)).float().unsqueeze(0)
+                self.cache[cache_key] = img
+            return self.cache[cache_key]
+        return torch.from_numpy(np.clip(nib.load(str(path)).get_fdata().astype(np.float32), 0.0, 1.0)).float().unsqueeze(0)
+
+    def _load_lbl(self, path):
+        if getattr(self, 'use_cache', False):
+            cache_key = str(path)
+            if cache_key not in getattr(self, 'lbl_cache', {}):
+                lbl = torch.from_numpy(nib.load(str(path)).get_fdata()).float().unsqueeze(0)
+                if not hasattr(self, 'lbl_cache'):
+                    self.lbl_cache = {}
+                self.lbl_cache[cache_key] = lbl
+            return self.lbl_cache[cache_key]
+        return torch.from_numpy(nib.load(str(path)).get_fdata()).float().unsqueeze(0)
+
     def __getitem__(self, idx):
         ct_path, mr_path = self.pairs[idx]
         
-        ct_nii = nib.load(str(ct_path))
-        mr_nii = nib.load(str(mr_path))
-
-        ct_np = ct_nii.get_fdata().astype(np.float32)
-        mr_np = mr_nii.get_fdata().astype(np.float32)
-        
-        # Data is already normalized to [0, 1] during preprocessing
-        # Bounding to expected range just in case of float drifts
-        ct_np = np.clip(ct_np, 0.0, 1.0)
-        mr_np = np.clip(mr_np, 0.0, 1.0)
-
-        ct = torch.from_numpy(ct_np).float().unsqueeze(0)
-        mr = torch.from_numpy(mr_np).float().unsqueeze(0)
+        ct = self._load_img(ct_path)
+        mr = self._load_img(mr_path)
         
         sample = {'source': ct, 'target': mr}
 
         # Load labels if available and filenames match
         if self.ct_label_dir and ct_path.name in self.ct_labels:
             ct_lbl_path = self.ct_labels[ct_path.name]
-            ct_lbl = torch.from_numpy(nib.load(str(ct_lbl_path)).get_fdata()).float().unsqueeze(0)
-            sample['source_label'] = ct_lbl
+            sample['source_label'] = self._load_lbl(ct_lbl_path)
             
         if self.mr_label_dir and mr_path.name in self.mr_labels:
              mr_lbl_path = self.mr_labels[mr_path.name]
-             mr_lbl = torch.from_numpy(nib.load(str(mr_lbl_path)).get_fdata()).float().unsqueeze(0)
-             sample['target_label'] = mr_lbl
+             sample['target_label'] = self._load_lbl(mr_lbl_path)
 
         sample['filename'] = ct_path.name.replace('.nii.gz', '').replace('.nii', '')
         return sample
@@ -1393,7 +1403,7 @@ def main():
     parser.add_argument('--mi-bins', type=int, default=32, help='Bins for Mutual Information')
     parser.add_argument('--mind-radius', type=int, default=2, help='MIND-SSC local patch radius')
     parser.add_argument('--mind-dilation', type=int, default=2, help='MIND-SSC neighbour dilation')
-    parser.add_argument('--mind-eps', type=float, default=1e-5, help='MIND-SSC numerical stability epsilon')
+    parser.add_argument('--mind-eps', type=float, default=1e-4, help='MIND-SSC numerical stability epsilon')
     parser.add_argument('--mi-weight', type=float, default=1.0, help='Weight for MI loss in mi_mind (Default 1.0)')
     parser.add_argument('--mind-weight', type=float, default=1.0, help='Weight for MIND loss in mi_mind (Default 1.0)')
     parser.add_argument('--unpaired', action='store_true', default=False, help='If set, force unpaired training even if filenames match.')
