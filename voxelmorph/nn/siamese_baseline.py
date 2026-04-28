@@ -142,7 +142,7 @@ class SiameseUNetBaseline(nn.Module):
     - Concatenation-based Skip Connections (No Diff-Aware yet)
     - No Frequency Domain Alignment yet
     """
-    def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False, use_pdaps=False, use_dsin=False, use_cmim=False, use_wmca=False, use_pyramid=False):
+    def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False, use_pdaps=False, use_dsin=False, use_cmim=False, use_wmca=False, use_pyramid=False, use_cross_mamba=False):
         super().__init__()
         self.inshape = inshape
         self.ndim = ndim
@@ -153,6 +153,7 @@ class SiameseUNetBaseline(nn.Module):
         self.use_cmim = use_cmim
         self.use_wmca = use_wmca
         self.use_pyramid = use_pyramid
+        self.use_cross_mamba = use_cross_mamba
 
         # 1. Shared Encoder with pluggable DSIN support
         self.encoder = DecoupledEncoder(
@@ -174,6 +175,17 @@ class SiameseUNetBaseline(nn.Module):
         if self.use_wmca:
             # 只在 1/4 (skip_idx=1) 添加，1/2 尺寸实在太大导致 OOM
             self.wmca_blocks["1"] = WindowCrossAttention3D(enc_nf[1], window_size=7)
+
+        # 1.7 Cross-Mamba at multi scales
+        self.cross_mamba_blocks = nn.ModuleDict()
+        if self.use_cross_mamba:
+            # 1/16 scale (seq len: ~1k)
+            self.cross_mamba_blocks["deep"] = CrossMambaInteraction3D(enc_nf[-1])
+            # 1/8 scale (seq len: ~12k)
+            self.cross_mamba_blocks["mid"] = CrossMambaInteraction3D(enc_nf[-2])
+            # 1/4 scale (seq len: ~100k -> pooled to ~12k)
+            # Use Strided version to strictly prevent Mamba from catastrophic length forgetting
+            self.cross_mamba_blocks["shallow"] = StridedCrossMambaInteraction3D(enc_nf[-3])
 
         
         # 2. Standard Decoder
@@ -249,6 +261,9 @@ class SiameseUNetBaseline(nn.Module):
         # Start from the bottom-most features (1/16 scale)
         if self.use_cmim:
             feat_s[-1] = self.cmim_blocks[0](feat_s[-1], feat_t[-1])
+        elif getattr(self, 'use_cross_mamba', False) and "deep" in self.cross_mamba_blocks:
+            feat_s[-1] = self.cross_mamba_blocks["deep"](feat_s[-1], feat_t[-1])
+            
         x = torch.cat([feat_s[-1], feat_t[-1]], dim=1)
         
         for i, block in enumerate(self.dec_blocks):
@@ -269,6 +284,13 @@ class SiameseUNetBaseline(nn.Module):
                 # --- [W-MCA at 1/4 and 1/2 Scales] ---
                 if getattr(self, 'use_wmca', False) and str(skip_idx) in self.wmca_blocks:
                     s_skip = self.wmca_blocks[str(skip_idx)](t_skip, s_skip)
+                
+                # --- [Cross-Mamba at Multi Scales] ---
+                if getattr(self, 'use_cross_mamba', False):
+                    if skip_idx == len(feat_s) - 2 and "mid" in self.cross_mamba_blocks:  # 1/8 scale
+                        s_skip = self.cross_mamba_blocks["mid"](s_skip, t_skip)
+                    elif skip_idx == len(feat_s) - 3 and "shallow" in self.cross_mamba_blocks:  # 1/4 scale
+                        s_skip = self.cross_mamba_blocks["shallow"](s_skip, t_skip)
                 
                 # --- [Ablation 2: DAPS-PLR / P-DAPS (Deformation-Aware Progressive Skip)] ---
                 if getattr(self, 'use_pdaps', False) and getattr(self, 'use_pyramid', False):
@@ -472,3 +494,122 @@ class WindowCrossAttention3D(nn.Module):
         x = self.norm(x_fixed[:, :, :D, :H, :W] + x)
             
         return x
+
+try:
+    from mamba_ssm import Mamba
+except ImportError:
+    Mamba = None
+
+class CrossMambaInteraction3D(nn.Module):
+    """
+    3D Cross-Mamba 模块：专为双流架构设计的全局跨模态交互。
+    替换原本 O(N^2) 复杂度的 Cross-Attention。
+    """
+    def __init__(self, channels, d_state=16, expand=2):
+        super().__init__()
+        if Mamba is None:
+            raise ImportError("请先安装: pip install causal-conv1d mamba-ssm")
+            
+        # 1. 跨模态融合投影
+        self.proj_in = nn.Conv3d(channels * 2, channels, kernel_size=1)
+        
+        # 2. 核心 Mamba 块
+        # Mamba 负责在展平的 1D 序列中建立 Source 和 Target 融合特征的全局依赖
+        self.mamba = Mamba(
+            d_model=channels,
+            d_state=d_state,   # SSM 状态维度
+            d_conv=4,          # 局部一维卷积大小
+            expand=expand,     # 通道扩展倍数
+        )
+        
+        self.norm_in = nn.LayerNorm(channels)
+        self.proj_out = nn.Conv3d(channels, channels, kernel_size=1)
+        self.norm_out = nn.InstanceNorm3d(channels)
+
+    def forward(self, source, target):
+        # source, target: (B, C, D, H, W)
+        B, C, D, H, W = source.shape
+        L = D * H * W
+        
+        # 1. 通道级特征融合并降维
+        # 为什么要融合？让网络在空间同位置感知两幅图的差异
+        x = torch.cat([source, target], dim=1) # (B, 2C, D, H, W)
+        x_proj = self.proj_in(x)               # (B, C, D, H, W)
+        
+        # 2. 展平为 (B, L, C) 序列以适配 Mamba
+        x_flat = x_proj.view(B, C, L).transpose(1, 2)
+        x_flat = self.norm_in(x_flat)
+        
+        # 3. Mamba 处理：双向扫描 (Bidirectional Scan) 破除因果盲区
+        # --- 前向扫描 (Forward) ---
+        out_forward = self.mamba(x_flat)
+        
+        # --- 后向扫描 (Backward) ---
+        # 翻转序列 L 的维度 (dim=1) 送入 Mamba，再翻转回来
+        x_flat_rev = torch.flip(x_flat, dims=[1])
+        out_backward = self.mamba(x_flat_rev)
+        out_backward = torch.flip(out_backward, dims=[1])
+        
+        # 将双向特征融合 (相加)
+        x_mamba = out_forward + out_backward
+        
+        # 4. 还原为 3D 尺寸
+        x_out_3d = x_mamba.transpose(1, 2).reshape(B, C, D, H, W)
+        
+        # 5. 残差连接到 Target（因为配准的目标是让 Source 对齐 Target）
+        out = self.proj_out(x_out_3d)
+        
+        return self.norm_out(target + out) # 返回强化后的 target 特征
+
+class StridedCrossMambaInteraction3D(nn.Module):
+    """
+    针对浅层大分辨率（1/4或1/2尺度）设计的池化 Mamba 交互模块。
+    通过 Downsample -> Mamba -> Upsample -> Local Conv，
+    解决 10 万级序列导致的 Mamba 内部状态遗忘（序列过长）问题。
+    """
+    def __init__(self, channels, d_state=16, expand=2):
+        super().__init__()
+        if Mamba is None:
+            raise ImportError("请先安装: pip install causal-conv1d mamba-ssm")
+            
+        self.proj_in = nn.Conv3d(channels * 2, channels, kernel_size=1)
+        self.pool = nn.AvgPool3d(kernel_size=2, stride=2)
+        
+        self.mamba = Mamba(d_model=channels, d_state=d_state, d_conv=4, expand=expand)
+        self.norm_in = nn.LayerNorm(channels)
+        
+        # 恢复尺寸后的局部细节打磨
+        self.local_conv = nn.Conv3d(channels, channels, kernel_size=3, padding=1)
+        self.proj_out = nn.Conv3d(channels, channels, kernel_size=1)
+        self.norm_out = nn.InstanceNorm3d(channels)
+
+    def forward(self, source, target):
+        B, C, D, H, W = source.shape
+        
+        # 1. 拼接与降维
+        x = torch.cat([source, target], dim=1) 
+        x = self.proj_in(x)
+        
+        # 2. 池化下采样，丢给 Mamba 解决序列过长问题
+        x_pooled = self.pool(x)
+        bp, cp, dp, hp, wp = x_pooled.shape
+        L_pooled = dp * hp * wp
+        
+        x_flat = x_pooled.view(bp, cp, L_pooled).transpose(1, 2)
+        x_flat = self.norm_in(x_flat)
+        
+        # 双向 Mamba
+        out_forward = self.mamba(x_flat)
+        x_flat_rev = torch.flip(x_flat, dims=[1])
+        out_backward = torch.flip(self.mamba(x_flat_rev), dims=[1])
+        x_mamba = out_forward + out_backward
+        
+        # 3. 还原尺寸并上采样回原分辨率
+        x_mamba_3d = x_mamba.transpose(1, 2).reshape(bp, cp, dp, hp, wp)
+        x_up = F.interpolate(x_mamba_3d, size=(D, H, W), mode='trilinear', align_corners=False)
+        
+        # 4. 局部 CNN 恢复插值丢失的高频细节，再生成残差
+        x_up = self.local_conv(x_up)
+        out = self.proj_out(x_up)
+        
+        return self.norm_out(target + out)
