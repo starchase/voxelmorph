@@ -1388,11 +1388,12 @@ def main():
     parser.add_argument('--ct-test-label-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm_300/test/labels/ct', help='Test CT labels')
     parser.add_argument('--mr-test-label-dir', type=str, default='/root/autodl-tmp/classedAbdomenMRCT_norm_300/test/labels/mr', help='Test MR labels')
     parser.add_argument('--output', type=str, default='/root/autodl-tmp/models/multimodal_vxm.pt', help='Output model path')
+    parser.add_argument('--network', type=str, default='siamese', choices=['siamese', 'vxm'], help='Network architecture to use')
     parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
     parser.add_argument('--workers', type=int, default=8, help='Number of workers')
     parser.add_argument('--steps-per-epoch', type=int, default=100, help='Steps per epoch')
     parser.add_argument('--max-train-samples', type=int, default=None, help='Max training samples to use (subsample)')
-    parser.add_argument('--batch-size', type=int, default=2, help='Batch size')
+    parser.add_argument('--batch-size', type=int, default=1, help='Batch size')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--lambda', type=float, dest='lambda_param', default=0.01, help='Regularization weight (0.01 for smooth, 1.0 for rigid)')
     parser.add_argument('--gpu', type=str, default='0', help='GPU ID')
@@ -1440,33 +1441,34 @@ def main():
     # sample['source'] shape is (1, D, H, W). We want (D, H, W)
     inshape = tuple(sample['source'].shape[1:])
 
-    # Model: SiameseUNetBaseline (原双流共享权重编码器)
-    # model = vxm.nn.SiameseUNetBaseline(
-    #     inshape=inshape,
-    #     ndim=3,
-    #     enc_nf=[32, 64, 64, 64],
-    #     dec_nf=[64, 64, 64, 32],
-    #     int_steps=args.integration_steps,
-    # ).to(device)
-    
-    # 替换为：调用浅层独立深层共享编码器 (DecoupledEncoder)
-    enc_channels = [32, 64, 64, 64]
-    dec_channels = [64, 64, 64, 32]
-    model = vxm.nn.SiameseUNetBaseline(
-        inshape=inshape,
-        in_channels=1,
-        enc_nf=enc_channels,
-        dec_nf=dec_channels,
-        ndim=3,
-        int_steps=args.integration_steps,
-        decouple_layers=2,
-        use_daps=args.use_daps,
-        use_pdaps=args.use_pdaps,
-        use_dsin=args.use_dsin,
-        use_cmim=args.use_cmim,
-        use_wmca=args.use_wmca,
-        use_pyramid=args.use_pyramid
-    ).to(device)
+    # Model
+    if args.network == 'vxm':
+        model = vxm.nn.models.VxmPairwise(
+            ndim=3,
+            source_channels=1,
+            target_channels=1,
+            nb_features=([32, 64, 64, 64], [64, 64, 64, 32]),
+            integration_steps=args.integration_steps,
+        ).to(device)
+    else:
+        # 替换为：调用浅层独立深层共享编码器 (DecoupledEncoder)
+        enc_channels = [32, 64, 64, 64]
+        dec_channels = [64, 64, 64, 32]
+        model = vxm.nn.SiameseUNetBaseline(
+            inshape=inshape,
+            in_channels=1,
+            enc_nf=enc_channels,
+            dec_nf=dec_channels,
+            ndim=3,
+            int_steps=args.integration_steps,
+            decouple_layers=2,
+            use_daps=args.use_daps,
+            use_pdaps=args.use_pdaps,
+            use_dsin=args.use_dsin,
+            use_cmim=args.use_cmim,
+            use_wmca=args.use_wmca,
+            use_pyramid=args.use_pyramid
+        ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f'Model Total Trainable Parameters: {total_params:,}')
