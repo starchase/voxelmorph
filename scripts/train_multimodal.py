@@ -1422,6 +1422,7 @@ def main():
     parser.add_argument('--use-cmim', action='store_true', help='Use CMIM')
     parser.add_argument('--use-wmca', action='store_true', help='Use WMCA (Local Window Attention)')
     parser.add_argument('--use-pyramid', action='store_true', help='Use Pyramid feature supervision')
+    parser.add_argument('--decouple-layers', type=int, default=0, help='Number of shallow encoder layers with independent source/target weights in SiameseUNetBaseline')
     parser.add_argument('--fusion-method', type=str, default='compress_concat', choices=['add', 'concat', 'compress_concat'], help='Feature fusion method for Siamese encoder')
     args = parser.parse_args()
 
@@ -1461,7 +1462,7 @@ def main():
             dec_nf=dec_channels,
             ndim=3,
             int_steps=args.integration_steps,
-            decouple_layers=2,
+            decouple_layers=args.decouple_layers,
             use_daps=args.use_daps,
             use_pdaps=args.use_pdaps,
             use_dsin=args.use_dsin,
@@ -1598,6 +1599,7 @@ def main():
         f.write(f"Lambda: {args.lambda_param}\n")
         f.write(f"LR: {args.lr}\n")
         f.write(f"Integration Steps: {args.integration_steps}\n")
+        f.write(f"Decouple Layers: {args.decouple_layers}\n")
         f.write(f"Unpaired: {args.unpaired}\n")
         f.write(f"Val Paired: {args.val_paired}\n")
         f.write(f"Model Architecture: SiameseUNetBaseline\n")
