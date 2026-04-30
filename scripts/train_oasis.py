@@ -77,7 +77,7 @@ def build_registration_model(args, device):
 
     if args.model_config == 'voxelmorph_baseline':
         ignored_flags = []
-        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_wmca', 'use_pyramid'):
+        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_gcv'):
             if getattr(args, flag):
                 ignored_flags.append(f'--{flag.replace("_", "-")}')
         if ignored_flags:
@@ -106,8 +106,10 @@ def build_registration_model(args, device):
             use_pdaps=args.use_pdaps,
             use_dsin=args.use_dsin,
             use_cmim=args.use_cmim,
-            use_wmca=args.use_wmca,
-            use_pyramid=args.use_pyramid
+            use_cross_mamba=args.use_cross_mamba,
+            use_wcv=args.use_wcv,
+            use_gcv=args.use_gcv,
+            encoder_type=getattr(args, 'encoder_type', 'cnn')
         )
 
     return model.to(device)
@@ -538,7 +540,7 @@ def train_epoch(
         y_seg = data[3].to(device)
 
         # 使用 AMP autocast
-        with torch.amp.autocast('cuda', enabled=amp_enabled):
+        with torch.autocast('cuda', enabled=amp_enabled, dtype=torch.bfloat16):
             # Get the displacement and the warped source image from the model
             out = model(
                 x,
@@ -584,7 +586,8 @@ def train_epoch(
                 else:
                     img_loss = -image_loss_fn(target_float, warped_float).mean()
                 
-            grad_loss = grad_loss_fn(displacement.float()).mean()
+            with torch.amp.autocast('cuda', enabled=False):
+                grad_loss = grad_loss_fn(displacement.float()).mean()
             
             # --- Deep Supervision for Pyramid/Coarse flows ---
             deep_sup_loss = displacement.new_tensor(0.0)
@@ -600,7 +603,8 @@ def train_epoch(
                     else:
                         c_flow_up = c_flow.float()
                         
-                    c_grad_loss = grad_loss_fn(c_flow_up).mean()
+                    with torch.amp.autocast('cuda', enabled=False):
+                        c_grad_loss = grad_loss_fn(c_flow_up).mean()
                     
                     # Warp using intermediate flow
                     if getattr(model, 'integrate', None) is not None:
@@ -627,8 +631,11 @@ def train_epoch(
                 # 对整体深度监督求平均，并打上折扣权重（默认0.5）
                 deep_sup_loss = (deep_sup_loss / len(coarse_flows)) * pyramid_weight
 
+            grad_loss = torch.clamp(grad_loss, min=0.0, max=100.0)
             loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
-            loss = loss + deep_sup_loss # Add deep supervision component
+            if deep_sup_loss is not None:
+                deep_sup_loss = torch.clamp(deep_sup_loss, min=0.0, max=100.0)
+                loss = loss + deep_sup_loss # Add deep supervision component
 
         # 数值稳定性保护：发现非有限值则跳过该 batch，避免污染整轮 loss
         if not torch.isfinite(loss):
@@ -681,8 +688,11 @@ def main():
     parser.add_argument('--use-daps', action='store_true', help='Use original DAPS')
     parser.add_argument('--use-dsin', action='store_true', help='Enable DSIN in the shallow decoupled encoder layers')
     parser.add_argument('--use-cmim', action='store_true', help='Enable CMIM at deep decoder scales')
-    parser.add_argument('--use-wmca', action='store_true', help='Enable window cross-attention on shallow skip features')
-    parser.add_argument('--use-pyramid', action='store_true', help='Enable pyramid coarse-to-fine flow prediction')
+    parser.add_argument('--use-cross-mamba', action='store_true', help='Enable Cross-Mamba at deep decoder scales')
+    parser.add_argument('--use-wcv', action='store_true', help='Enable window cross-attention on shallow skip features')
+    parser.add_argument('--use-swcv', action='store_true', help='Enable Structure-Aware WCV on deep skip features')
+    parser.add_argument('--use-gcv', action='store_true', help='Enable global cost volume on deep features')
+    parser.add_argument('--encoder-type', type=str, default='cnn', choices=['cnn', 'mamba'], help='Backbone type for feature extraction.')
     parser.add_argument('--model-config', type=str, default='dual_stream', choices=['dual_stream', 'voxelmorph_baseline'], help='Choose between the current dual-stream Siamese setup and the standard Voxelmorph baseline')
     parser.add_argument('--decouple-layers', type=int, default=2, help='Number of shallow decoupled encoder layers used in dual-stream mode')
     parser.add_argument('--gpu', type=str, default='0', help='GPU ID')
@@ -734,7 +744,7 @@ def main():
         print("          为了防止 NaN 崩盘，系统已强制关闭当前的 AMP 训练。\n\n")
         amp_enabled = False
         
-    scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
     # Dataloader identical to TransMorph
     train_composed = transforms.Compose([trans.NumpyType((np.float32, np.int16))])

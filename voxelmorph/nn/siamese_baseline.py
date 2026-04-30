@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .modules import SpatialTransformer, IntegrateVelocityField
+from .cross_mamba import CrossMambaModule
+from .vss_mamba import VSSBlock3D
 
 class ConvBlock(nn.Module):
     """
@@ -51,10 +53,11 @@ class DecoupledEncoder(nn.Module):
     Dual-stream encoder for Siamese Network with Appearance Decoupling.
     Allows specifying the number of decoupled layers at the beginning.
     """
-    def __init__(self, in_channels=1, enc_nf=[16, 32, 32, 32], ndim=3, decouple_layers=2, use_dsin=False):
+    def __init__(self, in_channels=1, enc_nf=[16, 32, 32, 32], ndim=3, decouple_layers=2, use_dsin=False, encoder_type='cnn'):
         super().__init__()
         self.decouple_layers = decouple_layers
         self.use_dsin = use_dsin
+        self.encoder_type = encoder_type
         
         self.enc_blocks_source = nn.ModuleList()
         self.enc_blocks_target = nn.ModuleList()
@@ -72,7 +75,17 @@ class DecoupledEncoder(nn.Module):
                 self.enc_blocks_target.append(ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=apply_norm))
             else:
                 # Shared convolution weights, usually no norm here for cross-modal interactive consistency
-                self.shared_blocks.append(ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=False))
+                if self.encoder_type == 'mamba' and i >= 2:
+                    # Deep layers: Hybrid CNN downsample + VSSBlock3D + Norm
+                    # We MUST normalize Mamba outputs, otherwise the unbounded variance 
+                    # causes the pyramid flow predictions to explode and log NaN grad_loss
+                    self.shared_blocks.append(nn.Sequential(
+                        ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=False),
+                        VSSBlock3D(nf),
+                        nn.Hardtanh(min_val=-10.0, max_val=10.0)
+                    ))
+                else:
+                    self.shared_blocks.append(ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=False))
             prev_channels = nf
 
     def forward(self, source, target):
@@ -107,7 +120,7 @@ class DAPS_PLR_Block(nn.Module):
         Conv = getattr(nn, f'Conv{ndim}d')
         self.flow_conv = Conv(in_channels, ndim, kernel_size=3, padding=1)
         # Initialize sub-flow to identity (close to zero)
-        self.flow_conv.weight.data.normal_(0, 1e-5)
+        self.flow_conv.weight.data.normal_(0, 1e-6)
         self.flow_conv.bias.data.zero_()
         self.stn = SpatialTransformer()
         self.ndim = ndim
@@ -115,7 +128,7 @@ class DAPS_PLR_Block(nn.Module):
     def forward(self, x, s_skip, t_skip):
         # a) Predict intermediate coarse flow
         mode = 'trilinear' if self.ndim == 3 else 'bilinear'
-        coarse_flow = self.flow_conv(x)
+        coarse_flow = 20.0 * torch.tanh(self.flow_conv(x) / 20.0)
         
         # Keep original sub-flow shape for PLR Return, but interpolate for warping if needed
         warp_flow = coarse_flow
@@ -134,6 +147,108 @@ class DAPS_PLR_Block(nn.Module):
         return skip_concat, coarse_flow
 
 
+
+class StructureAwareWindowCostVolume3D(nn.Module):
+    """
+    Structure-Aware Window Cost Volume (S-WCV).
+    Extracts high-frequency structural features (gradients/edges) to compute 
+    correlation, making it robust to modality/intensity shifts.
+    """
+    def __init__(self, dim, window_size=7, num_heads=4, qkv_bias=True):
+        super().__init__()
+        self.dim = dim
+        self.window_size = window_size
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+
+        # Fixed 3D difference kernels for spatial gradients
+        # [Channels, 1, KD, KH, KW] for depth-wise convolution
+        kernel_d = torch.tensor([[[-1., 0., 1.]]]).view(1, 1, 3, 1, 1).expand(dim, 1, 3, 1, 1)
+        kernel_h = torch.tensor([[[-1.], [0.], [1.]]]).view(1, 1, 1, 3, 1).expand(dim, 1, 1, 3, 1)
+        kernel_w = torch.tensor([[[-1., 0., 1.]]]).view(1, 1, 1, 1, 3).expand(dim, 1, 1, 1, 3)
+        
+        self.register_buffer('kernel_d', kernel_d)
+        self.register_buffer('kernel_h', kernel_h)
+        self.register_buffer('kernel_w', kernel_w)
+
+        # Q and K now take original feature + structural gradient (dim * 2)
+        self.q = nn.Linear(dim * 2, dim, bias=qkv_bias)
+        self.k = nn.Linear(dim * 2, bias=qkv_bias)
+        self.k = nn.Linear(dim * 2, dim, bias=qkv_bias)
+        
+        self.cv_proj = nn.Sequential(
+            nn.Conv3d(dim + 2 * num_heads, dim, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv3d(dim, dim, kernel_size=3, padding=1)
+        )
+        self.norm = nn.InstanceNorm3d(dim)
+
+    def extract_structure(self, x):
+        # Apply 3D spatial gradients (finite differences)
+        grad_d = F.conv3d(x, self.kernel_d, padding=(1, 0, 0), groups=self.dim)
+        grad_h = F.conv3d(x, self.kernel_h, padding=(0, 1, 0), groups=self.dim)
+        grad_w = F.conv3d(x, self.kernel_w, padding=(0, 0, 1), groups=self.dim)
+        # Structural edge magnitude
+        grad_mag = torch.sqrt(grad_d**2 + grad_h**2 + grad_w**2 + 1e-5)
+        # Concat origin features with structure features -> (B, 2C, D, H, W)
+        return torch.cat([x, grad_mag], dim=1)
+
+    def forward(self, x_fixed, x_moving):
+        orig_moving = x_moving
+        
+        # 1. Structural Extraction
+        feat_fixed = self.extract_structure(x_fixed)
+        feat_moving = self.extract_structure(x_moving)
+        
+        # 2. Geometry matching logic (same Windowing as S-WCV)
+        B, C_feat, D, H, W = feat_moving.shape
+        C = self.dim
+        
+        pad_d = (self.window_size - D % self.window_size) % self.window_size
+        pad_h = (self.window_size - H % self.window_size) % self.window_size
+        pad_w = (self.window_size - W % self.window_size) % self.window_size
+        
+        if pad_d > 0 or pad_h > 0 or pad_w > 0:
+            feat_fixed = F.pad(feat_fixed, (0, pad_w, 0, pad_h, 0, pad_d))
+            feat_moving = F.pad(feat_moving, (0, pad_w, 0, pad_h, 0, pad_d))
+            
+        _, _, D_pad, H_pad, W_pad = feat_moving.shape
+        
+        fixed_windows = window_partition_3d(feat_fixed, self.window_size)
+        moving_windows = window_partition_3d(feat_moving, self.window_size)
+        
+        fixed_windows = fixed_windows.view(-1, self.window_size**3, C_feat)
+        moving_windows = moving_windows.view(-1, self.window_size**3, C_feat)
+        
+        N_w = fixed_windows.shape[0]
+        
+        # Structural Query and Key
+        q = self.q(moving_windows).reshape(N_w, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        k = self.k(fixed_windows).reshape(N_w, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+
+        q_norm = torch.clamp(q.norm(p=2, dim=-1, keepdim=True), min=1e-5)
+        q = q / q_norm
+        k_norm = torch.clamp(k.norm(p=2, dim=-1, keepdim=True), min=1e-5)
+        k = k / k_norm
+
+        corr = (q @ k.transpose(-2, -1)) 
+        
+        cv_max, _ = corr.max(dim=-1)
+        cv_mean = corr.mean(dim=-1)
+        
+        cv_feat = torch.cat([cv_max, cv_mean], dim=1)
+        cv_feat = cv_feat.transpose(1, 2)
+        
+        cv_img = window_reverse_3d(cv_feat, self.window_size, D_pad, H_pad, W_pad)
+        
+        if pad_d > 0 or pad_h > 0 or pad_w > 0:
+            cv_img = cv_img[:, :, :D, :H, :W]
+            
+        fused = torch.cat([orig_moving, cv_img], dim=1)
+        fused = self.cv_proj(fused)
+            
+        return self.norm(orig_moving + fused)
+
 class SiameseUNetBaseline(nn.Module):
     """
     Vanilla Siamese U-Net Baseline.
@@ -142,7 +257,8 @@ class SiameseUNetBaseline(nn.Module):
     - Concatenation-based Skip Connections (No Diff-Aware yet)
     - No Frequency Domain Alignment yet
     """
-    def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False, use_pdaps=False, use_dsin=False, use_cmim=False, use_wmca=False, use_pyramid=False):
+    def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False, use_pdaps=False, use_dsin=False, use_cmim=False, use_cross_mamba=False, use_wcv=False,
+                 use_swcv=False, use_gcv=False, encoder_type='cnn'):
         super().__init__()
         self.inshape = inshape
         self.ndim = ndim
@@ -151,29 +267,56 @@ class SiameseUNetBaseline(nn.Module):
         self.use_pdaps = use_pdaps
         self.use_dsin = use_dsin
         self.use_cmim = use_cmim
-        self.use_wmca = use_wmca
-        self.use_pyramid = use_pyramid
+        self.use_cross_mamba = use_cross_mamba
+        self.use_wcv = use_wcv
+        self.use_swcv = use_swcv
+        self.use_gcv = use_gcv
+        
+        # --- [Architectural Refactoring] ---
+        # Note: P-DAPS natively encapsulates coarse-to-fine deformation (previously isolated as 'pyramid').
 
         # 1. Shared Encoder with pluggable DSIN support
         self.encoder = DecoupledEncoder(
             in_channels, enc_nf, ndim, 
             decouple_layers=decouple_layers, 
-            use_dsin=use_dsin
+            use_dsin=use_dsin,
+            encoder_type=encoder_type
         )
         
-        # 1.5 Cross-Modal Interaction Module (CMIM) at 1/8 and 1/16 scales
+        # 1.5 Cross-Modal Interaction Module
+        # CMIM: apply at 1/8 and 1/16 scales
+        # Cross-Mamba: apply to resolutions 1/16(idx=1) and 1/8(idx=0)
         self.cmim_blocks = nn.ModuleList()
         if self.use_cmim:
-            # Last layer (1/16 scale)
             self.cmim_blocks.append(CrossModalInteractionModule(enc_nf[-1]))
-            # Second to last layer (1/8 scale)
             self.cmim_blocks.append(CrossModalInteractionModule(enc_nf[-2]))
+        elif self.use_cross_mamba:
+            self.cmim_blocks.append(CrossMambaModule(enc_nf[-1])) # 1/16 bottleneck
+            self.cmim_blocks.append(CrossMambaModule(enc_nf[-2])) # 1/8 scale
             
-        # 1.6 Window Cross-Attention (W-MCA) at 1/2 and 1/4 scales
-        self.wmca_blocks = nn.ModuleDict()
-        if self.use_wmca:
-            # 只在 1/4 (skip_idx=1) 添加，1/2 尺寸实在太大导致 OOM
-            self.wmca_blocks["1"] = WindowCrossAttention3D(enc_nf[1], window_size=7)
+        # 1.6 Window Cost Volume (WCV) at shallow scales
+        
+        # 1.7 Global Cost Volume (GCV) at deep scales
+        self.gcv_blocks = nn.ModuleDict()
+        if self.use_gcv:
+            # 1/16 scale (bottleneck)
+            self.gcv_blocks["bottleneck"] = GlobalCostVolume3D(enc_nf[-1])
+            # 1/8 scale
+            self.gcv_blocks["3"] = GlobalCostVolume3D(dec_nf[0])
+
+        self.wcv_blocks = nn.ModuleDict()
+        if self.use_wcv:
+            # Deep Bottleneck (1/16 scale)
+            self.wcv_blocks["bottleneck"] = WindowCostVolume3D(enc_nf[-1], window_size=7)
+            # Deep skip connection (1/8 scale, skip_idx=2)
+            self.wcv_blocks["2"] = WindowCostVolume3D(enc_nf[-2], window_size=7)
+
+        self.swcv_blocks = nn.ModuleDict()
+        if self.use_swcv:
+            # Deep Bottleneck (1/16 scale)
+            self.swcv_blocks["bottleneck"] = StructureAwareWindowCostVolume3D(enc_nf[-1], window_size=7)
+            # Deep skip connection (1/8 scale, skip_idx=2)
+            self.swcv_blocks["2"] = StructureAwareWindowCostVolume3D(enc_nf[-2], window_size=7)
 
         
         # 2. Standard Decoder
@@ -215,15 +358,16 @@ class SiameseUNetBaseline(nn.Module):
         self.flow_conv = Conv(dec_nf[-1], ndim, kernel_size=3, padding=1)
         
         # Initialize flow weights to very small values
-        self.flow_conv.weight.data.normal_(0, 1e-5)
+        self.flow_conv.weight.data.normal_(0, 1e-6)
         self.flow_conv.bias.data.zero_()
 
-        # --- [Pyramid Coarse-to-fine Flows] ---
-        if self.use_pyramid:
+        # --- [P-DAPS Coarse-to-fine Flows] ---
+        if self.use_pdaps:
             self.pyramid_flows = nn.ModuleList()
             for nf in dec_nf:
                 p_flow_conv = Conv(nf, ndim, kernel_size=3, padding=1)
-                p_flow_conv.weight.data.normal_(0, 1e-5)
+                # Extremely small initialization is required to start with an identity transform
+                p_flow_conv.weight.data.normal_(0, 1e-7)
                 p_flow_conv.bias.data.zero_()
                 self.pyramid_flows.append(p_flow_conv)
 
@@ -247,8 +391,16 @@ class SiameseUNetBaseline(nn.Module):
         
         # 2. Decoding (Standard U-Net Upsampling)
         # Start from the bottom-most features (1/16 scale)
-        if self.use_cmim:
+        if self.use_cmim or getattr(self, 'use_cross_mamba', False):
             feat_s[-1] = self.cmim_blocks[0](feat_s[-1], feat_t[-1])
+        if getattr(self, 'use_wcv', False) and "bottleneck" in self.wcv_blocks:
+            feat_s[-1] = self.wcv_blocks["bottleneck"](x_fixed=feat_t[-1], x_moving=feat_s[-1])
+        if getattr(self, 'use_swcv', False) and "bottleneck" in self.swcv_blocks:
+            feat_s[-1] = self.swcv_blocks["bottleneck"](x_fixed=feat_t[-1], x_moving=feat_s[-1])
+        if getattr(self, 'use_gcv', False) and "bottleneck" in self.gcv_blocks:
+            feat_s[-1] = self.gcv_blocks["bottleneck"](x_fixed=feat_t[-1], x_moving=feat_s[-1])
+
+            
         x = torch.cat([feat_s[-1], feat_t[-1]], dim=1)
         
         for i, block in enumerate(self.dec_blocks):
@@ -266,12 +418,18 @@ class SiameseUNetBaseline(nn.Module):
                 if self.use_cmim and skip_idx == len(feat_s) - 2:
                     s_skip = self.cmim_blocks[1](s_skip, t_skip)
                 
-                # --- [W-MCA at 1/4 and 1/2 Scales] ---
-                if getattr(self, 'use_wmca', False) and str(skip_idx) in self.wmca_blocks:
-                    s_skip = self.wmca_blocks[str(skip_idx)](t_skip, s_skip)
+                # --- [Cross-Mamba at multi scales] ---
+                if getattr(self, 'use_cross_mamba', False):
+                    if skip_idx == len(feat_s) - 2:   # 1/8 scale
+                        s_skip = self.cmim_blocks[1](s_skip, t_skip)
                 
-                # --- [Ablation 2: DAPS-PLR / P-DAPS (Deformation-Aware Progressive Skip)] ---
-                if getattr(self, 'use_pdaps', False) and getattr(self, 'use_pyramid', False):
+                # --- [GCV at Deep Scales] ---
+                if getattr(self, 'use_gcv', False) and str(skip_idx) in self.gcv_blocks:
+                    s_skip = self.gcv_blocks[str(skip_idx)](x_fixed=t_skip, x_moving=s_skip)
+                
+                # --- [Ablation 2: P-DAPS (Pyramid Deformation-Aware Progressive Skip) + Structure Matching] ---
+                # NOTE: P-DAPS essentially absorbs the traditional feature pyramid.
+                if getattr(self, 'use_pdaps', False):
                     # P-DAPS: Use the explicit pyramid flow from the previous layer to warp s_skip
                     if pyramid_acc_flow is not None:
                         # Upsample previous flow to current skip connection resolution
@@ -286,26 +444,46 @@ class SiameseUNetBaseline(nn.Module):
                             disp_up = flow_up
                             
                         s_skip_warped = self.spatial_transform(s_skip, disp_up)
+                        
+                        # --- [Warp-then-Match: Apply S-WCV / WCV on aligned features] ---
+                        if getattr(self, 'use_wcv', False) and str(skip_idx) in self.wcv_blocks:
+                            s_skip_warped = self.wcv_blocks[str(skip_idx)](x_fixed=t_skip, x_moving=s_skip_warped)
+                        if getattr(self, 'use_swcv', False) and str(skip_idx) in self.swcv_blocks:
+                            s_skip_warped = self.swcv_blocks[str(skip_idx)](x_fixed=t_skip, x_moving=s_skip_warped)
+                            
+                        # Calculate diff and concat mapping explicit error
                         diff = torch.abs(s_skip_warped - t_skip)
                         skip_concat = torch.cat([s_skip_warped, t_skip, diff], dim=1)
                     else:
                         # Top-most layer (1/16 scale doesn't have a previous flow)
+                        if getattr(self, 'use_wcv', False) and str(skip_idx) in self.wcv_blocks:
+                            s_skip = self.wcv_blocks[str(skip_idx)](x_fixed=t_skip, x_moving=s_skip)
+                        if getattr(self, 'use_swcv', False) and str(skip_idx) in self.swcv_blocks:
+                            s_skip = self.swcv_blocks[str(skip_idx)](x_fixed=t_skip, x_moving=s_skip)
+                            
                         diff = torch.abs(s_skip - t_skip)
                         skip_concat = torch.cat([s_skip, t_skip, diff], dim=1)
+                        
                 elif getattr(self, 'use_daps', False):
                     # Original DAPS-PLR block
                     skip_concat, coarse_flow = self.daps_plr_blocks[i](x, s_skip, t_skip)
                     coarse_flows.append(coarse_flow)
                 else:
+                    # --- [Independent Match (No P-DAPS)] ---
+                    if getattr(self, 'use_wcv', False) and str(skip_idx) in self.wcv_blocks:
+                        s_skip = self.wcv_blocks[str(skip_idx)](x_fixed=t_skip, x_moving=s_skip)
+                    if getattr(self, 'use_swcv', False) and str(skip_idx) in self.swcv_blocks:
+                        s_skip = self.swcv_blocks[str(skip_idx)](x_fixed=t_skip, x_moving=s_skip)
+                        
                     skip_concat = torch.cat([s_skip, t_skip], dim=1)
                     
                 x = torch.cat([x, skip_concat], dim=1)
                 
             x = block(x)
 
-            # --- [Pyramid Coarse-to-fine generation & Deep Supervision] ---
-            if getattr(self, 'use_pyramid', False):
-                sub_flow = self.pyramid_flows[i](x)
+            # --- [P-DAPS Coarse-to-fine Flow generation & Deep Supervision] ---
+            if getattr(self, 'use_pdaps', False):
+                sub_flow = 10.0 * torch.tanh(self.pyramid_flows[i](x) / 10.0)
                 if pyramid_acc_flow is None:
                     pyramid_acc_flow = sub_flow
                 else:
@@ -321,10 +499,10 @@ class SiameseUNetBaseline(nn.Module):
 
         # 3. Flow prediction (Only at full resolution)
         # --- [Ablation 3 Hook: Coarse-to-fine FPN handling will replace this] ---
-        if getattr(self, 'use_pyramid', False):
+        if getattr(self, 'use_pdaps', False):
             velocity = pyramid_acc_flow
         else:
-            velocity = self.flow_conv(x)
+            velocity = 20.0 * torch.tanh(self.flow_conv(x) / 20.0)
         
         if self.integrate is not None:
             displacement = self.integrate(velocity)
@@ -365,31 +543,37 @@ class CrossModalInteractionModule(nn.Module):
         self.v_conv = nn.Conv3d(channels, channels, 1)
         
         self.out_conv = nn.Conv3d(channels, channels, 1)
+        self.fuse_conv = nn.Conv3d(channels * 2, channels, 1)
         self.norm = nn.InstanceNorm3d(channels)
         
     def forward(self, source, target):
         B, C, D, H, W = source.shape
         N = D * H * W
         
-        # Target acts as Query (where should target look in source?)
-        # Source acts as Key and Value
-        # Reshape to (B, heads, N, C/heads)
-        q = self.q_conv(target).view(B, self.num_heads, C // self.num_heads, N).transpose(-1, -2)
-        k = self.k_conv(source).view(B, self.num_heads, C // self.num_heads, N)
-        v = self.v_conv(source).view(B, self.num_heads, C // self.num_heads, N).transpose(-1, -2)
+        # [CRITICAL GEOMETRY FIX]
+        # For the Source feature branch, we MUST maintain the Source coordinate grid.
+        # Query = Source (Look outwards from the Source grid)
+        # Key/Value = Target (Search for matching patterns in the Target grid)
+        # This returns Target features aligned to the Source grid!
+        q = self.q_conv(source).view(B, self.num_heads, C // self.num_heads, N).transpose(-1, -2)
+        k = self.k_conv(target).view(B, self.num_heads, C // self.num_heads, N)
+        v = self.v_conv(target).view(B, self.num_heads, C // self.num_heads, N).transpose(-1, -2)
         
         # Scaled Dot-Product Attention: (B, heads, N, N)
+        # attn matrix: Source_pixels -> Target_pixels
         attn = torch.matmul(q, k) / (C // self.num_heads) ** 0.5
-        attn = F.softmax(attn, dim=-1)
+        attn = torch.nn.functional.softmax(attn, dim=-1)
         
-        # Output: (B, heads, N, C/heads) -> (B, C, D, H, W)
+        # Output geometry = Source! (Target features mapped to Source grid)
         out = torch.matmul(attn, v)
         out = out.transpose(-1, -2).reshape(B, C, D, H, W)
         
-        # Attention output represents Source content warped into Target geometry.
-        # So we should add it as a residual to Target, not Source.
+        # Now out and source are strictly in the SAME spatial coordinates (Source)
+        # We safely fuse them. Target is NOT concatenated here because it lives in a different spatial grid.
         out = self.out_conv(out)
-        return self.norm(target + out)
+        fused = self.fuse_conv(torch.cat([source, out], dim=1))
+        
+        return self.norm(fused + source)
 
 def window_partition_3d(x, window_size):
     """
@@ -411,12 +595,64 @@ def window_reverse_3d(windows, window_size, D, H, W):
     x = x.permute(0, 7, 1, 4, 2, 5, 3, 6).contiguous().view(B, C, D, H, W)
     return x
 
-class WindowCrossAttention3D(nn.Module):
+
+class GlobalCostVolume3D(nn.Module):
     """
-    Window-based Cross-Attention for high resolution feature alignment.
-    Decoupled: Query comes from Fixed/Target, Key/Value comes from Moving/Source.
+    Global Cost Volume: Computes explicit All-to-All correlation map.
+    Returns matched features based on maximum and mean correlation across the entire image.
     """
-    def __init__(self, dim, window_size=7, num_heads=4, qkv_bias=True, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, num_heads=4, qkv_bias=True):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k = nn.Linear(dim, dim, bias=qkv_bias)
+        
+        self.cv_proj = nn.Sequential(
+            nn.Conv3d(dim + 2 * num_heads, dim, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv3d(dim, dim, kernel_size=3, padding=1)
+        )
+        self.norm = nn.InstanceNorm3d(dim)
+
+    def forward(self, x_fixed, x_moving):
+        orig_moving = x_moving
+        B, C, D, H, W = x_moving.shape
+        N = D * H * W
+        
+        q = self.q(x_moving.view(B, C, N).transpose(1, 2)).view(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)
+        k = self.k(x_fixed.view(B, C, N).transpose(1, 2)).view(B, N, self.num_heads, C // self.num_heads).transpose(1, 2)
+        
+        # Cosine Similarity Context: mathematically bound the correlation map exactly to [-1, 1] to prevent ANY numerical cascade from Mamba
+        q_norm = torch.clamp(q.norm(p=2, dim=-1, keepdim=True), min=1e-5)
+        q = q / q_norm
+        k_norm = torch.clamp(k.norm(p=2, dim=-1, keepdim=True), min=1e-5)
+        k = k / k_norm
+        
+        # Explicit Correlation Matrix (B, num_heads, N, N)
+        corr = (q @ k.transpose(-2, -1)) # No scale needed for cosine similarity
+        
+        cv_max, _ = corr.max(dim=-1) # (B, num_heads, N)
+        cv_mean = corr.mean(dim=-1)  # (B, num_heads, N)
+        
+        cv_feat = torch.cat([cv_max, cv_mean], dim=1) # (B, 2*num_heads, N)
+        cv_img = cv_feat.view(B, 2*self.num_heads, D, H, W)
+        
+        fused = torch.cat([orig_moving, cv_img], dim=1)
+        fused = self.cv_proj(fused)
+            
+        return self.norm(orig_moving + fused)
+
+class WindowCostVolume3D(nn.Module):
+    """
+    State-Space Cost Volume (SSM-CV): Explicit Correlation Volume.
+    Instead of multiplying by V (which causes feature teleportation), 
+    we aggregate the correlation matrix (Q @ K^T) into a dense mismatch heatmap.
+    """
+    def __init__(self, dim, window_size=7, num_heads=4, qkv_bias=True):
         super().__init__()
         self.dim = dim
         self.window_size = window_size
@@ -425,16 +661,19 @@ class WindowCrossAttention3D(nn.Module):
         self.scale = head_dim ** -0.5
 
         self.q = nn.Linear(dim, dim, bias=qkv_bias)
-        self.kv = nn.Linear(dim, dim * 2, bias=qkv_bias)
+        self.k = nn.Linear(dim, dim, bias=qkv_bias)
         
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
+        # Compress the max and mean similarities into original channel dimension
+        self.cv_proj = nn.Sequential(
+            nn.Conv3d(dim + 2 * num_heads, dim, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv3d(dim, dim, kernel_size=3, padding=1)
+        )
         self.norm = nn.InstanceNorm3d(dim)
 
     def forward(self, x_fixed, x_moving):
         orig_moving = x_moving
-        B, C, D, H, W = x_fixed.shape
+        B, C, D, H, W = x_moving.shape
         
         pad_d = (self.window_size - D % self.window_size) % self.window_size
         pad_h = (self.window_size - H % self.window_size) % self.window_size
@@ -449,26 +688,38 @@ class WindowCrossAttention3D(nn.Module):
         fixed_windows = window_partition_3d(x_fixed, self.window_size) 
         moving_windows = window_partition_3d(x_moving, self.window_size)
         
-        N_w = fixed_windows.shape[0] 
-        q = self.q(fixed_windows).reshape(N_w, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
-        kv = self.kv(moving_windows).reshape(N_w, -1, 2, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        k, v = kv[0], kv[1]
+        N_w = moving_windows.shape[0] 
+        
+        # Source/Moving is Query
+        q = self.q(moving_windows).reshape(N_w, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
+        # Target/Fixed is Key
+        k = self.k(fixed_windows).reshape(N_w, -1, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
+        # Cosine Similarity Bounds for Window Cost Volume
+        q_norm = torch.clamp(q.norm(p=2, dim=-1, keepdim=True), min=1e-5)
+        q = q / q_norm
+        k_norm = torch.clamp(k.norm(p=2, dim=-1, keepdim=True), min=1e-5)
+        k = k / k_norm
 
-        x = (attn @ v).transpose(1, 2).reshape(N_w, -1, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-
-        x = window_reverse_3d(x, self.window_size, D_pad, H_pad, W_pad)
+        # Explicit Correlation Matrix (NO softmax, NO V multiplication)
+        # Shape: [N_w, num_heads, W^3, W^3]
+        corr = (q @ k.transpose(-2, -1)) # No scale needed for cosine
+        
+        # Aggregate mismatch heatmap statistics (Max correlation and Mean correlation)
+        # Max shows the best matching point, Mean shows global contextual confidence
+        cv_max, _ = corr.max(dim=-1) # [N_w, num_heads, W^3]
+        cv_mean = corr.mean(dim=-1)  # [N_w, num_heads, W^3]
+        
+        cv_feat = torch.cat([cv_max, cv_mean], dim=1) # [N_w, 2*num_heads, W^3]
+        cv_feat = cv_feat.transpose(1, 2) # [N_w, W^3, 2*num_heads]
+        
+        cv_img = window_reverse_3d(cv_feat, self.window_size, D_pad, H_pad, W_pad)
         
         if pad_d > 0 or pad_h > 0 or pad_w > 0:
-            x = x[:, :, :D, :H, :W]
+            cv_img = cv_img[:, :, :D, :H, :W]
             
-        # Attention output is aligned to fixed_windows (Target) spatial arrangement
-        # We should add it to x_fixed
-        x = self.norm(x_fixed[:, :, :D, :H, :W] + x)
+        # Concatenate Cost Volume Heatmap with original Source Features
+        fused = torch.cat([orig_moving, cv_img], dim=1)
+        fused = self.cv_proj(fused)
             
-        return x
+        return self.norm(orig_moving + fused)
