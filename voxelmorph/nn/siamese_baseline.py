@@ -26,6 +26,22 @@ class ConvBlock(nn.Module):
             x = self.norm(x)
         return self.activation(x)
 
+class ResidualMambaBlock(nn.Module):
+    """
+    Scientific Residual + Norm stabilized Mamba block.
+    VSSBlock3D natively contains a residual connection, so we just
+    stack them directly without applying norms over the residual sum,
+    which would otherwise destroy the identity mapping.
+    """
+    def __init__(self, channels, num_blocks=1):
+        super().__init__()
+        self.blocks = nn.ModuleList([VSSBlock3D(channels) for _ in range(num_blocks)])
+        
+    def forward(self, x):
+        for block in self.blocks:
+            x = block(x)
+        return x
+
 class SharedEncoder(nn.Module):
     """
     Shared dual-stream encoder for Siamese Network.
@@ -76,13 +92,11 @@ class DecoupledEncoder(nn.Module):
             else:
                 # Shared convolution weights, usually no norm here for cross-modal interactive consistency
                 if self.encoder_type == 'mamba' and i >= 2:
-                    # Deep layers: Hybrid CNN downsample + VSSBlock3D + Norm
-                    # We MUST normalize Mamba outputs, otherwise the unbounded variance 
-                    # causes the pyramid flow predictions to explode and log NaN grad_loss
+                    # Thick Deep Bottleneck: 1 block at 1/8 scale, 3 blocks at 1/16 scale
+                    num_mamba = 3 if i == len(enc_nf) - 1 else 1
                     self.shared_blocks.append(nn.Sequential(
                         ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=False),
-                        VSSBlock3D(nf),
-                        nn.Hardtanh(min_val=-10.0, max_val=10.0)
+                        ResidualMambaBlock(nf, num_blocks=num_mamba)
                     ))
                 else:
                     self.shared_blocks.append(ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=False))
@@ -173,7 +187,6 @@ class StructureAwareWindowCostVolume3D(nn.Module):
 
         # Q and K now take original feature + structural gradient (dim * 2)
         self.q = nn.Linear(dim * 2, dim, bias=qkv_bias)
-        self.k = nn.Linear(dim * 2, bias=qkv_bias)
         self.k = nn.Linear(dim * 2, dim, bias=qkv_bias)
         
         self.cv_proj = nn.Sequential(
@@ -271,6 +284,7 @@ class SiameseUNetBaseline(nn.Module):
         self.use_wcv = use_wcv
         self.use_swcv = use_swcv
         self.use_gcv = use_gcv
+        self.encoder_type = encoder_type
         
         # --- [Architectural Refactoring] ---
         # Note: P-DAPS natively encapsulates coarse-to-fine deformation (previously isolated as 'pyramid').
@@ -301,8 +315,8 @@ class SiameseUNetBaseline(nn.Module):
         if self.use_gcv:
             # 1/16 scale (bottleneck)
             self.gcv_blocks["bottleneck"] = GlobalCostVolume3D(enc_nf[-1])
-            # 1/8 scale
-            self.gcv_blocks["3"] = GlobalCostVolume3D(dec_nf[0])
+            # 1/8 scale, skip_idx=2
+            self.gcv_blocks["2"] = GlobalCostVolume3D(enc_nf[-2])
 
         self.wcv_blocks = nn.ModuleDict()
         if self.use_wcv:
@@ -348,7 +362,16 @@ class SiameseUNetBaseline(nn.Module):
             
             in_ch = prev_channels + skip_channels
             
-            self.dec_blocks.append(ConvBlock(ndim, in_ch, nf, stride=1))
+            # Asymmetric Decoder: Inject 1 Mamba block at the very first decoder stage (1/8 scale)
+            # to smoothly transition global topology into the CNN reconstruction pipeline.
+            if self.encoder_type == 'mamba' and i == 0:
+                self.dec_blocks.append(nn.Sequential(
+                    ConvBlock(ndim, in_ch, nf, stride=1),
+                    ResidualMambaBlock(nf, num_blocks=1)
+                ))
+            else:
+                self.dec_blocks.append(ConvBlock(ndim, in_ch, nf, stride=1))
+                
             prev_channels = nf
             
         # 3. Final Flow Prediction (Only at full resolution)

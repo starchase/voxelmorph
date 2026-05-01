@@ -3,7 +3,7 @@ import torch.nn as nn
 from mamba_ssm import Mamba
 
 class VSSBlock3D(nn.Module):
-    def __init__(self, channels, d_state=16, d_conv=4, expand=2):
+    def __init__(self, channels, d_state=16, d_conv=4, expand=2, gamma_init=0.1):
         super().__init__()
         self.channels = channels
         self.ln = nn.LayerNorm(channels)
@@ -16,6 +16,32 @@ class VSSBlock3D(nn.Module):
         # Adding a local spatial compensator (DWConv)
         self.dwconv = nn.Conv3d(channels, channels, kernel_size=3, padding=1, groups=channels)
         self.act = nn.SiLU()
+        self.gamma = nn.Parameter(torch.full((1, channels, 1, 1, 1), gamma_init))
+
+    def _scan_sequence(self, x_seq):
+        x_seq = self.ln(x_seq)
+        x_fwd = self.mamba(x_seq)
+        x_rev = self.mamba(torch.flip(x_seq, dims=[1]))
+        return x_fwd + torch.flip(x_rev, dims=[1])
+
+    def _flatten_axis(self, x, axis):
+        if axis == 'd':
+            return x.flatten(2).transpose(1, 2), None
+        if axis == 'h':
+            return x.permute(0, 1, 3, 2, 4).contiguous().flatten(2).transpose(1, 2), 'h'
+        if axis == 'w':
+            return x.permute(0, 1, 4, 2, 3).contiguous().flatten(2).transpose(1, 2), 'w'
+        raise ValueError(f'Unsupported scan axis: {axis}')
+
+    def _restore_axis(self, x_seq, B, C, D, H, W, axis_tag):
+        x = x_seq.transpose(1, 2).contiguous()
+        if axis_tag is None:
+            return x.view(B, C, D, H, W)
+        if axis_tag == 'h':
+            return x.view(B, C, H, D, W).permute(0, 1, 3, 2, 4).contiguous()
+        if axis_tag == 'w':
+            return x.view(B, C, W, D, H).permute(0, 1, 3, 4, 2).contiguous()
+        raise ValueError(f'Unsupported restore axis: {axis_tag}')
 
     def forward(self, x):
         # x.shape: (B, C, D, H, W)
@@ -26,15 +52,11 @@ class VSSBlock3D(nn.Module):
         x = self.dwconv(x)
         x = self.act(x)
         
-        # Flatten for Mamba
-        x = x.view(B, C, -1).permute(0, 2, 1) # (B, L, C)
-        x = self.ln(x)
-        
-        # Multi-scan approx (simplified for now with bidirectional or forward)
-        x_fwd = self.mamba(x)
-        x_rev = self.mamba(torch.flip(x, dims=[1]))
-        x = x_fwd + torch.flip(x_rev, dims=[1])
-        
-        # Reshape back
-        x = x.permute(0, 2, 1).view(B, C, D, H, W)
-        return x + shortcut
+        axis_outputs = []
+        for axis in ('d', 'h', 'w'):
+            x_seq, axis_tag = self._flatten_axis(x, axis)
+            x_seq = self._scan_sequence(x_seq)
+            axis_outputs.append(self._restore_axis(x_seq, B, C, D, H, W, axis_tag))
+
+        x = torch.stack(axis_outputs, dim=0).mean(dim=0)
+        return shortcut + self.gamma * x

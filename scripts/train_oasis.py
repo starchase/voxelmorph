@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
@@ -77,7 +78,7 @@ def build_registration_model(args, device):
 
     if args.model_config == 'voxelmorph_baseline':
         ignored_flags = []
-        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_gcv'):
+        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv'):
             if getattr(args, flag):
                 ignored_flags.append(f'--{flag.replace("_", "-")}')
         if ignored_flags:
@@ -108,6 +109,7 @@ def build_registration_model(args, device):
             use_cmim=args.use_cmim,
             use_cross_mamba=args.use_cross_mamba,
             use_wcv=args.use_wcv,
+            use_swcv=args.use_swcv,
             use_gcv=args.use_gcv,
             encoder_type=getattr(args, 'encoder_type', 'cnn')
         )
@@ -511,6 +513,23 @@ def validate(
         return eval_dsc.avg, eval_hd95.avg, eval_jac.avg, eval_mag.avg
     return eval_dsc.avg
 
+def _binary_dilate_3d(mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    return F.max_pool3d(mask, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+
+def _binary_erode_3d(mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    return 1.0 - F.max_pool3d(1.0 - mask, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+
+def build_foreground_mask(target: torch.Tensor, target_seg: torch.Tensor = None) -> torch.Tensor:
+    if target_seg is not None and (target_seg > 0).float().sum() >= 1e-3:
+        mask = (target_seg > 0).float()
+    else:
+        mask = (target > 0.01).float()
+
+    mask = _binary_dilate_3d(mask, kernel_size=5)
+    mask = _binary_erode_3d(mask, kernel_size=5)
+    mask = _binary_dilate_3d(mask, kernel_size=3)
+    return mask.clamp_(0.0, 1.0)
+
 def train_epoch(
     model: nn.Module,
     dataloader: torch.utils.data.DataLoader,
@@ -564,11 +583,7 @@ def train_epoch(
             # 方法B (常规): 依然用阈值提取背景，但做膨胀/闭运算填补内部空洞(morphological hole filling)。但深度学习中往往算算算嫌麻烦。
             
             if use_mask:
-                # 方案：既然你有 y_seg，直接使用有标注的组织所在合集作为精准的前景 Mask！
-                fg_mask = (y_seg > 0).float()
-                # 兜底：如果有些批次 y_seg 全0失效了，退化回阈值硬扣。这会保护防止分母为 0。
-                if fg_mask.sum() < 1e-3:
-                    fg_mask = (target_float > 0.01).float()
+                fg_mask = build_foreground_mask(target_float, y_seg)
             else:
                 # 也就是默认在全图 (Batchx1xHxWxD) 上一视同仁全部计算 Loss
                 fg_mask = torch.ones_like(target_float)
@@ -698,6 +713,7 @@ def main():
     parser.add_argument('--gpu', type=str, default='0', help='GPU ID')
     parser.add_argument('--fusion-method', type=str, default='compress_concat', choices=['add', 'concat', 'compress_concat'], help='Feature fusion method for Siamese encoder')
     parser.add_argument('--save-every', type=int, default=10, help='Checkpoint every N epochs')
+    parser.add_argument('--vis-every', type=int, default=5, help='Save qualitative visualization every N epochs; set 0 to disable')
     parser.add_argument('--patience', type=int, default=20, help='Early stopping patience')
     parser.add_argument('--threshold', type=float, default=0.0, help='Early stopping threshold')
     parser.add_argument('--warm-start', type=int, default=10, help='Early stopping warm start steps')
@@ -705,6 +721,11 @@ def main():
     parser.add_argument('--train-dir', type=str, default='/root/autodl-tmp/OASIS_L2R_2021_task03/All/')
     parser.add_argument('--val-dir', type=str, default='/root/autodl-tmp/OASIS_L2R_2021_task03/Test/')
     args = parser.parse_args()
+
+    if args.use_daps and args.use_pdaps:
+        parser.error('--use-daps and --use-pdaps are mutually exclusive. Use --use-pdaps for the current pyramid design.')
+    if args.use_cmim and args.use_cross_mamba:
+        parser.error('--use-cmim and --use-cross-mamba are mutually exclusive interaction modules.')
 
     # Set device
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -858,11 +879,12 @@ def main():
         else:
             print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Val DSC: {val_dsc:.6f}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s, Peak: {peak_gpu_mem:.2f}MB')
 
-        # Save visualizations
-        try:
-            save_qualitative_results(model, val_set, out_path.parent, epoch=epoch+1, device=device)
-        except Exception as e:
-            print(f"Failed to save visualization: {e}")
+        # Save visualizations periodically to reduce epoch overhead
+        if args.vis_every > 0 and (epoch + 1) % args.vis_every == 0:
+            try:
+                save_qualitative_results(model, val_set, out_path.parent, epoch=epoch+1, device=device)
+            except Exception as e:
+                print(f"Failed to save visualization: {e}")
 
         # Logging
         with open(log_file, 'a', newline='') as f:
