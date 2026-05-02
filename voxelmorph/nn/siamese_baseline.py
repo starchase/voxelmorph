@@ -33,9 +33,12 @@ class ResidualMambaBlock(nn.Module):
     stack them directly without applying norms over the residual sum,
     which would otherwise destroy the identity mapping.
     """
-    def __init__(self, channels, num_blocks=1):
+    def __init__(self, channels, num_blocks=1, scan_axes=('d',), gamma_init=0.2):
         super().__init__()
-        self.blocks = nn.ModuleList([VSSBlock3D(channels) for _ in range(num_blocks)])
+        self.blocks = nn.ModuleList([
+            VSSBlock3D(channels, scan_axes=scan_axes, gamma_init=gamma_init)
+            for _ in range(num_blocks)
+        ])
         
     def forward(self, x):
         for block in self.blocks:
@@ -94,9 +97,11 @@ class DecoupledEncoder(nn.Module):
                 if self.encoder_type == 'mamba' and i >= 2:
                     # Thick Deep Bottleneck: 1 block at 1/8 scale, 3 blocks at 1/16 scale
                     num_mamba = 3 if i == len(enc_nf) - 1 else 1
+                    # Both 1/8 and 1/16 scales now use true 3D scanning
+                    scan_axes = ('d', 'h', 'w')
                     self.shared_blocks.append(nn.Sequential(
                         ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=False),
-                        ResidualMambaBlock(nf, num_blocks=num_mamba)
+                        ResidualMambaBlock(nf, num_blocks=num_mamba, scan_axes=scan_axes, gamma_init=0.2)
                     ))
                 else:
                     self.shared_blocks.append(ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=False))
@@ -367,7 +372,7 @@ class SiameseUNetBaseline(nn.Module):
             if self.encoder_type == 'mamba' and i == 0:
                 self.dec_blocks.append(nn.Sequential(
                     ConvBlock(ndim, in_ch, nf, stride=1),
-                    ResidualMambaBlock(nf, num_blocks=1)
+                    ResidualMambaBlock(nf, num_blocks=1, scan_axes=('d', 'h', 'w'), gamma_init=0.2)
                 ))
             else:
                 self.dec_blocks.append(ConvBlock(ndim, in_ch, nf, stride=1))
