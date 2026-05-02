@@ -608,7 +608,9 @@ def train_epoch(
             deep_sup_loss = displacement.new_tensor(0.0)
             if len(coarse_flows) > 0:
                 for c_flow in coarse_flows:
-                    # Scale to full resolution to evaluate image metric directly
+                    # Intermediate P-DAPS flows are residual scaffolds, not final predictions.
+                    # Supervising them with full-resolution image similarity over-constrains
+                    # the coarse levels and hurts the final refinement quality.
                     c_shape = c_flow.shape[2:]
                     t_shape = displacement.shape[2:]
                     if c_shape != t_shape:
@@ -617,31 +619,11 @@ def train_epoch(
                         c_flow_up = torch.nn.functional.interpolate(c_flow.float(), size=t_shape, mode=mode, align_corners=False) * scale_factor
                     else:
                         c_flow_up = c_flow.float()
-                        
+
                     with torch.amp.autocast('cuda', enabled=False):
                         c_grad_loss = grad_loss_fn(c_flow_up).mean()
-                    
-                    # Warp using intermediate flow
-                    if getattr(model, 'integrate', None) is not None:
-                        c_disp = model.integrate(c_flow_up)
-                    else:
-                        c_disp = c_flow_up
-                    c_warp = model.spatial_transform(x.float(), c_disp)
-                    
-                    # 金字塔中间层的损失约束同样跟随 user 的 Loss 策略
-                    c_warp_float = c_warp.float()
-                    if loss_type == 'mse':
-                        c_squared_diff = (target_float - c_warp_float) ** 2
-                        c_img_loss = (c_squared_diff * fg_mask).sum() / (fg_mask.sum() + 1e-8)
-                    else: # loss_type == 'ncc'
-                        if use_mask:
-                            masked_c_target = target_float * fg_mask
-                            masked_c_warp = c_warp_float * fg_mask
-                            c_img_loss = -image_loss_fn(masked_c_target, masked_c_warp).mean()
-                        else:
-                            c_img_loss = -image_loss_fn(target_float, c_warp_float).mean()
 
-                    deep_sup_loss = deep_sup_loss + c_img_loss + loss_weights[1] * c_grad_loss
+                    deep_sup_loss = deep_sup_loss + loss_weights[1] * c_grad_loss
                         
                 # 对整体深度监督求平均，并打上折扣权重（默认0.5）
                 deep_sup_loss = (deep_sup_loss / len(coarse_flows)) * pyramid_weight

@@ -392,12 +392,16 @@ class SiameseUNetBaseline(nn.Module):
         # --- [P-DAPS Coarse-to-fine Flows] ---
         if self.use_pdaps:
             self.pyramid_flows = nn.ModuleList()
+            pdaps_limits = []
             for nf in dec_nf:
                 p_flow_conv = Conv(nf, ndim, kernel_size=3, padding=1)
                 # Extremely small initialization is required to start with an identity transform
                 p_flow_conv.weight.data.normal_(0, 1e-7)
                 p_flow_conv.bias.data.zero_()
                 self.pyramid_flows.append(p_flow_conv)
+            for i in range(len(dec_nf)):
+                pdaps_limits.append(2.0 / (2 ** (len(dec_nf) - i - 1)))
+            self.register_buffer('pdaps_flow_limits', torch.tensor(pdaps_limits, dtype=torch.float32), persistent=False)
 
         # 4. Spatial Transformer
         self.spatial_transform = SpatialTransformer()
@@ -511,7 +515,9 @@ class SiameseUNetBaseline(nn.Module):
 
             # --- [P-DAPS Coarse-to-fine Flow generation & Deep Supervision] ---
             if getattr(self, 'use_pdaps', False):
-                sub_flow = 10.0 * torch.tanh(self.pyramid_flows[i](x) / 10.0)
+                sub_flow_limit = self.pdaps_flow_limits[i].to(dtype=x.dtype)
+                raw_sub_flow = self.pyramid_flows[i](x)
+                sub_flow = sub_flow_limit * torch.tanh(raw_sub_flow / sub_flow_limit)
                 if pyramid_acc_flow is None:
                     pyramid_acc_flow = sub_flow
                 else:
