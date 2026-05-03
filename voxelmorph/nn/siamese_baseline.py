@@ -282,7 +282,7 @@ class SiameseUNetBaseline(nn.Module):
     - No Frequency Domain Alignment yet
     """
     def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False, use_pdaps=False, use_dsin=False, use_cmim=False, use_cross_mamba=False, use_wcv=False,
-                 use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, fusion_method='compress_concat'):
+                 use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, fusion_method='compress_concat', window_size=9):
         super().__init__()
         self.inshape = inshape
         self.ndim = ndim
@@ -335,16 +335,16 @@ class SiameseUNetBaseline(nn.Module):
         self.wcv_blocks = nn.ModuleDict()
         if self.use_wcv:
             # Deep Bottleneck (1/16 scale)
-            self.wcv_blocks["bottleneck"] = WindowCostVolume3D(enc_nf[-1], window_size=7)
+            self.wcv_blocks["bottleneck"] = WindowCostVolume3D(enc_nf[-1], window_size=window_size)
             # Deep skip connection (1/8 scale, skip_idx=2)
-            self.wcv_blocks["2"] = WindowCostVolume3D(enc_nf[-2], window_size=7)
+            self.wcv_blocks["2"] = WindowCostVolume3D(enc_nf[-2], window_size=window_size)
 
         self.swcv_blocks = nn.ModuleDict()
         if self.use_swcv:
             # Deep Bottleneck (1/16 scale)
-            self.swcv_blocks["bottleneck"] = StructureAwareWindowCostVolume3D(enc_nf[-1], window_size=7)
+            self.swcv_blocks["bottleneck"] = StructureAwareWindowCostVolume3D(enc_nf[-1], window_size=window_size)
             # Deep skip connection (1/8 scale, skip_idx=2)
-            self.swcv_blocks["2"] = StructureAwareWindowCostVolume3D(enc_nf[-2], window_size=7)
+            self.swcv_blocks["2"] = StructureAwareWindowCostVolume3D(enc_nf[-2], window_size=window_size)
 
         
         # 2. Standard Decoder

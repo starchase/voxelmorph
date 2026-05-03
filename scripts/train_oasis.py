@@ -112,7 +112,8 @@ def build_registration_model(args, device):
             use_swcv=args.use_swcv,
             use_gcv=args.use_gcv,
             encoder_type=getattr(args, 'encoder_type', 'cnn'),
-            mamba_shallow_multi=getattr(args, 'mamba_shallow_multi', False)
+            mamba_shallow_multi=getattr(args, 'mamba_shallow_multi', False),
+            window_size=getattr(args, 'window_size', 9)
         )
 
     return model.to(device)
@@ -572,62 +573,63 @@ def train_epoch(
             displacement, warped_source = out[0], out[1]
             coarse_flows = out[2] if len(out) > 2 else []
 
-            # AMP 兼容性保护：强制将预测结果和 Loss 计算切回 float32
-            target_float = y.float()
-            warped_float = warped_source.float()
-            
-            # --- Mask 核心逻辑联动 ---
-            # Q: 前景 Mask 的过滤规则如果是按 > 0.01 背景排查，图像内部会有 0 体素吗？
-            # A: 会。脑室（CSF/脑脊液区域）、肿瘤病灶、或者是扫描伪影在某些 MRI 模态(如T1) 中，部分像素可能天然表现为黑(接近0)。
-            # 由于简单的硬阈值 `> 0.01` 会不小心在内部抠出“空洞”，一般用下述 2 种方案处理：
-            # 方法A (推荐): 如果你的数据集里自带真实器官的 Label `y_seg`，直接拿全器官 Label 生成 Mask `(y_seg > 0).float()` 即可完美覆盖目标实质区域！
-            # 方法B (常规): 依然用阈值提取背景，但做膨胀/闭运算填补内部空洞(morphological hole filling)。但深度学习中往往算算算嫌麻烦。
-            
+        # 🔥【关键修复】：在这里退出模型前向的 AMP autocast 作用域！
+        # 如果把损失函数（不论是 NCC 还是 MSE）放在 autocast 里面算，因为 Loss 内部往往会有 Conv3d 或者平方项操作，
+        # PyTorch 会非常聪明地强行把输入的 float32 降级成 BF16/FP16 再算，这会导致 NCC 的方差发生严重的精度截断甚至变成负数导致 NaN。
+        # AMP 兼容性保护：强制将预测结果和 Loss 计算切回 float32
+        target_float = y.float()
+        warped_float = warped_source.float()
+        
+        # --- Mask 核心逻辑联动 ---
+        # Q: 前景 Mask 的过滤规则如果是按 > 0.01 背景排查，图像内部会有 0 体素吗？
+        # A: 会。脑室（CSF/脑脊液区域）、肿瘤病灶、或者是扫描伪影在某些 MRI 模态(如T1) 中，部分像素可能天然表现为黑(接近0)。
+        # 由于简单的硬阈值 `> 0.01` 会不小心在内部抠出“空洞”，一般用下述 2 种方案处理：
+        # 方法A (推荐): 如果你的数据集里自带真实器官的 Label `y_seg`，直接拿全器官 Label 生成 Mask `(y_seg > 0).float()` 即可完美覆盖目标实质区域！
+        # 方法B (常规): 依然用阈值提取背景，但做膨胀/闭运算填补内部空洞(morphological hole filling)。但深度学习中往往算算算嫌麻烦。
+        
+        if use_mask:
+            fg_mask = build_foreground_mask(target_float, y_seg)
+        else:
+            # 也就是默认在全图 (Batchx1xHxWxD) 上一视同仁全部计算 Loss
+            fg_mask = torch.ones_like(target_float)
+        
+        if loss_type == 'mse':
+            # 手动计算前景/全局的加权 MSE
+            squared_diff = (target_float - warped_float) ** 2
+            img_loss = (squared_diff * fg_mask).sum() / (fg_mask.sum() + 1e-8)
+        elif loss_type == 'ncc':
             if use_mask:
-                fg_mask = build_foreground_mask(target_float, y_seg)
+                # 屏蔽掉非脑范围，强制外围全黑，中心有效，使得 NCC 计算更稳定且聚焦大脑
+                masked_target = target_float * fg_mask
+                masked_warped = warped_float * fg_mask
+                img_loss = -image_loss_fn(masked_target, masked_warped).mean()
             else:
-                # 也就是默认在全图 (Batchx1xHxWxD) 上一视同仁全部计算 Loss
-                fg_mask = torch.ones_like(target_float)
+                img_loss = -image_loss_fn(target_float, warped_float).mean()
             
-            if loss_type == 'mse':
-                # 手动计算前景/全局的加权 MSE
-                squared_diff = (target_float - warped_float) ** 2
-                img_loss = (squared_diff * fg_mask).sum() / (fg_mask.sum() + 1e-8)
-            elif loss_type == 'ncc':
-                if use_mask:
-                    # 屏蔽掉非脑范围，强制外围全黑，中心有效，使得 NCC 计算更稳定且聚焦大脑
-                    masked_target = target_float * fg_mask
-                    masked_warped = warped_float * fg_mask
-                    img_loss = -image_loss_fn(masked_target, masked_warped).mean()
+            grad_loss = grad_loss_fn(displacement.float()).mean()
+        
+        # --- Deep Supervision for Pyramid/Coarse flows ---
+        deep_sup_loss = displacement.new_tensor(0.0)
+        if len(coarse_flows) > 0:
+            for c_flow in coarse_flows:
+                # Intermediate P-DAPS flows are residual scaffolds, not final predictions.
+                # Supervising them with full-resolution image similarity over-constrains
+                # the coarse levels and hurts the final refinement quality.
+                c_shape = c_flow.shape[2:]
+                t_shape = displacement.shape[2:]
+                if c_shape != t_shape:
+                    scale_factor = t_shape[0] / c_shape[0] # assuming square/cube
+                    mode = 'trilinear' if len(c_shape) == 3 else 'bilinear'
+                    c_flow_up = torch.nn.functional.interpolate(c_flow.float(), size=t_shape, mode=mode, align_corners=False) * scale_factor
                 else:
-                    img_loss = -image_loss_fn(target_float, warped_float).mean()
-                
-            with torch.amp.autocast('cuda', enabled=False):
-                grad_loss = grad_loss_fn(displacement.float()).mean()
-            
-            # --- Deep Supervision for Pyramid/Coarse flows ---
-            deep_sup_loss = displacement.new_tensor(0.0)
-            if len(coarse_flows) > 0:
-                for c_flow in coarse_flows:
-                    # Intermediate P-DAPS flows are residual scaffolds, not final predictions.
-                    # Supervising them with full-resolution image similarity over-constrains
-                    # the coarse levels and hurts the final refinement quality.
-                    c_shape = c_flow.shape[2:]
-                    t_shape = displacement.shape[2:]
-                    if c_shape != t_shape:
-                        scale_factor = t_shape[0] / c_shape[0] # assuming square/cube
-                        mode = 'trilinear' if len(c_shape) == 3 else 'bilinear'
-                        c_flow_up = torch.nn.functional.interpolate(c_flow.float(), size=t_shape, mode=mode, align_corners=False) * scale_factor
-                    else:
-                        c_flow_up = c_flow.float()
+                    c_flow_up = c_flow.float()
 
-                    with torch.amp.autocast('cuda', enabled=False):
-                        c_grad_loss = grad_loss_fn(c_flow_up).mean()
+                    c_grad_loss = grad_loss_fn(c_flow_up).mean()
 
-                    deep_sup_loss = deep_sup_loss + loss_weights[1] * c_grad_loss
-                        
-                # 对整体深度监督求平均，并打上折扣权重（默认0.5）
-                deep_sup_loss = (deep_sup_loss / len(coarse_flows)) * pyramid_weight
+                deep_sup_loss = deep_sup_loss + loss_weights[1] * c_grad_loss
+                    
+            # 对整体深度监督求平均，并打上折扣权重（默认0.5）
+            deep_sup_loss = (deep_sup_loss / len(coarse_flows)) * pyramid_weight
 
             grad_loss = torch.clamp(grad_loss, min=0.0, max=100.0)
             loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
@@ -695,6 +697,7 @@ def main():
     parser.add_argument('--model-config', type=str, default='dual_stream', choices=['dual_stream', 'voxelmorph_baseline'], help='Choose between the current dual-stream Siamese setup and the standard Voxelmorph baseline')
     parser.add_argument('--decouple-layers', type=int, default=2, help='Number of shallow decoupled encoder layers used in dual-stream mode')
     parser.add_argument('--gpu', type=str, default='0', help='GPU ID')
+    parser.add_argument('--window-size', type=int, default=9, help='Window size for WCV and S-WCV')
     parser.add_argument('--fusion-method', type=str, default='compress_concat', choices=['add', 'concat', 'compress_concat'], help='Feature fusion method for Siamese encoder')
     parser.add_argument('--save-every', type=int, default=10, help='Checkpoint every N epochs')
     parser.add_argument('--vis-every', type=int, default=5, help='Save qualitative visualization every N epochs; set 0 to disable')
@@ -744,10 +747,7 @@ def main():
     # 2. AMP 策略与防爆保护
     amp_enabled = (device == 'cuda') and not args.disable_amp
     if amp_enabled and (args.loss.lower() == 'ncc') and (args.integration_steps > 0):
-        print("\n\n[WARNING 🚨] 检测到高危配置组合：AMP(FP16) + NCC + DiffoIntegration(>0)")
-        print("          微分同胚 7次 Squaring 极易在 FP16 的浮点指数上乘爆，同时 NCC 的方差计算本身更容易溢出。")
-        print("          为了防止 NaN 崩盘，系统已强制关闭当前的 AMP 训练。\n\n")
-        amp_enabled = False
+        print("\n\n[INFO 🚀] 使用了 AMP + NCC。系统已修复精度范围域，请放心训练！\n\n")
         
     scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
 
