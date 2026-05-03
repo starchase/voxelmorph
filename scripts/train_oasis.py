@@ -605,8 +605,8 @@ def train_epoch(
                 img_loss = -image_loss_fn(masked_target, masked_warped).mean()
             else:
                 img_loss = -image_loss_fn(target_float, warped_float).mean()
-            
-            grad_loss = grad_loss_fn(displacement.float()).mean()
+        
+        grad_loss = grad_loss_fn(displacement.float()).mean()
         
         # --- Deep Supervision for Pyramid/Coarse flows ---
         deep_sup_loss = displacement.new_tensor(0.0)
@@ -631,11 +631,11 @@ def train_epoch(
             # 对整体深度监督求平均，并打上折扣权重（默认0.5）
             deep_sup_loss = (deep_sup_loss / len(coarse_flows)) * pyramid_weight
 
-            grad_loss = torch.clamp(grad_loss, min=0.0, max=100.0)
-            loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
-            if deep_sup_loss is not None:
-                deep_sup_loss = torch.clamp(deep_sup_loss, min=0.0, max=100.0)
-                loss = loss + deep_sup_loss # Add deep supervision component
+        grad_loss = torch.clamp(grad_loss, min=0.0, max=100.0)
+        loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
+        if deep_sup_loss.item() > 0:
+            deep_sup_loss = torch.clamp(deep_sup_loss, min=0.0, max=100.0)
+            loss = loss + deep_sup_loss # Add deep supervision component
 
         # 数值稳定性保护：发现非有限值则跳过该 batch，避免污染整轮 loss
         if not torch.isfinite(loss):
