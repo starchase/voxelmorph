@@ -72,11 +72,12 @@ class DecoupledEncoder(nn.Module):
     Dual-stream encoder for Siamese Network with Appearance Decoupling.
     Allows specifying the number of decoupled layers at the beginning.
     """
-    def __init__(self, in_channels=1, enc_nf=[16, 32, 32, 32], ndim=3, decouple_layers=2, use_dsin=False, encoder_type='cnn'):
+    def __init__(self, in_channels=1, enc_nf=[16, 32, 32, 32], ndim=3, decouple_layers=2, use_dsin=False, encoder_type='cnn', mamba_shallow_multi=False):
         super().__init__()
         self.decouple_layers = decouple_layers
         self.use_dsin = use_dsin
         self.encoder_type = encoder_type
+        self.mamba_shallow_multi = mamba_shallow_multi
         
         self.enc_blocks_source = nn.ModuleList()
         self.enc_blocks_target = nn.ModuleList()
@@ -97,8 +98,13 @@ class DecoupledEncoder(nn.Module):
                 if self.encoder_type == 'mamba' and i >= 2:
                     # Thick Deep Bottleneck: 1 block at 1/8 scale, 3 blocks at 1/16 scale
                     num_mamba = 3 if i == len(enc_nf) - 1 else 1
-                    # Both 1/8 and 1/16 scales now use true 3D scanning
-                    scan_axes = ('d', 'h', 'w')
+                    if i == len(enc_nf) - 1:
+                        # 1/16 deep bottleneck always uses full 3D scanning
+                        scan_axes = ('d', 'h', 'w')
+                    else:
+                        # 1/8 shallow block uses multi-axis only if configured
+                        scan_axes = ('d', 'h', 'w') if self.mamba_shallow_multi else ('d',)
+                        
                     self.shared_blocks.append(nn.Sequential(
                         ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=False),
                         ResidualMambaBlock(nf, num_blocks=num_mamba, scan_axes=scan_axes, gamma_init=0.2)
@@ -276,15 +282,17 @@ class SiameseUNetBaseline(nn.Module):
     - No Frequency Domain Alignment yet
     """
     def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False, use_pdaps=False, use_dsin=False, use_cmim=False, use_cross_mamba=False, use_wcv=False,
-                 use_swcv=False, use_gcv=False, encoder_type='cnn'):
+                 use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, fusion_method='compress_concat'):
         super().__init__()
         self.inshape = inshape
         self.ndim = ndim
         self.int_steps = int_steps
-        self.use_daps = use_daps
+        self.use_pdaps = use_pdaps
+        self.fusion_method = fusion_method
         self.use_pdaps = use_pdaps
         self.use_dsin = use_dsin
         self.use_cmim = use_cmim
+        self.use_daps = use_daps
         self.use_cross_mamba = use_cross_mamba
         self.use_wcv = use_wcv
         self.use_swcv = use_swcv
@@ -299,7 +307,8 @@ class SiameseUNetBaseline(nn.Module):
             in_channels, enc_nf, ndim, 
             decouple_layers=decouple_layers, 
             use_dsin=use_dsin,
-            encoder_type=encoder_type
+            encoder_type=encoder_type,
+            mamba_shallow_multi=mamba_shallow_multi
         )
         
         # 1.5 Cross-Modal Interaction Module
@@ -345,7 +354,10 @@ class SiameseUNetBaseline(nn.Module):
         if self.use_daps:
             self.daps_plr_blocks = nn.ModuleList()
 
-        prev_channels = enc_nf[-1] * 2  # The very bottom layer merges source and target
+        if self.fusion_method == 'add':
+            prev_channels = enc_nf[-1]
+        else:
+            prev_channels = enc_nf[-1] * 2  # The very bottom layer merges source and target
         
         for i, nf in enumerate(dec_nf):
             # For ablation extensibility, we keep the decode path modular
@@ -370,9 +382,10 @@ class SiameseUNetBaseline(nn.Module):
             # Asymmetric Decoder: Inject 1 Mamba block at the very first decoder stage (1/8 scale)
             # to smoothly transition global topology into the CNN reconstruction pipeline.
             if self.encoder_type == 'mamba' and i == 0:
+                dec_scan_axes = ('d', 'h', 'w') if mamba_shallow_multi else ('d',)
                 self.dec_blocks.append(nn.Sequential(
                     ConvBlock(ndim, in_ch, nf, stride=1),
-                    ResidualMambaBlock(nf, num_blocks=1, scan_axes=('d', 'h', 'w'), gamma_init=0.2)
+                    ResidualMambaBlock(nf, num_blocks=1, scan_axes=dec_scan_axes, gamma_init=0.2)
                 ))
             else:
                 self.dec_blocks.append(ConvBlock(ndim, in_ch, nf, stride=1))
@@ -433,7 +446,11 @@ class SiameseUNetBaseline(nn.Module):
             feat_s[-1] = self.gcv_blocks["bottleneck"](x_fixed=feat_t[-1], x_moving=feat_s[-1])
 
             
-        x = torch.cat([feat_s[-1], feat_t[-1]], dim=1)
+        # --- Fusion Method Applier ---
+        if self.fusion_method == 'add':
+            x = feat_s[-1] + feat_t[-1] # Element-wise sum logic to preserve Mamba space
+        else:
+            x = torch.cat([feat_s[-1], feat_t[-1]], dim=1)
         
         for i, block in enumerate(self.dec_blocks):
             # Upsample

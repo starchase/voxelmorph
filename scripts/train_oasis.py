@@ -111,7 +111,8 @@ def build_registration_model(args, device):
             use_wcv=args.use_wcv,
             use_swcv=args.use_swcv,
             use_gcv=args.use_gcv,
-            encoder_type=getattr(args, 'encoder_type', 'cnn')
+            encoder_type=getattr(args, 'encoder_type', 'cnn'),
+            mamba_shallow_multi=getattr(args, 'mamba_shallow_multi', False)
         )
 
     return model.to(device)
@@ -690,6 +691,7 @@ def main():
     parser.add_argument('--use-swcv', action='store_true', help='Enable Structure-Aware WCV on deep skip features')
     parser.add_argument('--use-gcv', action='store_true', help='Enable global cost volume on deep features')
     parser.add_argument('--encoder-type', type=str, default='cnn', choices=['cnn', 'mamba'], help='Backbone type for feature extraction.')
+    parser.add_argument('--mamba-shallow-multi', action='store_true', help='Enable multi-axis (d,h,w) scanning for 1/8 scale shallow features. If disabled, uses single axis (d) to remain stable.')
     parser.add_argument('--model-config', type=str, default='dual_stream', choices=['dual_stream', 'voxelmorph_baseline'], help='Choose between the current dual-stream Siamese setup and the standard Voxelmorph baseline')
     parser.add_argument('--decouple-layers', type=int, default=2, help='Number of shallow decoupled encoder layers used in dual-stream mode')
     parser.add_argument('--gpu', type=str, default='0', help='GPU ID')
@@ -833,7 +835,7 @@ def main():
         loss_history.append(avg_loss)
         
         # Calculate Validation metrics
-        compute_extra = ((epoch + 1) % 5 == 0)
+        compute_extra = ((epoch + 1) == 1) or ((epoch + 1) % 5 == 0)
         val_res = validate(
             model=model,
             dataloader=val_loader,
