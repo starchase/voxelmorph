@@ -624,7 +624,7 @@ def train_epoch(
                 else:
                     c_flow_up = c_flow.float()
 
-                    c_grad_loss = grad_loss_fn(c_flow_up).mean()
+                c_grad_loss = grad_loss_fn(c_flow_up).mean()
 
                 deep_sup_loss = deep_sup_loss + loss_weights[1] * c_grad_loss
                     
