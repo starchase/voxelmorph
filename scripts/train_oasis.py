@@ -126,8 +126,8 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
     # Get the dataset from the dataloader if needed, but we'll adapt to just take a list of data items
     # For OASIS dataset, data is (x, y, x_seg, y_seg)
     
-    # Default behavior for validation: Index 0
-    sample_default = dataset[0]
+    # Use medium validation sample for visualization: Index 9 (Initial DSC ~ 0.59)
+    sample_default = dataset[9]
     samples_to_plot.append(('default', sample_default))
         
     for name_tag, sample in samples_to_plot:
@@ -882,8 +882,9 @@ def main():
         else:
             print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Val DSC: {val_dsc:.6f}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s, Peak: {peak_gpu_mem:.2f}MB')
 
-        # Save visualizations periodically to reduce epoch overhead
-        if args.vis_every > 0 and (epoch + 1) % args.vis_every == 0:
+        # Save visualizations periodically or when a new best model is found to reduce epoch overhead
+        save_vis = args.vis_every > 0 and (((epoch + 1) == 1) or ((epoch + 1) % args.vis_every == 0) or is_new_best)
+        if save_vis:
             try:
                 save_qualitative_results(model, val_set, out_path.parent, epoch=epoch+1, device=device)
             except Exception as e:
