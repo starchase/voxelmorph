@@ -719,6 +719,13 @@ def main():
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f'Using device: {device}')
 
+    # 加速补丁：为固定尺寸的 3D 输入寻找最优 CUDA 卷积算子
+    import torch.backends.cudnn as cudnn
+    if device == 'cuda':
+        cudnn.benchmark = True
+        cudnn.deterministic = False
+        print("🚀 cuDNN Benchmark enabled for Cuda acceleration!")
+
     # Create model
     model = build_registration_model(args, device)
     print(f'Model config: {args.model_config}')
@@ -834,18 +841,30 @@ def main():
         )
         loss_history.append(avg_loss)
         
-        # Calculate Validation metrics
-        compute_extra = ((epoch + 1) == 1) or ((epoch + 1) % 5 == 0)
-        val_res = validate(
+        # Calculate Validation metrics (Fast: only DSC)
+        val_dsc = validate(
             model=model,
             dataloader=val_loader,
             device=device,
-            compute_extra=compute_extra
+            compute_extra=False
         )
+        
+        # Decide if we need to compute heavy extra metrics (HD95, Jac, Mag)
+        # Condition: Epoch 1, or every 10 epochs, or if this is the new best DSC
+        is_new_best = val_dsc > best_dsc
+        compute_extra = ((epoch + 1) == 1) or ((epoch + 1) % 10 == 0) or is_new_best
+        
         if compute_extra:
-            val_dsc, val_hd95, val_jac, val_mag = val_res
+            # Rerun validate to get the extra outputs. 
+            # (Slight overhead of redoing model forward & DSC, but totally negligible compared to HD95 calculation)
+            val_res_extra = validate(
+                model=model,
+                dataloader=val_loader,
+                device=device,
+                compute_extra=True
+            )
+            _, val_hd95, val_jac, val_mag = val_res_extra
         else:
-            val_dsc = val_res
             val_hd95, val_jac, val_mag = np.nan, np.nan, np.nan
             
         val_dsc_history.append(val_dsc)
@@ -895,11 +914,11 @@ def main():
             torch.save(model.state_dict(), checkpoint_path)
             print(f'Checkpoint saved to {checkpoint_path}')
 
-        if val_dsc > best_dsc:
+        if is_new_best:
             best_dsc = val_dsc
             best_path = out_path.parent / f'{out_path.stem}_best.pt'
             torch.save(model.state_dict(), best_path)
-            print(f'Saved new best model with DSC: {best_dsc:.6f}')
+            print(f'Saved new best model with DSC: {best_dsc:.6f} (HD95: {val_hd95:.2f}, Jac: {val_jac:.4f})')
 
         if (epoch + 1) % 10 == 0:
             try:
