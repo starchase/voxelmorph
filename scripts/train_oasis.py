@@ -850,9 +850,13 @@ def main():
         )
         
         # Decide if we need to compute heavy extra metrics (HD95, Jac, Mag)
-        # Condition: Epoch 1, or every 10 epochs, or if this is the new best DSC
+        # Condition: 第1, 3, 5, 7个epoch，之后每10个epoch，或者dice达到最佳且大于0.77
         is_new_best = val_dsc > best_dsc
-        compute_extra = ((epoch + 1) == 1) or ((epoch + 1) % 10 == 0) or is_new_best
+        epoch_num = epoch + 1
+        
+        condition_epoch = epoch_num in [1, 3, 5, 7] or epoch_num % 10 == 0
+        condition_best = is_new_best and (val_dsc > 0.77)
+        compute_extra = condition_epoch or condition_best
         
         if compute_extra:
             # Rerun validate to get the extra outputs. 
@@ -883,7 +887,7 @@ def main():
             print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Val DSC: {val_dsc:.6f}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s, Peak: {peak_gpu_mem:.2f}MB')
 
         # Save visualizations periodically or when a new best model is found to reduce epoch overhead
-        save_vis = args.vis_every > 0 and (((epoch + 1) == 1) or ((epoch + 1) % args.vis_every == 0) or is_new_best)
+        save_vis = compute_extra
         if save_vis:
             try:
                 save_qualitative_results(model, val_set, out_path.parent, epoch=epoch+1, device=device)
