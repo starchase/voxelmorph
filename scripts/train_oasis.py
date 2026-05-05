@@ -20,6 +20,8 @@ import voxelmorph as vxm
 
 from data import datasets, trans
 import utils
+from scipy.ndimage import distance_transform_edt
+
 
 
 import matplotlib.pyplot as plt
@@ -32,8 +34,8 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
     # Get the dataset from the dataloader if needed, but we'll adapt to just take a list of data items
     # For OASIS dataset, data is (x, y, x_seg, y_seg)
     
-    # Default behavior for validation: Index 0
-    sample_default = dataset[0]
+    # Default behavior for validation: Index 9
+    sample_default = dataset[9]
     samples_to_plot.append(('default', sample_default))
         
     for name_tag, sample in samples_to_plot:
@@ -312,14 +314,44 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
         plt.savefig(str(out_file))
         plt.close(fig)
 
-def validate(
 
+import scipy.ndimage
+from scipy.spatial import cKDTree
+
+def fast_hd95(ground_truth, prediction, spacing=None):
+    if ground_truth.sum() == 0 or prediction.sum() == 0:
+        return 0.0
+
+    pred_border = prediction ^ scipy.ndimage.binary_erosion(prediction)
+    gt_border = ground_truth ^ scipy.ndimage.binary_erosion(ground_truth)
+    
+    pts_pred = np.argwhere(pred_border)
+    pts_gt = np.argwhere(gt_border)
+    if pts_pred.shape[0] == 0 or pts_gt.shape[0] == 0:
+        return 0.0
+        
+    tree_gt = cKDTree(pts_gt)
+    tree_pred = cKDTree(pts_pred)
+    
+    dist_pred_to_gt, _ = tree_gt.query(pts_pred, k=1)
+    dist_gt_to_pred, _ = tree_pred.query(pts_gt, k=1)
+    
+    hd95_pred_to_gt = np.percentile(dist_pred_to_gt, 95)
+    hd95_gt_to_pred = np.percentile(dist_gt_to_pred, 95)
+    
+    return max(hd95_pred_to_gt, hd95_gt_to_pred)
+
+def validate(
     model: nn.Module,
     dataloader: DataLoader,
     device: str = 'cuda',
-) -> float:
+    compute_extra: bool = False
+):
     model.eval()
     eval_dsc = utils.AverageMeter()
+    eval_hd95 = utils.AverageMeter()
+    eval_jac = utils.AverageMeter()
+    eval_mag = utils.AverageMeter()
 
     # Spatial transformation for nearest neighbour
     reg_model = vxm.nn.modules.SpatialTransformer(interpolation_mode='nearest').to(device)
@@ -346,7 +378,43 @@ def validate(
             dsc = utils.dice_val_VOI(def_out.long(), y_seg.long())
             eval_dsc.update(dsc.item(), x.size(0))
 
-    return eval_dsc.avg
+            if compute_extra:
+                # HD95
+                def_out_np = def_out.cpu().numpy()[0, 0]
+                y_seg_np = y_seg.cpu().numpy()[0, 0]
+                unique_labels = np.unique(y_seg_np)
+                unique_labels = unique_labels[unique_labels > 0]
+                sample_hd95 = []
+                for label in unique_labels:
+                    mask_def = (def_out_np == label)
+                    mask_y = (y_seg_np == label)
+                    if np.sum(mask_def) > 0 and np.sum(mask_y) > 0:
+                        try:
+                            h = fast_hd95(mask_def, mask_y)
+                            sample_hd95.append(h)
+                        except:
+                            pass
+                if sample_hd95:
+                    eval_hd95.update(np.mean(sample_hd95), 1)
+
+                # Jac
+                disp_np = displacement.cpu().numpy()[0]
+                dz_dz, dz_dy, dz_dx = np.gradient(disp_np[0])
+                dy_dz, dy_dy, dy_dx = np.gradient(disp_np[1])
+                dx_dz, dx_dy, dx_dx = np.gradient(disp_np[2])
+                jac_det = ((1 + dx_dx) * ((1 + dy_dy) * (1 + dz_dz) - dz_dy * dy_dz)
+                           - dx_dy * (dy_dx * (1 + dz_dz) - dy_dz * dz_dx)
+                           + dx_dz * (dy_dx * dz_dy - (1 + dy_dy) * dz_dx))
+                neg_jac_ratio = np.sum(jac_det <= 0) / jac_det.size
+                eval_jac.update(neg_jac_ratio, 1)
+
+                # Mag
+                disp_mag = np.sqrt(np.sum(disp_np**2, axis=0))
+                eval_mag.update(np.mean(disp_mag), 1)
+
+    if compute_extra:
+        return eval_dsc.avg, eval_hd95.avg if eval_hd95.count > 0 else 0.0, eval_jac.avg if eval_jac.count > 0 else 0.0, eval_mag.avg if eval_mag.count > 0 else 0.0
+    return eval_dsc.avg, None, None, None
 
 def train_epoch(
     model: nn.Module,
@@ -355,7 +423,8 @@ def train_epoch(
     image_loss_fn: nn.Module,
     grad_loss_fn: nn.Module,
     loss_weights: list,
-    device: str = 'cuda'
+    device: str = 'cuda',
+    scaler: torch.cuda.amp.GradScaler = None
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -368,31 +437,43 @@ def train_epoch(
         x = data[0].to(device)
         y = data[1].to(device)
 
-        # Get the displacement and the warped source image from the model
-        out = model(
-            x,
-            y,
-            return_warped_source=True,
-            return_field_type='displacement'
-        )
-        displacement, warped_source = out[0], out[1]
+        if scaler is not None:
+            with torch.cuda.amp.autocast():
+                out = model(x, y, return_warped_source=True, return_field_type='displacement')
+                displacement, warped_source = out[0], out[1]
 
-        img_loss = image_loss_fn(y, warped_source).mean()
-        
-        # If the loss function is NCC (which computes similarity), we need to minimize -NCC
-        if isinstance(image_loss_fn, ne.nn.modules.NCC):
-            img_loss = -img_loss
-            
-        grad_loss = grad_loss_fn(displacement).mean()
+            # Convert back to float32 to prevent overflow in NCC loss calculation (which involves square and sum)
+            warped_source = warped_source.float()
+            displacement = displacement.float()
+            y_float = y.float()
 
-        loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
-        loss.backward()
-        
-        # 增加梯度裁剪，防止 NCC 在背景区域计算导致梯度爆炸
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        
-        optimizer.step()
-        total_loss += loss.item()
+            img_loss = image_loss_fn(y_float, warped_source).mean()
+            if isinstance(image_loss_fn, ne.nn.modules.NCC):
+                img_loss = -img_loss
+            grad_loss = grad_loss_fn(displacement).mean()
+
+            loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            total_loss += loss.item()
+        else:
+            out = model(x, y, return_warped_source=True, return_field_type='displacement')
+            displacement, warped_source = out[0], out[1]
+
+            img_loss = image_loss_fn(y, warped_source).mean()
+            if isinstance(image_loss_fn, ne.nn.modules.NCC):
+                img_loss = -img_loss
+            grad_loss = grad_loss_fn(displacement).mean()
+
+            loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            total_loss += loss.item()
 
     return total_loss / len(dataloader)
 
@@ -412,11 +493,14 @@ def main():
     parser.add_argument('--warm-start', type=int, default=10, help='Early stopping warm start steps')
     parser.add_argument('--train-dir', type=str, default='/root/autodl-tmp/OASIS_L2R_2021_task03/All/')
     parser.add_argument('--val-dir', type=str, default='/root/autodl-tmp/OASIS_L2R_2021_task03/Test/')
+    parser.add_argument('--integration-steps', type=int, default=0, help='number of integration steps for diffeomorphic registration')
     args = parser.parse_args()
 
     # Set device
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if device == 'cuda':
+        torch.backends.cudnn.benchmark = True
     print(f'Using device: {device}')
 
     # Create model (using VoxelMorph-2 extended capacity)
@@ -431,7 +515,7 @@ def main():
             # 解码器4层，与编码器对称
             [64, 64, 64, 32]
         ],
-        integration_steps=0, # set to 7 if you want diffeomorphic fields
+        integration_steps=args.integration_steps,
     ).to(device)
 
     # Setup losses and optimizer
@@ -447,6 +531,16 @@ def main():
     
     # Scheduler: Cosine annealing to gradually lower LR
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    
+    # Initialize AMP Scaler
+    amp_enabled = True if device == 'cuda' else False
+    if amp_enabled and (args.loss.lower() == 'ncc') and (args.integration_steps > 0):
+        print("\n\n[WARNING \U0001f6a8] 检测到高危配置组合：AMP(FP16) + NCC + DiffoIntegration(>0)")
+        print("          微分同胚 7次 Squaring 极易在 FP16 的浮点指数上乘爆，同时 NCC 的方差计算本身更容易溢出。")
+        print("          为了防止 NaN 崩盘，系统已强制关闭当前的 AMP 训练。\n\n")
+        amp_enabled = False
+        
+    scaler = torch.cuda.amp.GradScaler() if amp_enabled else None
 
     # Dataloader identical to TransMorph
     train_composed = transforms.Compose([trans.NumpyType((np.float32, np.int16))])
@@ -484,9 +578,14 @@ def main():
     
     # Save training configuration
     config_file = out_path.parent / 'config.txt'
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     with open(config_file, 'w') as f:
         f.write(f"Training Configuration:\n")
         f.write(f"Device: {device}\n")
+        f.write(f"Total Parameters: {total_params}\n")
+        f.write(f"Trainable Parameters: {trainable_params}\n")
+        f.write(f"Integration Steps: {args.integration_steps}\n")
         f.write(f"Epochs: {args.epochs}\n")
         f.write(f"Batch Size: {args.batch_size}\n")
         f.write(f"Lambda: {args.lambda_param}\n")
@@ -496,15 +595,18 @@ def main():
     # Initialize Logger
     with open(log_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'train_loss', 'val_dsc'])
+        writer.writerow(['epoch', 'train_loss', 'val_dsc', 'val_hd95', 'val_jac', 'val_mag'])
 
     # Training loop
     print(f'Training for {args.epochs} epochs...')
     best_dsc = 0.0
     loss_history = []
     val_dsc_history = []
+    epoch_times = []
+    import time
     
     for epoch in range(args.epochs):
+        start_time = time.time()
         avg_loss = train_epoch(
             model=model,
             dataloader=train_loader,
@@ -512,35 +614,56 @@ def main():
             image_loss_fn=image_loss_fn,
             grad_loss_fn=grad_loss_fn,
             loss_weights=loss_weights,
-            device=device
+            device=device,
+            scaler=scaler
         )
+        end_time = time.time()
+        epoch_time = end_time - start_time
+        epoch_times.append(epoch_time)
         loss_history.append(avg_loss)
         
         # Calculate Validation metrics
-        val_dsc = validate(
+        compute_extra = (epoch == 0 or (epoch + 1) % 10 == 0)
+        val_dsc, val_hd95, val_jac, val_mag = validate(
             model=model,
             dataloader=val_loader,
-            device=device
+            device=device,
+            compute_extra=compute_extra
         )
         val_dsc_history.append(val_dsc)
+
+        is_best = val_dsc > best_dsc
+        if is_best and not compute_extra:
+            print(f'New best DSC ({val_dsc:.6f} > {best_dsc:.6f})! Computing extra metrics and visuals...')
+            compute_extra = True
+            _, val_hd95, val_jac, val_mag = validate(
+                model=model,
+                dataloader=val_loader,
+                device=device,
+                compute_extra=True
+            )
         
         # Step the learning rate scheduler
         scheduler.step()
         
         current_lr = optimizer.param_groups[0]['lr']
-        print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Val DSC: {val_dsc:.6f}, LR: {current_lr:.6f}')
-
+        extra_str = f", HD95: {val_hd95:.4f}, Jac: {val_jac:.6f}, Mag: {val_mag:.4f}" if compute_extra else ""
+        print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Val DSC: {val_dsc:.6f}{extra_str}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s')
+        
         # Save visualizations
-        try:
-            save_qualitative_results(model, val_set, out_path.parent, epoch=epoch+1, device=device)
-        except Exception as e:
-            print(f"Failed to save visualization: {e}")
+        if compute_extra:
+            try:
+                save_qualitative_results(model, val_set, out_path.parent, epoch=epoch+1, device=device)
+            except Exception as e:
+                print(f"Failed to save visualization: {e}")
 
         # Logging
         with open(log_file, 'a', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow([epoch + 1, f"{avg_loss:.6f}", f"{val_dsc:.6f}"])
-
+            hd_str = f"{val_hd95:.6f}" if compute_extra else ""
+            jac_str = f"{val_jac:.6f}" if compute_extra else ""
+            mag_str = f"{val_mag:.6f}" if compute_extra else ""
+            writer.writerow([epoch + 1, f"{avg_loss:.6f}", f"{val_dsc:.6f}", hd_str, jac_str, mag_str])
         # Early stopping check based on average loss
         if len(loss_history) >= args.warm_start + args.patience + 1:
             recent_losses = loss_history[-args.patience:]
@@ -597,8 +720,10 @@ def main():
     finish_utc = datetime.datetime.utcnow()
     finish_beijing = finish_utc + datetime.timedelta(hours=8)
     finish_timestamp = finish_beijing.strftime('%Y%m%d_%H%M%S')
+    avg_epoch_time = sum(epoch_times) / len(epoch_times) if epoch_times else 0.0
     with open(config_file, 'a') as f:
         f.write(f"End Time: {finish_timestamp}\n")
+        f.write(f"Average Epoch Time: {avg_epoch_time:.2f}s\n")
 
 if __name__ == '__main__':
     main()
