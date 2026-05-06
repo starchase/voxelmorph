@@ -47,8 +47,9 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
         
         model.eval()
         with torch.no_grad():
-            out = model(source, target, return_warped_source=True, return_field_type='displacement')
-            displacement, warped_source = out[0], out[1]
+            with torch.autocast('cuda', enabled=True, dtype=torch.bfloat16):
+                out = model(source, target, return_warped_source=True, return_field_type='displacement')
+            displacement, warped_source = out[0].float(), out[1].float()
             
             warped_label = None
             if source_label is not None:
@@ -364,13 +365,14 @@ def validate(
             y_seg = data[3].to(device)
 
             # Get the displacement fields
-            out = model(
-                x,
-                y,
-                return_warped_source=True,
-                return_field_type='displacement'
-            )
-            displacement, warped_source = out[0], out[1]
+            with torch.autocast('cuda', enabled=True, dtype=torch.bfloat16):
+                out = model(
+                    x,
+                    y,
+                    return_warped_source=True,
+                    return_field_type='displacement'
+                )
+            displacement, warped_source = out[0].float(), out[1].float()
 
             # Warp the segmentations with nearest neighbour
             def_out = reg_model(x_seg.float(), displacement)
@@ -424,10 +426,12 @@ def train_epoch(
     grad_loss_fn: nn.Module,
     loss_weights: list,
     device: str = 'cuda',
-    scaler: torch.cuda.amp.GradScaler = None
+    scaler: torch.cuda.amp.GradScaler = None,
+    amp_enabled: bool = True
 ) -> float:
     model.train()
     total_loss = 0.0
+    valid_batches = 0
 
     for batch_idx, data in enumerate(dataloader):
         optimizer.zero_grad()
@@ -438,28 +442,43 @@ def train_epoch(
         y = data[1].to(device)
 
         if scaler is not None:
-            with torch.cuda.amp.autocast():
+            with torch.autocast('cuda', enabled=amp_enabled, dtype=torch.bfloat16):
                 out = model(x, y, return_warped_source=True, return_field_type='displacement')
                 displacement, warped_source = out[0], out[1]
 
             # Convert back to float32 to prevent overflow in NCC loss calculation (which involves square and sum)
+            # And also, gradient computation for displacement field may require float32 precision
             warped_source = warped_source.float()
             displacement = displacement.float()
             y_float = y.float()
 
-            img_loss = image_loss_fn(y_float, warped_source).mean()
-            if isinstance(image_loss_fn, ne.nn.modules.NCC):
-                img_loss = -img_loss
-            grad_loss = grad_loss_fn(displacement).mean()
+            with torch.amp.autocast('cuda', enabled=False):
+                img_loss = image_loss_fn(y_float, warped_source).mean()
+                if isinstance(image_loss_fn, ne.nn.modules.NCC):
+                    img_loss = -img_loss
+                grad_loss = grad_loss_fn(displacement).mean()
+    
+                grad_loss = torch.clamp(grad_loss, min=0.0, max=100.0)
+                loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
 
-            loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
-
+            # 数值稳定性保护：发现非有限值则跳过该 batch，避免污染整轮 loss
+            if not torch.isfinite(loss):
+                print(
+                    f"[WARN] Non-finite loss at batch {batch_idx}: "
+                    f"img_loss={img_loss.item()}, grad_loss={grad_loss.item()}, total={loss.item()}"
+                )
+                optimizer.zero_grad(set_to_none=True)
+                del out, displacement, warped_source, loss, img_loss, grad_loss
+                torch.cuda.empty_cache()
+                continue
+                
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             scaler.step(optimizer)
             scaler.update()
             total_loss += loss.item()
+            valid_batches += 1
         else:
             out = model(x, y, return_warped_source=True, return_field_type='displacement')
             displacement, warped_source = out[0], out[1]
@@ -469,13 +488,22 @@ def train_epoch(
                 img_loss = -img_loss
             grad_loss = grad_loss_fn(displacement).mean()
 
+            grad_loss = torch.clamp(grad_loss, min=0.0, max=100.0)
             loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
+            
+            if not torch.isfinite(loss):
+                optimizer.zero_grad(set_to_none=True)
+                del out, displacement, warped_source, loss, img_loss, grad_loss
+                torch.cuda.empty_cache()
+                continue
+                
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             total_loss += loss.item()
+            valid_batches += 1
 
-    return total_loss / len(dataloader)
+    return total_loss / (valid_batches if valid_batches > 0 else 1)
 
 def main():
     parser = argparse.ArgumentParser(description='Train 3D VoxelMorph on OASIS data')
@@ -534,11 +562,7 @@ def main():
     
     # Initialize AMP Scaler
     amp_enabled = True if device == 'cuda' else False
-    if amp_enabled and (args.loss.lower() == 'ncc') and (args.integration_steps > 0):
-        print("\n\n[WARNING \U0001f6a8] 检测到高危配置组合：AMP(FP16) + NCC + DiffoIntegration(>0)")
-        print("          微分同胚 7次 Squaring 极易在 FP16 的浮点指数上乘爆，同时 NCC 的方差计算本身更容易溢出。")
-        print("          为了防止 NaN 崩盘，系统已强制关闭当前的 AMP 训练。\n\n")
-        amp_enabled = False
+    # removing the block that disabled amp
         
     scaler = torch.cuda.amp.GradScaler() if amp_enabled else None
 
@@ -615,7 +639,8 @@ def main():
             grad_loss_fn=grad_loss_fn,
             loss_weights=loss_weights,
             device=device,
-            scaler=scaler
+            scaler=scaler,
+            amp_enabled=amp_enabled
         )
         end_time = time.time()
         epoch_time = end_time - start_time
