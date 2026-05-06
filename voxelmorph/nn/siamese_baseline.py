@@ -416,9 +416,9 @@ class SiameseUNetBaseline(nn.Module):
                 if getattr(self, 'encoder_type', 'cnn') == 'mamba':
                     # 如果 Mamba 处于深层，深层直接拥有全局感受野，可以承担最大的形变预测
                     # 所以初始化统一给 2.0，并且将其转为可学习参数，让网络自主适应
-                    pdaps_limits.append(2.0)
+                    pdaps_limits.append(20.0)
                 else:
-                    pdaps_limits.append(2.0 / (2 ** (len(dec_nf) - i - 1)))
+                    pdaps_limits.append(20.0 / (2 ** (len(dec_nf) - i - 1)))
             
             # 改为 nn.Parameter，这样对于腹痛等大形变任务，模型可以在训练中自动突破预设上限
             self.pdaps_flow_limits = nn.Parameter(torch.tensor(pdaps_limits, dtype=torch.float32))
@@ -539,7 +539,7 @@ class SiameseUNetBaseline(nn.Module):
 
             # --- [P-DAPS Coarse-to-fine Flow generation & Deep Supervision] ---
             if getattr(self, 'use_pdaps', False):
-                sub_flow_limit = self.pdaps_flow_limits[i].to(dtype=x.dtype)
+                sub_flow_limit = torch.clamp(self.pdaps_flow_limits[i], min=1e-3).to(dtype=x.dtype)
                 raw_sub_flow = self.pyramid_flows[i](x)
                 sub_flow = sub_flow_limit * torch.tanh(raw_sub_flow / sub_flow_limit)
                 if pyramid_acc_flow is None:
