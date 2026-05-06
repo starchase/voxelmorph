@@ -7,9 +7,10 @@ class CrossMambaModule(nn.Module):
     Improved 3D Cross-Mamba Module with Multi-Directional Scanning.
     Inspired by VMamba/SegMamba's Cross-Scan Module to preserve spatial locality.
     """
-    def __init__(self, channels, d_state=16, d_conv=4, expand=2, img_size=(10, 12, 10)):
+    def __init__(self, channels, d_state=16, d_conv=4, expand=2, img_size=(10, 12, 10), use_resampling=True):
         super().__init__()
         self.channels = channels
+        self.use_resampling = use_resampling
         
         # 3D learnable positional embedding (optional but highly recommended for 1D scanning)
         # 用一个极小的晶格尺寸 (10x12x10) 作为连续位置编码的种子，大大降低参数量
@@ -27,9 +28,21 @@ class CrossMambaModule(nn.Module):
         
         # 因为提取了 6 个方向（3个轴 x 2个正反向）的特征图，使用 1x1x1 卷积做降维综合
         self.direction_fuse = nn.Conv3d(channels * 6, channels, 1)
-        self.cross_gate = nn.Parameter(torch.tensor(-2.0))
-        # 扩大感受野：加入 3x3x3 局部空间卷积补偿，缝合 Mamba 序列化可能丢失的局部几何信息
-        self.fuse_local = nn.Conv3d(channels * 2, channels, kernel_size=3, padding=1)
+        
+        # 🌟 方案一：显式局部重采样 (Deformable Feature Resampling)
+        # 用 Mamba 的全局上下文输出预测 3D 局部形变偏移量 (dx, dy, dz) 和调制掩码
+        self.offset_conv = nn.Conv3d(channels, 3, kernel_size=3, padding=1)
+        self.mask_conv = nn.Conv3d(channels, channels, kernel_size=3, padding=1)
+        # 扩大感受野：加入 3x3x3 局部空间卷积补偿，缝合重采样后的局部几何信息
+        self.fuse_local = nn.Conv3d(channels, channels, kernel_size=3, padding=1)
+        
+        # 将偏移量初始化为零，以便一开始是个纯残差网络，避免早期崩溃
+        self.offset_conv.weight.data.zero_()
+        self.offset_conv.bias.data.zero_()
+        # 掩码卷积也进行零初始化（sigmoid(0)=0.5的均匀门控初始态）
+        self.mask_conv.weight.data.zero_()
+        self.mask_conv.bias.data.zero_()
+        
         self.act = nn.GELU()
         self.norm = nn.InstanceNorm3d(channels)
         
@@ -74,14 +87,48 @@ class CrossMambaModule(nn.Module):
         
         # 合并 6 个空间扫描维度的结果表征 (B, 6*C, D, H, W) -> (B, C, D, H, W)
         multi_dir_concat = torch.cat(out_features, dim=1) 
-        cross_out = self.direction_fuse(multi_dir_concat)
-        gate = torch.sigmoid(self.cross_gate).to(dtype=source.dtype)
-        gated_cross_out = cross_out.to(source.dtype) * gate
+        mamba_guidance = self.direction_fuse(multi_dir_concat)
+        mamba_guidance = self.act(mamba_guidance)
+        mamba_guidance = mamba_guidance.to(source.dtype)
         
-        # 结果降维转回对应精度，并与原本的 source 进行形变场纠正引导
-        cat_feat = torch.cat([source, gated_cross_out], dim=1)
-        fused = self.fuse_local(cat_feat)
-        return self.norm(self.act(fused) + source)
+        if self.use_resampling:
+            # 🌟 方案一实施：利用 Mamba 获取的长距离指导，执行显式局部特征重采样
+            # 1. 预测特征级的微观偏移量 (Offset) 和调制权重 (Mask)
+            offset = self.offset_conv(mamba_guidance)  # (B, 3, D, H, W)
+            mask = torch.sigmoid(self.mask_conv(mamba_guidance))  # (B, C, D, H, W)
+            
+            # 2. 构建特征级的仿射网格 (Feature Grid)
+            device, dtype = source.device, source.dtype
+            vectors = [torch.arange(0, s, device=device, dtype=dtype) for s in (D, H, W)]
+            grids = torch.meshgrid(vectors, indexing='ij')
+            base_grid = torch.stack(grids).unsqueeze(0).expand(B, -1, -1, -1, -1) # (B, 3, D, H, W)
+            
+            # 将偏移量应用于 base grid （这里 offset 是基于像素尺度的局部位移）
+            deformed_grid = base_grid + offset
+            
+            # 将 grid 归一化到 [-1, 1] 才能被 F.grid_sample 使用
+            normalized_grid = torch.zeros_like(deformed_grid)
+            for i, s in enumerate((D, H, W)):
+                normalized_grid[:, i, ...] = 2.0 * (deformed_grid[:, i, ...] / (s - 1.0)) - 1.0
+                
+            # grid_sample 要求的座标系是在最后一维，且在3D中顺序是 (W, H, D) -> 即 (x, y, z)
+            normalized_grid = normalized_grid.permute(0, 2, 3, 4, 1) # -> (B, D, H, W, 3)
+            normalized_grid = normalized_grid[..., [2, 1, 0]] # -> flip to (x, y, z)
+            
+            # 3. 对 Source 进行双线性可变形重采样。修改 padding_mode 为 'border' 防止边界黑边伪影
+            resampled_source = nn.functional.grid_sample(
+                source, normalized_grid, 
+                mode='bilinear', padding_mode='border', align_corners=True
+            )
+            
+            # 4. 施加 Mamba 预测的门控掩码，并经过 3x3x3 空间卷积进行平滑雕花
+            modulated_source = resampled_source * mask
+            refined_fused = self.fuse_local(modulated_source)
+            return self.norm(self.act(refined_fused) + source)
+        else:
+            # 退回原始的特征直接加法融合逻辑，取消重采样模块的介入
+            refined_fused = self.fuse_local(mamba_guidance)
+            return self.norm(self.act(refined_fused) + source)
         
     def _scan_and_extract(self, seq_s, seq_t, D, H, W, order='z', reverse=False):
         B, L, C = seq_s.shape
