@@ -7,9 +7,14 @@ class CrossMambaModule(nn.Module):
     Improved 3D Cross-Mamba Module with Multi-Directional Scanning.
     Inspired by VMamba/SegMamba's Cross-Scan Module to preserve spatial locality.
     """
-    def __init__(self, channels, d_state=16, d_conv=4, expand=2):
+    def __init__(self, channels, d_state=16, d_conv=4, expand=2, img_size=(10, 12, 10)):
         super().__init__()
         self.channels = channels
+        
+        # 3D learnable positional embedding (optional but highly recommended for 1D scanning)
+        # 用一个极小的晶格尺寸 (10x12x10) 作为连续位置编码的种子，大大降低参数量
+        self.pos_embed = nn.Parameter(torch.zeros(1, channels, *img_size))
+        nn.init.trunc_normal_(self.pos_embed, std=.02)
         
         # 共享一个 Mamba 权重以减少参数量，同时处理多个方向展开
         self.mamba = Mamba(
@@ -29,6 +34,16 @@ class CrossMambaModule(nn.Module):
         self.norm = nn.InstanceNorm3d(channels)
         
     def forward(self, source, target):
+        # 加上 3D 选择性位置编码
+        if self.pos_embed.shape[2:] != source.shape[2:]:
+            # If the feature map size changes (e.g. from downsampling), interpolate the positional embedding
+            pos_embed = nn.functional.interpolate(self.pos_embed, size=source.shape[2:], mode='trilinear', align_corners=False)
+        else:
+            pos_embed = self.pos_embed
+
+        source = source + pos_embed
+        target = target + pos_embed
+
         # 防雷机制：强制转成 FP32 运算，防止 Mamba 在半精度下的指数运算爆炸
         B, C, D, H, W = source.shape
         src_fp32 = source.float()
@@ -79,12 +94,15 @@ class CrossMambaModule(nn.Module):
         seq_s = self.seq_norm(seq_s)
         seq_t = self.seq_norm(seq_t)
             
-        # Target 紧贴在 Source 前，向 Source 流入注意力。这是 Cross-Mamba 的灵魂。
-        seq_concat = torch.cat([seq_t, seq_s], dim=1)  # (B, 2L, C)
+        # Target 和 Source 物理级交织（Interleaved）重组。这是配准长距离匹配的灵魂。
+        # [T1, S1, T2, S2, ..., TL, SL]
+        stacked = torch.stack([seq_t, seq_s], dim=2) 
+        seq_concat = stacked.view(B, 2 * L, C)
+        
         scan_out = self.mamba(seq_concat)
         
-        # 你只需要 Source 收到 Target 引导后的部分表征
-        out_s = scan_out[:, L:, :]
+        # 提取 Source，由于是交织排列 (T,S,T,S)，Source 全在奇数位 1, 3, 5...
+        out_s = scan_out[:, 1::2, :]
         
         if reverse:
             out_s = torch.flip(out_s, dims=[1])
