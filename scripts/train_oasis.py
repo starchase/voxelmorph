@@ -704,6 +704,7 @@ def main():
     parser.add_argument('--patience', type=int, default=20, help='Early stopping patience')
     parser.add_argument('--threshold', type=float, default=0.0, help='Early stopping threshold')
     parser.add_argument('--warm-start', type=int, default=10, help='Early stopping warm start steps')
+    parser.add_argument('--warmup-epochs', type=int, default=10, help='Number of epochs for learning rate warmup')
     parser.add_argument('--integration-steps', type=int, default=0, help='number of integration steps for diffeomorphic registration')
     parser.add_argument('--train-dir', type=str, default='/root/autodl-tmp/OASIS_L2R_2021_task03/All/')
     parser.add_argument('--val-dir', type=str, default='/root/autodl-tmp/OASIS_L2R_2021_task03/Test/')
@@ -748,8 +749,8 @@ def main():
     loss_weights = [1.0, args.lambda_param]
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     
-    # Scheduler: Warmup (Linear) for first 10 epochs, then Cosine annealing to gradually lower LR
-    warmup_epochs = 10
+    # Scheduler: Warmup (Linear) then Cosine annealing to gradually lower LR
+    warmup_epochs = args.warmup_epochs
     cosine_epochs = max(1, args.epochs - warmup_epochs)
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cosine_epochs)
