@@ -413,12 +413,8 @@ class SiameseUNetBaseline(nn.Module):
                 p_flow_conv.bias.data.zero_()
                 self.pyramid_flows.append(p_flow_conv)
             for i in range(len(dec_nf)):
-                if getattr(self, 'encoder_type', 'cnn') == 'mamba':
-                    # 如果 Mamba 处于深层，深层直接拥有全局感受野，可以承担最大的形变预测
-                    # 所以初始化统一给 2.0，并且将其转为可学习参数，让网络自主适应
-                    pdaps_limits.append(20.0)
-                else:
-                    pdaps_limits.append(20.0 / (2 ** (len(dec_nf) - i - 1)))
+                # 统一使用按层衰减分配物理形变上限，防止深层轻微波动放大后撕裂结构
+                pdaps_limits.append(20.0 / (2 ** (len(dec_nf) - i - 1)))
             
             # 改为 nn.Parameter，这样对于腹痛等大形变任务，模型可以在训练中自动突破预设上限
             self.pdaps_flow_limits = nn.Parameter(torch.tensor(pdaps_limits, dtype=torch.float32))
