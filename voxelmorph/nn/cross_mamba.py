@@ -34,14 +34,14 @@ class CrossMambaModule(nn.Module):
         self.offset_conv = nn.Conv3d(channels, 3, kernel_size=3, padding=1)
         self.mask_conv = nn.Conv3d(channels, channels, kernel_size=3, padding=1)
         # 扩大感受野：加入 3x3x3 局部空间卷积补偿，缝合重采样后的局部几何信息
-        self.fuse_local = nn.Conv3d(channels, channels, kernel_size=3, padding=1)
+        self.fuse_local = nn.Conv3d(channels * 2, channels, kernel_size=3, padding=1)
         
         # 将偏移量初始化为零，以便一开始是个纯残差网络，避免早期崩溃
         self.offset_conv.weight.data.zero_()
         self.offset_conv.bias.data.zero_()
-        # 掩码卷积也进行零初始化（sigmoid(0)=0.5的均匀门控初始态）
+        # 掩码初始化略给一点偏置(1.0即可让sigmoid起始为0.73)，避免一开始重采样特征被折半
         self.mask_conv.weight.data.zero_()
-        self.mask_conv.bias.data.zero_()
+        self.mask_conv.bias.data.fill_(1.0)
         
         self.act = nn.GELU()
         self.norm = nn.InstanceNorm3d(channels)
@@ -123,11 +123,16 @@ class CrossMambaModule(nn.Module):
             
             # 4. 施加 Mamba 预测的门控掩码，并经过 3x3x3 空间卷积进行平滑雕花
             modulated_source = resampled_source * mask
-            refined_fused = self.fuse_local(modulated_source)
+            
+            # 【核心修复】将重采样后的 source 与 Mamba 本身提取的全局语义特征拼接融合！如果不拼，Mamba 就变成了一个纯 STN，丧失特征提取意义。
+            cat_feat = torch.cat([modulated_source, mamba_guidance], dim=1)
+            refined_fused = self.fuse_local(cat_feat)
+            
             return self.norm(self.act(refined_fused) + source)
         else:
             # 退回原始的特征直接加法融合逻辑，取消重采样模块的介入
-            refined_fused = self.fuse_local(mamba_guidance)
+            cat_feat = torch.cat([source, mamba_guidance], dim=1)
+            refined_fused = self.fuse_local(cat_feat)
             return self.norm(self.act(refined_fused) + source)
         
     def _scan_and_extract(self, seq_s, seq_t, D, H, W, order='z', reverse=False):
