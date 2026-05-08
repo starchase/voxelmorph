@@ -611,24 +611,53 @@ def train_epoch(
         # --- Deep Supervision for Pyramid/Coarse flows ---
         deep_sup_loss = displacement.new_tensor(0.0)
         if len(coarse_flows) > 0:
+            st_cache = {}
             for c_flow in coarse_flows:
-                # Intermediate P-DAPS flows are residual scaffolds, not final predictions.
-                # Supervising them with full-resolution image similarity over-constrains
-                # the coarse levels and hurts the final refinement quality.
                 c_shape = c_flow.shape[2:]
                 t_shape = displacement.shape[2:]
+                c_flow_float = c_flow.float()
+                
+                # 1. 梯度惩罚 (The gradient of the coarse flow)
+                c_grad_loss = grad_loss_fn(c_flow_float).mean()
+                
+                # 2. 图像下采样及图像相似度对抗 (NCC / MSE)
                 if c_shape != t_shape:
-                    scale_factor = t_shape[0] / c_shape[0] # assuming square/cube
-                    mode = 'trilinear' if len(c_shape) == 3 else 'bilinear'
-                    c_flow_up = torch.nn.functional.interpolate(c_flow.float(), size=t_shape, mode=mode, align_corners=False) * scale_factor
+                    scale_factor = t_shape[0] // c_shape[0]
+                    y_down = torch.nn.functional.avg_pool3d(target_float, kernel_size=scale_factor, stride=scale_factor)
+                    x_down = torch.nn.functional.avg_pool3d(x.float(), kernel_size=scale_factor, stride=scale_factor)
+                    if use_mask:
+                        mask_down = torch.nn.functional.avg_pool3d(fg_mask, kernel_size=scale_factor, stride=scale_factor)
                 else:
-                    c_flow_up = c_flow.float()
+                    y_down = target_float
+                    x_down = x.float()
+                    if use_mask: mask_down = fg_mask
 
-                c_grad_loss = grad_loss_fn(c_flow_up).mean()
+                # 把粗流场(vel)进行积分变位移(disp)
+                if hasattr(model, 'integrate') and model.integrate is not None:
+                    c_disp = model.integrate(c_flow_float)
+                else:
+                    c_disp = c_flow_float
+                
+                if c_shape not in st_cache:
+                    st_cache[c_shape] = vxm.nn.SpatialTransformer(size=c_shape).to(device)
+                
+                warped_x_down = st_cache[c_shape](x_down, c_disp)
+                
+                if loss_type == 'ncc':
+                    if use_mask:
+                        c_img_loss = -image_loss_fn(y_down * mask_down, warped_x_down * mask_down).mean()
+                    else:
+                        c_img_loss = -image_loss_fn(y_down, warped_x_down).mean()
+                else:
+                    if use_mask:
+                        c_img_loss = (((y_down - warped_x_down)**2) * mask_down).mean()
+                    else:
+                        c_img_loss = ((y_down - warped_x_down)**2).mean()
 
-                deep_sup_loss = deep_sup_loss + loss_weights[1] * c_grad_loss
+                # 将图像相似性与梯度平滑惩罚项双管齐下
+                deep_sup_loss = deep_sup_loss + loss_weights[0] * c_img_loss + loss_weights[1] * c_grad_loss
                     
-            # 对整体深度监督求平均，并打上折扣权重（默认0.5）
+            # 对整体深度加权求平均，并打上 pyramid 折扣 (默认 0.5)
             deep_sup_loss = (deep_sup_loss / len(coarse_flows)) * pyramid_weight
 
         grad_loss = torch.clamp(grad_loss, min=0.0, max=100.0)
