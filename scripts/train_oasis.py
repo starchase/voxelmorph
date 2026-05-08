@@ -645,13 +645,22 @@ def train_epoch(
                 
                 warped_x_down = st_cache[c_shape](x_down, c_disp)
                 
-                # 为了解决低级别分辨率（如1/8）极易由于感受野/方差爆炸导致Mamba崩溃的问题
-                # 恢复使用最稳定、绝不崩溃且具有明确下界约束的 MSE，并为了补齐与最后一层NCC的量级
-                # 此处强制乘以 10.0，使 MSE 梯度与 NCC 控制在同一数量级！
+                # 使用 Global NCC 避免小分辨特征下方差为0导致的崩溃，同时适应跨病人配准的相对亮度差异
+                def global_ncc(y_true, y_pred, eps=1e-5):
+                    u_true = y_true.mean(dim=[1,2,3,4], keepdim=True)
+                    u_pred = y_pred.mean(dim=[1,2,3,4], keepdim=True)
+                    z_true = y_true - u_true
+                    z_pred = y_pred - u_pred
+                    cov = (z_true * z_pred).mean(dim=[1,2,3,4])
+                    var_true = (z_true ** 2).mean(dim=[1,2,3,4])
+                    var_pred = (z_pred ** 2).mean(dim=[1,2,3,4])
+                    corr = cov / (torch.sqrt(var_true * var_pred) + eps)
+                    return -corr.mean()
+
                 if use_mask:
-                    c_img_loss = (((y_down - warped_x_down)**2) * mask_down).mean() * 10.0
+                    c_img_loss = global_ncc(y_down * mask_down, warped_x_down * mask_down)
                 else:
-                    c_img_loss = ((y_down - warped_x_down)**2).mean() * 10.0
+                    c_img_loss = global_ncc(y_down, warped_x_down)
 
                 # 将图像相似性与梯度平滑惩罚项双管齐下
                 deep_sup_loss = deep_sup_loss + loss_weights[0] * c_img_loss + loss_weights[1] * c_grad_loss
