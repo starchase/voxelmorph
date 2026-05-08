@@ -662,8 +662,7 @@ def train_epoch(
 
         grad_loss = torch.clamp(grad_loss, min=0.0, max=100.0)
         loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
-        if deep_sup_loss.item() > 0:
-            deep_sup_loss = torch.clamp(deep_sup_loss, min=0.0, max=100.0)
+        if deep_sup_loss.requires_grad or deep_sup_loss.item() != 0:
             loss = loss + deep_sup_loss # Add deep supervision component
 
         # 数值稳定性保护：发现非有限值则跳过该 batch，避免污染整轮 loss
