@@ -645,18 +645,13 @@ def train_epoch(
                 
                 warped_x_down = st_cache[c_shape](x_down, c_disp)
                 
-                # 为了解决低分辨率下（如1/8尺寸）由于感受野太小导致 9x9 NCC 计算极其不稳定、极易崩溃的问题，
-                # 这里引入 image_loss_fn_coarse (window_size=3, 增大 eps) 继续进行局部纹理的高质量约束！
-                if loss_type == 'ncc' and image_loss_fn_coarse is not None:
-                    if use_mask:
-                        c_img_loss = -image_loss_fn_coarse(y_down * mask_down, warped_x_down * mask_down).mean()
-                    else:
-                        c_img_loss = -image_loss_fn_coarse(y_down, warped_x_down).mean()
+                # 为了解决低级别分辨率（如1/8）极易由于感受野/方差爆炸导致Mamba崩溃的问题
+                # 恢复使用最稳定、绝不崩溃且具有明确下界约束的 MSE，并为了补齐与最后一层NCC的量级
+                # 此处强制乘以 10.0，使 MSE 梯度与 NCC 控制在同一数量级！
+                if use_mask:
+                    c_img_loss = (((y_down - warped_x_down)**2) * mask_down).mean() * 10.0
                 else:
-                    if use_mask:
-                        c_img_loss = (((y_down - warped_x_down)**2) * mask_down).mean()
-                    else:
-                        c_img_loss = ((y_down - warped_x_down)**2).mean()
+                    c_img_loss = ((y_down - warped_x_down)**2).mean() * 10.0
 
                 # 将图像相似性与梯度平滑惩罚项双管齐下
                 deep_sup_loss = deep_sup_loss + loss_weights[0] * c_img_loss + loss_weights[1] * c_grad_loss
