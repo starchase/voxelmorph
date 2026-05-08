@@ -545,7 +545,8 @@ def train_epoch(
     scaler = None,
     amp_enabled: bool = True,
     use_mask: bool = False,
-    loss_type: str = 'mse'
+    loss_type: str = 'mse',
+    image_loss_fn_coarse: nn.Module = None
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -644,11 +645,13 @@ def train_epoch(
                 
                 warped_x_down = st_cache[c_shape](x_down, c_disp)
                 
-                if loss_type == 'ncc':
+                # 为了解决低分辨率下（如1/8尺寸）由于感受野太小导致 9x9 NCC 计算极其不稳定、极易崩溃的问题，
+                # 这里引入 image_loss_fn_coarse (window_size=3, 增大 eps) 继续进行局部纹理的高质量约束！
+                if loss_type == 'ncc' and image_loss_fn_coarse is not None:
                     if use_mask:
-                        c_img_loss = -image_loss_fn(y_down * mask_down, warped_x_down * mask_down).mean()
+                        c_img_loss = -image_loss_fn_coarse(y_down * mask_down, warped_x_down * mask_down).mean()
                     else:
-                        c_img_loss = -image_loss_fn(y_down, warped_x_down).mean()
+                        c_img_loss = -image_loss_fn_coarse(y_down, warped_x_down).mean()
                 else:
                     if use_mask:
                         c_img_loss = (((y_down - warped_x_down)**2) * mask_down).mean()
@@ -772,8 +775,10 @@ def main():
     if args.loss.lower() == 'ncc':
         # 增大 eps (默认是 1e-5)，防止由于图像大面积黑色背景(方差近乎 0)导致的除零/梯度爆炸
         image_loss_fn = ne.nn.modules.NCC(eps=1e-3)
+        image_loss_fn_coarse = ne.nn.modules.NCC(eps=1e-2, window_size=3)
     else:
         image_loss_fn = ne.nn.modules.MSE()
+        image_loss_fn_coarse = ne.nn.modules.MSE()
         
     grad_loss_fn = ne.nn.modules.SpatialGradient('l2')
     loss_weights = [1.0, args.lambda_param]
@@ -872,7 +877,8 @@ def main():
             scaler=scaler,
             amp_enabled=amp_enabled,
             use_mask=args.use_mask,
-            loss_type=args.loss.lower()
+            loss_type=args.loss.lower(),
+            image_loss_fn_coarse=image_loss_fn_coarse
         )
         loss_history.append(avg_loss)
         
