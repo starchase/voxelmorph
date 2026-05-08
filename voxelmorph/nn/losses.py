@@ -233,3 +233,82 @@ class localMutualInformation(torch.nn.Module):
 
     def forward(self,y_true, y_pred):
         return -self.local_mi(y_true, y_pred)
+class MIND(torch.nn.Module):
+    """
+    Modality Independent Neighbourhood Descriptor (MIND) Self-Similarity Context (SSC) Loss.
+    Standard 3D implementation for PyTorch.
+    Expects inputs of shape (B, C, D, H, W). Usually C=1.
+    """
+    def __init__(self, radius=2, dilation=2):
+        super(MIND, self).__init__()
+        self.radius = radius
+        self.dilation = dilation
+        
+        # 3D 12-neighborhood definition (MIND-SSC)
+        # Represents shifts: (x, y, z)
+        six_neighborhood = torch.Tensor([[0, 1, 0],
+                                         [1, 0, 0],
+                                         [0, 0, 1],
+                                         [0,-1, 0],
+                                         [-1,0, 0],
+                                         [0, 0,-1]])
+        
+        # Generates the 12 edges of the cube (SSC patch differences)
+        import math
+        dist = F.pdist(six_neighborhood)
+        edges = torch.combinations(torch.arange(6), 2)[dist == math.sqrt(2)]
+        
+        # Create displacement variables
+        displacement = six_neighborhood[edges[:, 0]] - six_neighborhood[edges[:, 1]]
+        
+        # Shift masks for Conv3d
+        self.register_buffer('displacement', displacement.view(12, 3, 1, 1, 1).long())
+        
+    def forward(self, y_true, y_pred):
+        """
+        Computes the MSE of the MIND-SSC features between the fixed and moving images.
+        """
+        return torch.mean((self.mind_ssc(y_true) - self.mind_ssc(y_pred)) ** 2)
+
+    def mind_ssc(self, img):
+        """
+        Compute the MIND-SSC descriptor for a 3D image.
+        """
+        # Padding to avoid border issues during shifts
+        pad = self.dilation
+        img_padded = F.pad(img, (pad, pad, pad, pad, pad, pad), mode='replicate')
+        
+        # Compute patch distances
+        Dp = []
+        for i in range(12):
+            dx, dy, dz = (self.displacement[i, :, 0, 0, 0] * self.dilation).tolist()
+            
+            # Shift image
+            shifted_img = img_padded[
+                :, :, 
+                pad+dz : img_padded.shape[2]-pad+dz,
+                pad+dy : img_padded.shape[3]-pad+dy,
+                pad+dx : img_padded.shape[4]-pad+dx
+            ]
+            
+            # Squared difference metric
+            Dp.append((img - shifted_img)**2)
+            
+        Dp = torch.cat(Dp, dim=1)
+        
+        # Compute local variance using average pooling (equivalent to uniform convolution)
+        kernel = torch.ones([1, 1, 3, 3, 3], device=img.device) / 27.0
+        
+        # Grouped conv to apply mean filter channel-wise
+        V = F.conv3d(Dp, kernel.repeat(12, 1, 1, 1, 1), padding=1, groups=12)
+        
+        # Estimate variance (mean of min distances)
+        # Using the smallest 6 distances to approximate variance structurally
+        V_min, _ = torch.min(V, dim=1, keepdim=True)
+        # Added small epsilon for numerical stability
+        V = V_min + 1e-5 
+
+        # Calculate MIND-SSC features (exponentiated normalized distances)
+        mind = torch.exp(-Dp / V)
+        
+        return mind

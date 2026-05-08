@@ -825,7 +825,7 @@ def train_epoch(
     grad_loss_fn: nn.Module,
     loss_weights: Sequence[float],
     steps_per_epoch: int,   # Used only for progress bar calculation now if we iterate full loader
-    scaler: Optional[torch.amp.GradScaler] = None,
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,
     device: str = 'cuda'
 ) -> float:
     model.train()
@@ -838,7 +838,7 @@ def train_epoch(
 
     # Keep AMP scaler persistent across epochs. If not provided, fallback to local scaler.
     if scaler is None:
-        scaler = torch.amp.GradScaler('cuda', enabled=(device == 'cuda'))
+        scaler = torch.cuda.amp.GradScaler(enabled=(device == 'cuda'))
 
     # Prefer bfloat16 for better numeric range when available (especially for MI/localMI).
     amp_dtype = torch.bfloat16 if (device == 'cuda' and torch.cuda.is_bf16_supported()) else torch.float16
@@ -854,22 +854,38 @@ def train_epoch(
         source = batch['source'].to(device, non_blocking=True)
         target = batch['target'].to(device, non_blocking=True)
 
-        # 禁用 AMP, 避免 Local_MI 和 MI 计算因为半精度溢出产生 NaN
-        # with torch.amp.autocast('cuda', enabled=(device=='cuda'), dtype=amp_dtype):
-        if True:
-            displacement, warped_source = model(
-                source,
-                target,
-                return_warped_source=True,
-                return_field_type='displacement'
-            )
+        # 采用 train_oasis.py 的兼容代码，模型前向使用 AMP (bfloat16)，loss计算使用 float32
+        amp_enabled = (device == 'cuda')
+        field_type = 'velocity' if getattr(model, 'integration_steps', 0) > 0 else 'displacement'
+        if scaler is not None:
+            with torch.autocast('cuda', enabled=amp_enabled, dtype=torch.bfloat16):
+                out = model(source, target, return_warped_source=True, return_field_type=field_type)
+                field, warped_source = out[0], out[1]
+
+            warped_source_float = warped_source.float()
+            field_float = field.float()
+            target_float = target.float()
+
+            with torch.cuda.amp.autocast(enabled=False):
+                if isinstance(image_loss_fn, ne.nn.modules.NCC):
+                    img_loss = -image_loss_fn(target_float, warped_source_float).mean()
+                else:
+                    img_loss = image_loss_fn(target_float, warped_source_float).mean()
+
+                grad_loss = grad_loss_fn(field_float).mean()
+                grad_loss = torch.clamp(grad_loss, min=0.0, max=100.0)
+                loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
+        else:
+            out = model(source, target, return_warped_source=True, return_field_type=field_type)
+            field, warped_source = out[0], out[1]
 
             if isinstance(image_loss_fn, ne.nn.modules.NCC):
-                img_loss = -image_loss_fn(target, warped_source)
+                img_loss = -image_loss_fn(target, warped_source).mean()
             else:
-                img_loss = image_loss_fn(target, warped_source)
+                img_loss = image_loss_fn(target, warped_source).mean()
 
-            grad_loss = grad_loss_fn(displacement)
+            grad_loss = grad_loss_fn(field).mean()
+            grad_loss = torch.clamp(grad_loss, min=0.0, max=100.0)
             loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
 
         if not torch.isfinite(loss):
@@ -1361,10 +1377,12 @@ def main():
     parser.add_argument('--lambda', type=float, dest='lambda_param', default=0.01, help='Regularization weight (0.01 for smooth, 1.0 for rigid)')
     parser.add_argument('--gpu', type=str, default='0', help='GPU ID')
     parser.add_argument('--save-every', type=int, default=10, help='Checkpoint every N epochs')
-    parser.add_argument('--image-loss', type=str, choices=['mse', 'ncc', 'mi', 'local_mi'], default='ncc', help='Image similarity loss')
+    parser.add_argument('--image-loss', type=str, choices=['mse', 'ncc', 'mi', 'local_mi', 'mind'], default='ncc', help='Image similarity loss')
     parser.add_argument('--ncc-win', type=int, default=9, help='NCC window size')
     parser.add_argument('--patch-size', type=int, default=9, help='Local Mutual Information patch size')
     parser.add_argument('--mi-bins', type=int, default=32, help='Bins for Mutual Information')
+    parser.add_argument('--mind-radius', type=int, default=2, help='Radius for MIND loss')
+    parser.add_argument('--mind-dilation', type=int, default=2, help='Dilation for MIND loss')
     parser.add_argument('--unpaired', action='store_true', default=False, help='If set, force unpaired training even if filenames match.')
     parser.add_argument('--val-paired', action='store_true', default=False, help='Validation data is paired')
     parser.add_argument('--patience', type=int, default=20, help='Early stopping patience')
@@ -1410,14 +1428,19 @@ def main():
         image_loss_fn = vxm.nn.losses.MutualInformation(num_bin=args.mi_bins).to(device)
     elif args.image_loss == 'local_mi':
         image_loss_fn = vxm.nn.losses.localMutualInformation(patch_size=args.patch_size, num_bin=args.mi_bins).to(device)
+    elif args.image_loss == 'mind':
+        image_loss_fn = vxm.nn.losses.MIND(radius=args.mind_radius, dilation=args.mind_dilation).to(device)
     else:
         # neurite NCC expects window size; default None will choose automatic
-        image_loss_fn = ne.nn.modules.NCC(window_size=args.ncc_win).to(device)
+        # 增大 eps (默认是 1e-5)，防止由于图像大面积黑色背景(方差近乎 0)导致的除零/梯度爆炸
+        image_loss_fn = ne.nn.modules.NCC(window_size=args.ncc_win, eps=1e-3).to(device)
 
     grad_loss_fn = ne.nn.modules.SpatialGradient('l2')
     loss_weights = [1.0, args.lambda_param]
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
+    
+    # Scheduler: Cosine annealing to gradually lower LR as in train_oasis.py
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     # Dataloader
     # Switch to Map-style Dataset for consistent epoch definition
@@ -1505,6 +1528,8 @@ def main():
         f.write(f"Batch Size: {args.batch_size}\n")
         f.write(f"Image Loss: {args.image_loss}\n")
         f.write(f"NCC Window: {args.ncc_win}\n")
+        f.write(f"MIND Radius: {args.mind_radius}\n")
+        f.write(f"MIND Dilation: {args.mind_dilation}\n")
         f.write(f"Lambda: {args.lambda_param}\n")
         f.write(f"LR: {args.lr}\n")
         f.write(f"Integration Steps: {args.integration_steps}\n")
@@ -1516,7 +1541,7 @@ def main():
 
     with open(log_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'train_loss', 'train_grad_norm', 'train_update_ratio', 'val_loss', 'test_loss', 'test_dice', 'test_dice_std', 'test_hd95', 'test_hd95_std', 'test_time_sec', 'test_reg_time_sec', 'test_jac', 'test_jac_std', 'test_mag', 'test_dice_per_label', 'test_dice_per_label_std'])
+        writer.writerow(['epoch', 'train_loss', 'test_dice', 'test_hd95', 'test_jac', 'test_mag', 'train_grad_norm', 'train_update_ratio', 'val_loss', 'test_loss', 'test_dice_std', 'test_hd95_std', 'test_jac_std', 'test_time_sec', 'test_reg_time_sec', 'test_dice_per_label', 'test_dice_per_label_std'])
 
     best_loss = float('inf')
     best_test_dice = 0.0
@@ -1527,7 +1552,7 @@ def main():
     loss_history: List[float] = []
 
     # Persistent scaler across all epochs (important for stable AMP training)
-    scaler = torch.amp.GradScaler('cuda', enabled=(device == 'cuda'))
+    scaler = torch.cuda.amp.GradScaler(enabled=(device == 'cuda'))
 
     print(f'Training for {args.epochs} epochs...')
     for epoch in range(args.epochs):
@@ -1675,19 +1700,19 @@ def main():
             row = [
                 epoch + 1, 
                 fmt(avg_loss), 
+                fmt(test_dice), 
+                fmt(test_hd95), 
+                fmt(test_jac), 
+                fmt(test_mag), 
                 fmt(avg_grad_norm),
                 fmt(update_ratio),
                 fmt(val_loss), 
                 fmt(test_loss), 
-                fmt(test_dice), 
                 fmt(test_dice_std),
-                fmt(test_hd95), 
                 fmt(test_hd95_std),
+                fmt(test_jac_std),
                 fmt(test_time), 
                 fmt(test_reg_time), 
-                fmt(test_jac), 
-                fmt(test_jac_std),
-                fmt(test_mag), 
                 test_dice_per_label_str,
                 test_dice_per_label_std_str
             ]
@@ -1698,7 +1723,7 @@ def main():
         # -----------------------------
         # Visualization
         # -----------------------------
-        do_visualization = False # 快速验证超参期间关闭可视化 (原为: is_best_test_dice or run_full_metrics)
+        do_visualization = is_best_test_dice or run_full_metrics
         
         if do_visualization:
             vis_dataset = None
@@ -1749,8 +1774,8 @@ def main():
             best_loss = current_monitor_loss
             print(f'New best val loss: {best_loss:.6f}.')
 
-        # Scheduler step based on Test Dice (maximize)
-        scheduler.step(test_dice)
+        # Scheduler step (CosineAnnealingLR)
+        scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Current LR: {current_lr}")
 
