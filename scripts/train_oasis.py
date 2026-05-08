@@ -113,7 +113,8 @@ def build_registration_model(args, device):
             use_gcv=args.use_gcv,
             encoder_type=getattr(args, 'encoder_type', 'cnn'),
             mamba_shallow_multi=getattr(args, 'mamba_shallow_multi', False),
-            window_size=getattr(args, 'window_size', 9)
+            window_size=getattr(args, 'window_size', 9),
+            pdaps_flow_limit=getattr(args, 'pdaps_flow_limit', 20.0)
         )
 
     return model.to(device)
@@ -713,6 +714,7 @@ def main():
     parser.add_argument('--lambda', type=float, dest='lambda_param', default=0.01, help='Weight of gradient loss')
     parser.add_argument('--pyramid-weight', type=float, default=0.5, help='Weight for intermediate pyramid deep supervision loss')
     parser.add_argument('--use-pdaps', action='store_true', help='Use Pyramid-guided Deformation-Aware Progressive Skip')
+    parser.add_argument('--pdaps-flow-limit', type=float, default=20.0, help='Maximum physical flow limit for P-DAPS. E.g., 20.0 for Brain, 30.0+ for Abdomen CT/MRI.')
     parser.add_argument('--use-daps', action='store_true', help='Use original DAPS')
     parser.add_argument('--use-dsin', action='store_true', help='Enable DSIN in the shallow decoupled encoder layers')
     parser.add_argument('--use-cmim', action='store_true', help='Enable CMIM at deep decoder scales')

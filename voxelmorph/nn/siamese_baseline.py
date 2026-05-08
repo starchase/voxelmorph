@@ -282,7 +282,7 @@ class SiameseUNetBaseline(nn.Module):
     - No Frequency Domain Alignment yet
     """
     def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False, use_pdaps=False, use_dsin=False, use_cmim=False, use_cross_mamba=False, use_wcv=False,
-                 use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, fusion_method='compress_concat', window_size=9):
+                 use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, fusion_method='compress_concat', window_size=9, pdaps_flow_limit=20.0):
         super().__init__()
         self.inshape = inshape
         self.ndim = ndim
@@ -414,10 +414,10 @@ class SiameseUNetBaseline(nn.Module):
                 self.pyramid_flows.append(p_flow_conv)
             for i in range(len(dec_nf)):
                 # 统一使用按层衰减分配物理形变上限，防止深层轻微波动放大后撕裂结构
-                pdaps_limits.append(20.0 / (2 ** (len(dec_nf) - i - 1)))
+                pdaps_limits.append(pdaps_flow_limit / (2 ** (len(dec_nf) - i - 1)))
             
-            # 改为 nn.Parameter，这样对于腹痛等大形变任务，模型可以在训练中自动突破预设上限
-            self.pdaps_flow_limits = nn.Parameter(torch.tensor(pdaps_limits, dtype=torch.float32))
+            # 改为 nn.Parameter(requires_grad=False)，修复在自动探索大形变时因 NCC 目标直接导致位移限度无限扩展而撕裂网络的问题
+            self.pdaps_flow_limits = nn.Parameter(torch.tensor(pdaps_limits, dtype=torch.float32), requires_grad=False)
 
         # 4. Spatial Transformer
         self.spatial_transform = SpatialTransformer()
