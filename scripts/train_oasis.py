@@ -639,7 +639,7 @@ def train_epoch(
                     c_disp = c_flow_float
                 
                 if c_shape not in st_cache:
-                    st_cache[c_shape] = vxm.nn.SpatialTransformer(size=c_shape).to(device)
+                    st_cache[c_shape] = vxm.nn.modules.SpatialTransformer().to(device)
                 
                 warped_x_down = st_cache[c_shape](x_down, c_disp)
                 
