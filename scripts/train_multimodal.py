@@ -119,7 +119,17 @@ class MultimodalTrainDataset(torch.utils.data.Dataset):
         mr = self._load_img(mr_path)
 
         return {'source': ct, 'target': mr}
-def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', suffix='', best_sample_idx=None):
+def save_qualitative_results(
+    model,
+    dataset,
+    output_dir,
+    epoch,
+    device='cuda',
+    suffix='',
+    best_sample_idx=None,
+    boundary_kernel='sobel',
+    boundary_smooth_kernel=3,
+):
     """Save mid-slice images of samples."""
     
     samples_to_plot = []
@@ -157,6 +167,15 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
         model.eval()
         with torch.no_grad():
             displacement, warped_source = model(source, target, return_warped_source=True, return_field_type='displacement')
+            boundary_extractor = vxm.nn.modules.FixedGradientMagnitude3D(
+                operator=boundary_kernel,
+                smooth_kernel_size=boundary_smooth_kernel,
+                normalize=True,
+            ).to(device)
+            source_boundary = boundary_extractor(source.float())
+            target_boundary = boundary_extractor(target.float())
+            warped_boundary = boundary_extractor(warped_source.float())
+            foreground_mask = build_foreground_mask(target.float())
             
             warped_label = None
             if source_label is not None:
@@ -254,6 +273,10 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
         src_slice = get_slice(source, slice_idx)
         tgt_slice = get_slice(target, slice_idx)
         warped_slice = get_slice(warped_source, slice_idx)
+        src_boundary_slice = get_slice(source_boundary, slice_idx)
+        tgt_boundary_slice = get_slice(target_boundary, slice_idx)
+        warped_boundary_slice = get_slice(warped_boundary, slice_idx)
+        foreground_mask_slice = get_slice(foreground_mask, slice_idx)
         
         src_lbl_slice = get_slice(source_label, slice_idx)
         tgt_lbl_slice = get_slice(target_label, slice_idx)
@@ -263,9 +286,9 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
         has_labels = (src_lbl_slice is not None) and (tgt_lbl_slice is not None)
         
         # Re-organized Layout: 3 Rows x 4 Cols (12 plots total) to fit Jacobian
-        rows = 3
+        rows = 4
         cols = 4
-        fig, axes = plt.subplots(rows, cols, figsize=(20, 15))
+        fig, axes = plt.subplots(rows, cols, figsize=(20, 20))
         
         # Turn off all axes initially
         for ax in axes.flatten():
@@ -602,6 +625,31 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
             
             # 12. [2,3] Empty
             axes[2, 3].axis('off')
+
+        # --- Row 4: Boundary Maps & Active Foreground Mask ---
+        boundary_vmax = max(
+            np.max(src_boundary_slice),
+            np.max(tgt_boundary_slice),
+            np.max(warped_boundary_slice),
+            1e-6,
+        )
+
+        axes[3, 0].imshow(src_boundary_slice, cmap='magma', vmin=0.0, vmax=boundary_vmax)
+        axes[3, 0].set_title('Source Boundary Map')
+        axes[3, 0].axis('off')
+
+        axes[3, 1].imshow(tgt_boundary_slice, cmap='magma', vmin=0.0, vmax=boundary_vmax)
+        axes[3, 1].set_title('Target Boundary Map')
+        axes[3, 1].axis('off')
+
+        axes[3, 2].imshow(warped_boundary_slice, cmap='magma', vmin=0.0, vmax=boundary_vmax)
+        axes[3, 2].set_title('Warped Boundary Map')
+        axes[3, 2].axis('off')
+
+        axes[3, 3].imshow(tgt_slice, cmap='gray')
+        axes[3, 3].imshow(foreground_mask_slice, cmap='autumn', alpha=0.45, vmin=0.0, vmax=1.0)
+        axes[3, 3].set_title('Foreground Mask')
+        axes[3, 3].axis('off')
 
         plt.suptitle(f'Epoch {epoch} - Sample {name_tag} (Slice Z={slice_idx})', fontsize=16)
         
@@ -1505,7 +1553,7 @@ def main():
     parser.add_argument('--boundary-branch-strength', type=float, default=0.5, help='Residual gate strength for the boundary feature branch')
     parser.add_argument('--use-boundary-loss', action='store_true', help='Enable explicit boundary consistency loss between warped source and target')
     parser.add_argument('--boundary-loss-weight', type=float, default=0.1, help='Weight for boundary consistency loss when enabled')
-    parser.add_argument('--boundary-loss-metric', type=str, default='ncc', choices=['ncc', 'l1'], help='Metric used by the boundary consistency loss')
+    parser.add_argument('--boundary-loss-metric', type=str, default='l1', choices=['ncc', 'l1'], help='Metric used by the boundary consistency loss; `l1` compares 3D Sobel gradient maps more directly and usually overlaps less with the main image NCC/MI term')
     parser.add_argument('--boundary-kernel', type=str, default='sobel', choices=['sobel', 'diff'], help='Fixed operator used to extract 3D boundary maps')
     parser.add_argument('--boundary-smooth-kernel', type=int, default=3, help='Odd smoothing kernel size applied before boundary extraction')
     args = parser.parse_args()
@@ -1940,7 +1988,9 @@ def main():
                      epoch + 1, 
                      device=device, 
                      suffix=vis_suffix,
-                     best_sample_idx=best_idx_to_plot
+                     best_sample_idx=best_idx_to_plot,
+                     boundary_kernel=args.boundary_kernel,
+                     boundary_smooth_kernel=args.boundary_smooth_kernel,
                  )
 
         # -----------------------------

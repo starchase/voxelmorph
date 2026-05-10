@@ -128,7 +128,19 @@ def build_registration_model(args, device):
 
     return model.to(device)
 
-def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', suffix='', best_sample_idx=None):
+def save_qualitative_results(
+    model,
+    dataset,
+    output_dir,
+    epoch,
+    device='cuda',
+    suffix='',
+    best_sample_idx=None,
+    boundary_kernel='sobel',
+    boundary_smooth_kernel=3,
+    boundary_ring_inner_kernel=3,
+    boundary_ring_outer_kernel=7,
+):
     """Save mid-slice images of samples."""
     
     samples_to_plot = []
@@ -151,10 +163,23 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
         with torch.no_grad():
             out = model(source, target, return_warped_source=True, return_field_type='displacement')
             displacement, warped_source = out[0], out[1]
+            boundary_extractor = vxm.nn.modules.FixedGradientMagnitude3D(
+                operator=boundary_kernel,
+                smooth_kernel_size=boundary_smooth_kernel,
+                normalize=True,
+            ).to(device)
+            source_boundary = boundary_extractor(source.float())
+            target_boundary = boundary_extractor(target.float())
+            warped_boundary = boundary_extractor(warped_source.float())
+            base_fg_mask = build_foreground_mask(target.float(), target_label.float())
+            boundary_ring_mask = build_boundary_ring_mask(
+                base_fg_mask,
+                inner_kernel_size=boundary_ring_inner_kernel,
+                outer_kernel_size=boundary_ring_outer_kernel,
+            )
             
             warped_label = None
             if source_label is not None:
-                 import voxelmorph as vxm
                  trf = vxm.nn.modules.SpatialTransformer(interpolation_mode='nearest').to(device)
                  warped_label = trf(source_label.float(), displacement)
         
@@ -186,6 +211,10 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
         src_slice = get_slice(source, slice_idx)
         tgt_slice = get_slice(target, slice_idx)
         warped_slice = get_slice(warped_source, slice_idx)
+        src_boundary_slice = get_slice(source_boundary, slice_idx)
+        tgt_boundary_slice = get_slice(target_boundary, slice_idx)
+        warped_boundary_slice = get_slice(warped_boundary, slice_idx)
+        ring_mask_slice = get_slice(boundary_ring_mask, slice_idx)
         
         src_lbl_slice = get_slice(source_label, slice_idx, is_label=True)
         tgt_lbl_slice = get_slice(target_label, slice_idx, is_label=True)
@@ -193,9 +222,9 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
         
         has_labels = (src_lbl_slice is not None) and (tgt_lbl_slice is not None)
         
-        rows = 3
+        rows = 4
         cols = 4
-        fig, axes = plt.subplots(rows, cols, figsize=(20, 15))
+        fig, axes = plt.subplots(rows, cols, figsize=(20, 20))
         
         for ax in axes.flatten():
             ax.axis('off')
@@ -407,6 +436,31 @@ def save_qualitative_results(model, dataset, output_dir, epoch, device='cuda', s
         axes[2, 3].set_title('Jacobian Determinant')
         axes[2, 3].axis('off')
 
+        # --- Row 4: Boundary Maps & Ring Mask ---
+        boundary_vmax = max(
+            np.max(src_boundary_slice),
+            np.max(tgt_boundary_slice),
+            np.max(warped_boundary_slice),
+            1e-6,
+        )
+
+        axes[3, 0].imshow(src_boundary_slice, cmap='magma', vmin=0.0, vmax=boundary_vmax)
+        axes[3, 0].set_title('Source Boundary Map')
+        axes[3, 0].axis('off')
+
+        axes[3, 1].imshow(tgt_boundary_slice, cmap='magma', vmin=0.0, vmax=boundary_vmax)
+        axes[3, 1].set_title('Target Boundary Map')
+        axes[3, 1].axis('off')
+
+        axes[3, 2].imshow(warped_boundary_slice, cmap='magma', vmin=0.0, vmax=boundary_vmax)
+        axes[3, 2].set_title('Warped Boundary Map')
+        axes[3, 2].axis('off')
+
+        axes[3, 3].imshow(tgt_slice, cmap='gray', vmin=vmin_val, vmax=vmax_val)
+        axes[3, 3].imshow(ring_mask_slice, cmap='autumn', alpha=0.45, vmin=0.0, vmax=1.0)
+        axes[3, 3].set_title('Boundary Ring Mask')
+        axes[3, 3].axis('off')
+
         plt.suptitle(f'Epoch {epoch} - Sample {name_tag} (Slice Z={slice_idx})', fontsize=16)
         
         try:
@@ -452,6 +506,8 @@ def validate(
     loss_weights: list = None,
     boundary_loss_fn: nn.Module = None,
     boundary_loss_weight: float = 0.0,
+    boundary_ring_inner_kernel: int = 3,
+    boundary_ring_outer_kernel: int = 7,
     use_mask: bool = False,
     loss_type: str = 'mse',
 ) -> tuple:
@@ -484,8 +540,14 @@ def validate(
 
             target_float = y.float()
             warped_float = warped_source.float()
+            base_fg_mask = build_foreground_mask(target_float, y_seg)
+            boundary_ring_mask = build_boundary_ring_mask(
+                base_fg_mask,
+                inner_kernel_size=boundary_ring_inner_kernel,
+                outer_kernel_size=boundary_ring_outer_kernel,
+            )
             if use_mask:
-                fg_mask = build_foreground_mask(target_float, y_seg)
+                fg_mask = base_fg_mask
             else:
                 fg_mask = torch.ones_like(target_float)
 
@@ -506,7 +568,7 @@ def validate(
                 loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
 
                 if boundary_loss_fn is not None and boundary_loss_weight > 0:
-                    boundary_loss = boundary_loss_fn(warped_float, target_float, mask=fg_mask)
+                    boundary_loss = boundary_loss_fn(warped_float, target_float, mask=boundary_ring_mask)
                     loss = loss + boundary_loss_weight * boundary_loss
 
                 eval_loss.update(loss.item(), x.size(0))
@@ -581,6 +643,28 @@ def build_foreground_mask(target: torch.Tensor, target_seg: torch.Tensor = None)
     mask = _binary_dilate_3d(mask, kernel_size=3)
     return mask.clamp_(0.0, 1.0)
 
+def build_boundary_ring_mask(
+    foreground_mask: torch.Tensor,
+    inner_kernel_size: int = 3,
+    outer_kernel_size: int = 7,
+) -> torch.Tensor:
+    inner_kernel_size = max(1, int(inner_kernel_size))
+    outer_kernel_size = max(inner_kernel_size, int(outer_kernel_size))
+
+    if inner_kernel_size % 2 == 0:
+        inner_kernel_size += 1
+    if outer_kernel_size % 2 == 0:
+        outer_kernel_size += 1
+
+    foreground_mask = foreground_mask.float().clamp_(0.0, 1.0)
+    outer_band = _binary_dilate_3d(foreground_mask, kernel_size=outer_kernel_size)
+    inner_core = _binary_erode_3d(foreground_mask, kernel_size=inner_kernel_size)
+    ring_mask = (outer_band - inner_core).clamp_(0.0, 1.0)
+
+    if torch.count_nonzero(ring_mask).item() == 0:
+        return foreground_mask
+    return ring_mask
+
 def train_epoch(
     model: nn.Module,
     dataloader: torch.utils.data.DataLoader,
@@ -597,6 +681,8 @@ def train_epoch(
     image_loss_fn_coarse: nn.Module = None,
     boundary_loss_fn: nn.Module = None,
     boundary_loss_weight: float = 0.0,
+    boundary_ring_inner_kernel: int = 3,
+    boundary_ring_outer_kernel: int = 7,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -640,8 +726,15 @@ def train_epoch(
         # 方法A (推荐): 如果你的数据集里自带真实器官的 Label `y_seg`，直接拿全器官 Label 生成 Mask `(y_seg > 0).float()` 即可完美覆盖目标实质区域！
         # 方法B (常规): 依然用阈值提取背景，但做膨胀/闭运算填补内部空洞(morphological hole filling)。但深度学习中往往算算算嫌麻烦。
         
+        base_fg_mask = build_foreground_mask(target_float, y_seg)
+        boundary_ring_mask = build_boundary_ring_mask(
+            base_fg_mask,
+            inner_kernel_size=boundary_ring_inner_kernel,
+            outer_kernel_size=boundary_ring_outer_kernel,
+        )
+
         if use_mask:
-            fg_mask = build_foreground_mask(target_float, y_seg)
+            fg_mask = base_fg_mask
         else:
             # 也就是默认在全图 (Batchx1xHxWxD) 上一视同仁全部计算 Loss
             fg_mask = torch.ones_like(target_float)
@@ -662,7 +755,7 @@ def train_epoch(
         grad_loss = grad_loss_fn(displacement.float()).mean()
         boundary_loss = displacement.new_tensor(0.0)
         if boundary_loss_fn is not None and boundary_loss_weight > 0:
-            boundary_loss = boundary_loss_fn(warped_float, target_float, mask=fg_mask)
+            boundary_loss = boundary_loss_fn(warped_float, target_float, mask=boundary_ring_mask)
         
         # --- Deep Supervision for Pyramid/Coarse flows ---
         deep_sup_loss = displacement.new_tensor(0.0)
@@ -791,9 +884,12 @@ def main():
     parser.add_argument('--boundary-branch-strength', type=float, default=0.5, help='Residual gate strength for the boundary feature branch')
     parser.add_argument('--use-boundary-loss', action='store_true', help='Enable explicit boundary consistency loss between warped source and target')
     parser.add_argument('--boundary-loss-weight', type=float, default=0.1, help='Weight for boundary consistency loss when enabled')
-    parser.add_argument('--boundary-loss-metric', type=str, default='ncc', choices=['ncc', 'l1'], help='Metric used by the boundary consistency loss')
+    parser.add_argument('--boundary-loss-start-epoch', type=int, default=10, help='Enable boundary loss only after this 1-based epoch index; e.g. 10 starts boundary loss from epoch 11')
+    parser.add_argument('--boundary-loss-metric', type=str, default='l1', choices=['ncc', 'l1'], help='Metric used by the boundary consistency loss; `l1` compares 3D Sobel gradient maps more directly and usually overlaps less with the main image NCC term')
     parser.add_argument('--boundary-kernel', type=str, default='sobel', choices=['sobel', 'diff'], help='Fixed operator used to extract 3D boundary maps')
     parser.add_argument('--boundary-smooth-kernel', type=int, default=3, help='Odd smoothing kernel size applied before boundary extraction')
+    parser.add_argument('--boundary-ring-inner-kernel', type=int, default=3, help='Inner erosion kernel size for the foreground boundary ring mask')
+    parser.add_argument('--boundary-ring-outer-kernel', type=int, default=7, help='Outer dilation kernel size for the foreground boundary ring mask')
     parser.add_argument('--encoder-type', type=str, default='cnn', choices=['cnn', 'mamba'], help='Backbone type for feature extraction.')
     parser.add_argument('--mamba-shallow-multi', action='store_true', help='Enable multi-axis (d,h,w) scanning for 1/8 scale shallow features. If disabled, uses single axis (d) to remain stable.')
     parser.add_argument('--model-config', type=str, default='dual_stream', choices=['dual_stream', 'voxelmorph_baseline'], help='Choose between the current dual-stream Siamese setup and the standard Voxelmorph baseline')
@@ -816,6 +912,10 @@ def main():
         parser.error('--use-daps and --use-pdaps are mutually exclusive. Use --use-pdaps for the current pyramid design.')
     if args.use_cmim and args.use_cross_mamba:
         parser.error('--use-cmim and --use-cross-mamba are mutually exclusive interaction modules.')
+    if args.boundary_ring_inner_kernel < 1 or args.boundary_ring_outer_kernel < 1:
+        parser.error('--boundary-ring-inner-kernel and --boundary-ring-outer-kernel must be positive integers.')
+    if args.boundary_ring_outer_kernel < args.boundary_ring_inner_kernel:
+        parser.error('--boundary-ring-outer-kernel must be greater than or equal to --boundary-ring-inner-kernel.')
 
     # Set device
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -940,6 +1040,9 @@ def main():
     
     for epoch in range(args.epochs):
         epoch_start_time = time.time()
+        epoch_num = epoch + 1
+        boundary_loss_active = args.use_boundary_loss and (epoch_num > args.boundary_loss_start_epoch)
+        active_boundary_loss_weight = args.boundary_loss_weight if boundary_loss_active else 0.0
         
         avg_loss, train_boundary_loss = train_epoch(
             model=model,
@@ -956,7 +1059,9 @@ def main():
             loss_type=args.loss.lower(),
             image_loss_fn_coarse=image_loss_fn_coarse,
             boundary_loss_fn=boundary_loss_fn,
-            boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
+            boundary_loss_weight=active_boundary_loss_weight,
+            boundary_ring_inner_kernel=args.boundary_ring_inner_kernel,
+            boundary_ring_outer_kernel=args.boundary_ring_outer_kernel,
         )
         loss_history.append(avg_loss)
         
@@ -970,7 +1075,9 @@ def main():
             grad_loss_fn=grad_loss_fn,
             loss_weights=loss_weights,
             boundary_loss_fn=boundary_loss_fn,
-            boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
+            boundary_loss_weight=active_boundary_loss_weight,
+            boundary_ring_inner_kernel=args.boundary_ring_inner_kernel,
+            boundary_ring_outer_kernel=args.boundary_ring_outer_kernel,
             use_mask=args.use_mask,
             loss_type=args.loss.lower(),
         )
@@ -978,8 +1085,6 @@ def main():
         # Decide if we need to compute heavy extra metrics (HD95, Jac, Mag)
         # Condition: 第1, 3, 5, 7个epoch，之后每10个epoch，或者dice达到最佳且大于0.77
         is_new_best = val_dsc > best_dsc
-        epoch_num = epoch + 1
-        
         condition_epoch = epoch_num in [1, 3, 5, 7] or epoch_num % 10 == 0
         condition_best = is_new_best and (val_dsc > 0.77)
         compute_extra = condition_epoch or condition_best
@@ -996,7 +1101,9 @@ def main():
                 grad_loss_fn=grad_loss_fn,
                 loss_weights=loss_weights,
                 boundary_loss_fn=boundary_loss_fn,
-                boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
+                boundary_loss_weight=active_boundary_loss_weight,
+                boundary_ring_inner_kernel=args.boundary_ring_inner_kernel,
+                boundary_ring_outer_kernel=args.boundary_ring_outer_kernel,
                 use_mask=args.use_mask,
                 loss_type=args.loss.lower(),
             )
@@ -1023,7 +1130,17 @@ def main():
         save_vis = compute_extra
         if save_vis:
             try:
-                save_qualitative_results(model, val_set, out_path.parent, epoch=epoch+1, device=device)
+                save_qualitative_results(
+                    model,
+                    val_set,
+                    out_path.parent,
+                    epoch=epoch+1,
+                    device=device,
+                    boundary_kernel=args.boundary_kernel,
+                    boundary_smooth_kernel=args.boundary_smooth_kernel,
+                    boundary_ring_inner_kernel=args.boundary_ring_inner_kernel,
+                    boundary_ring_outer_kernel=args.boundary_ring_outer_kernel,
+                )
             except Exception as e:
                 print(f"Failed to save visualization: {e}")
 
