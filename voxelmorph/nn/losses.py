@@ -11,6 +11,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
+from .modules import FixedGradientMagnitude3D
+
 
 class NCC:
     """
@@ -342,3 +344,73 @@ class JointMIMINDLoss(nn.Module):
         loss_mind = self.mind_loss(target, source)
         
         return self.mi_weight * loss_mi + self.mind_weight * loss_mind
+
+
+class BoundaryConsistencyLoss(nn.Module):
+    """
+    Boundary consistency loss on fixed gradient-magnitude maps.
+    """
+
+    def __init__(
+        self,
+        operator: str = 'sobel',
+        metric: str = 'ncc',
+        smooth_kernel_size: int = 3,
+        normalize_edges: bool = True,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+
+        if metric not in {'ncc', 'l1'}:
+            raise ValueError(f"metric must be 'ncc' or 'l1', got {metric!r}")
+
+        self.metric = metric
+        self.eps = eps
+        self.extractor = FixedGradientMagnitude3D(
+            operator=operator,
+            smooth_kernel_size=smooth_kernel_size,
+            normalize=normalize_edges,
+            eps=eps,
+        )
+
+    def _prepare_mask(self, mask: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+        if mask.shape[2:] != reference.shape[2:]:
+            mask = F.interpolate(mask, size=reference.shape[2:], mode='nearest')
+        if mask.shape[1] == 1 and reference.shape[1] != 1:
+            mask = mask.expand(-1, reference.shape[1], -1, -1, -1)
+        return mask.float()
+
+    def _masked_ncc(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        if mask is None:
+            mask = torch.ones_like(pred)
+        else:
+            mask = self._prepare_mask(mask, pred)
+
+        reduce_dims = (2, 3, 4)
+        weight_sum = mask.sum(dim=reduce_dims, keepdim=True).clamp_min(self.eps)
+
+        pred_mean = (pred * mask).sum(dim=reduce_dims, keepdim=True) / weight_sum
+        target_mean = (target * mask).sum(dim=reduce_dims, keepdim=True) / weight_sum
+
+        pred_centered = (pred - pred_mean) * mask
+        target_centered = (target - target_mean) * mask
+
+        numerator = (pred_centered * target_centered).sum(dim=reduce_dims)
+        pred_var = pred_centered.square().sum(dim=reduce_dims)
+        target_var = target_centered.square().sum(dim=reduce_dims)
+        corr = numerator / (torch.sqrt(pred_var * target_var) + self.eps)
+        return 1.0 - corr.mean()
+
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        pred_edges = self.extractor(prediction.float())
+        target_edges = self.extractor(target.float())
+
+        if self.metric == 'l1':
+            if mask is None:
+                return torch.mean(torch.abs(pred_edges - target_edges))
+
+            mask = self._prepare_mask(mask, pred_edges)
+            diff = torch.abs(pred_edges - target_edges) * mask
+            return diff.sum() / mask.sum().clamp_min(self.eps)
+
+        return self._masked_ncc(pred_edges, target_edges, mask=mask)

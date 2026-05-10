@@ -286,3 +286,88 @@ class ResizeDisplacementField(nn.Module):
         )
 
         return resized_disp
+
+
+class FixedGradientMagnitude3D(nn.Module):
+    """
+    Fixed 3D gradient-magnitude extractor for boundary-aware registration.
+    """
+
+    def __init__(
+        self,
+        operator: str = "sobel",
+        smooth_kernel_size: int = 1,
+        normalize: bool = True,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+
+        if operator not in {"diff", "sobel"}:
+            raise ValueError(f"operator must be 'diff' or 'sobel', got {operator!r}")
+        if smooth_kernel_size < 1 or smooth_kernel_size % 2 == 0:
+            raise ValueError(
+                f"smooth_kernel_size must be a positive odd integer, got {smooth_kernel_size}"
+            )
+
+        self.operator = operator
+        self.smooth_kernel_size = smooth_kernel_size
+        self.normalize = normalize
+        self.eps = eps
+
+        self.register_buffer("kernel_d", self._build_kernel(axis="d"))
+        self.register_buffer("kernel_h", self._build_kernel(axis="h"))
+        self.register_buffer("kernel_w", self._build_kernel(axis="w"))
+
+    def _build_kernel(self, axis: str) -> torch.Tensor:
+        derivative = torch.tensor([-1.0, 0.0, 1.0], dtype=torch.float32)
+        if self.operator == "sobel":
+            smooth = torch.tensor([1.0, 2.0, 1.0], dtype=torch.float32)
+        else:
+            smooth = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32)
+
+        if axis == "d":
+            kernel = derivative[:, None, None] * smooth[None, :, None] * smooth[None, None, :]
+        elif axis == "h":
+            kernel = smooth[:, None, None] * derivative[None, :, None] * smooth[None, None, :]
+        elif axis == "w":
+            kernel = smooth[:, None, None] * smooth[None, :, None] * derivative[None, None, :]
+        else:
+            raise ValueError(f"Unsupported axis {axis!r}")
+
+        kernel = kernel / kernel.abs().sum().clamp_min(1.0)
+        return kernel.view(1, 1, 3, 3, 3)
+
+    def _expand_kernel(self, kernel: torch.Tensor, channels: int, dtype: torch.dtype) -> torch.Tensor:
+        return kernel.to(dtype=dtype).repeat(channels, 1, 1, 1, 1)
+
+    def forward(self, image: torch.Tensor) -> torch.Tensor:
+        if image.dim() != 5:
+            raise ValueError(
+                f"FixedGradientMagnitude3D expects [B, C, D, H, W], got {tuple(image.shape)}"
+            )
+
+        x = image
+        if self.smooth_kernel_size > 1:
+            x = nnf.avg_pool3d(
+                x,
+                kernel_size=self.smooth_kernel_size,
+                stride=1,
+                padding=self.smooth_kernel_size // 2,
+            )
+
+        channels = x.shape[1]
+        kernel_d = self._expand_kernel(self.kernel_d, channels, x.dtype)
+        kernel_h = self._expand_kernel(self.kernel_h, channels, x.dtype)
+        kernel_w = self._expand_kernel(self.kernel_w, channels, x.dtype)
+
+        grad_d = nnf.conv3d(x, kernel_d, padding=1, groups=channels)
+        grad_h = nnf.conv3d(x, kernel_h, padding=1, groups=channels)
+        grad_w = nnf.conv3d(x, kernel_w, padding=1, groups=channels)
+
+        grad_mag = torch.sqrt(grad_d.square() + grad_h.square() + grad_w.square() + self.eps)
+
+        if self.normalize:
+            spatial_max = grad_mag.amax(dim=(2, 3, 4), keepdim=True).clamp_min(self.eps)
+            grad_mag = grad_mag / spatial_max
+
+        return grad_mag

@@ -25,6 +25,7 @@ import nibabel as nib
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import IterableDataset, DataLoader
 from tqdm import tqdm
 
@@ -618,11 +619,14 @@ def plot_history(log_file, output_dir):
     """Plot training history from log file."""
     epochs = []
     train_loss = []
+    train_boundary_loss = []
     val_loss = []
+    val_boundary_loss = []
     val_dice = []
     val_jac = []
     val_mag = []
     test_loss = []
+    test_boundary_loss = []
     test_dice = []
     test_jac = []
     test_mag = []
@@ -632,12 +636,15 @@ def plot_history(log_file, output_dir):
         for row in reader:
             epochs.append(int(row['epoch']))
             train_loss.append(float(row['train_loss']))
+            train_boundary_loss.append(float(row.get('train_boundary_loss', 0.0)))
             val_loss.append(float(row['val_loss']))
+            val_boundary_loss.append(float(row.get('val_boundary_loss', 0.0)))
             val_dice.append(float(row.get('val_dice', 0.0)))
             val_jac.append(float(row.get('val_neg_jac_ratio', 0.0)))
             # Handle potentially missing columns if log file format changed mid-way
             val_mag.append(float(row.get('val_mag', 0.0)))
             test_loss.append(float(row.get('test_loss', 0.0)))
+            test_boundary_loss.append(float(row.get('test_boundary_loss', 0.0)))
             test_dice.append(float(row.get('test_dice', 0.0)))
             test_jac.append(float(row.get('test_jac', 0.0)))
             test_mag.append(float(row.get('test_mag', 0.0)))
@@ -650,6 +657,11 @@ def plot_history(log_file, output_dir):
     plt.plot(epochs, val_loss, label='Val Loss')
     if any(l != 0 for l in test_loss):
         plt.plot(epochs, test_loss, label='Test Loss')
+    if any(l != 0 for l in train_boundary_loss + val_boundary_loss + test_boundary_loss):
+        plt.plot(epochs, train_boundary_loss, '--', label='Train Boundary Loss')
+        plt.plot(epochs, val_boundary_loss, '--', label='Val Boundary Loss')
+        if any(l != 0 for l in test_boundary_loss):
+            plt.plot(epochs, test_boundary_loss, '--', label='Test Boundary Loss')
     plt.title('Loss')
     plt.xlabel('Epoch')
     plt.legend()
@@ -826,6 +838,20 @@ def check_early_stopping(loss_history, patience=20, threshold=0.0, warm_start_st
     
     return False
 
+def _binary_dilate_3d(mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    return F.max_pool3d(mask, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+
+def _binary_erode_3d(mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    return 1.0 - F.max_pool3d(1.0 - mask, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+
+def build_foreground_mask(target: torch.Tensor) -> torch.Tensor:
+    bg_val = target.amin(dim=(2, 3, 4), keepdim=True)
+    mask = (target > (bg_val + 1e-3)).float()
+    mask = _binary_dilate_3d(mask, kernel_size=5)
+    mask = _binary_erode_3d(mask, kernel_size=5)
+    mask = _binary_dilate_3d(mask, kernel_size=3)
+    return mask.clamp_(0.0, 1.0)
+
 
 def train_epoch(
     model: nn.Module,
@@ -837,10 +863,13 @@ def train_epoch(
     steps_per_epoch: int,   # Used only for progress bar calculation now if we iterate full loader
     pyramid_weight: float = 0.5,
     scaler: Optional[torch.amp.GradScaler] = None,
-    device: str = 'cuda'
+    device: str = 'cuda',
+    boundary_loss_fn: Optional[nn.Module] = None,
+    boundary_loss_weight: float = 0.0,
 ) -> float:
     model.train()
     total_loss = 0.0
+    total_boundary_loss = 0.0
     num_steps = 0
     total_grad_norm = 0.0
     num_grad_norm = 0
@@ -880,6 +909,7 @@ def train_epoch(
         target_float = target.float()
         warped_source_float = warped_source.float()
         displacement_float = displacement.float()
+        foreground_mask = build_foreground_mask(target_float)
         
         img_loss = image_loss_fn(target_float, warped_source_float).mean()
         
@@ -887,6 +917,9 @@ def train_epoch(
             img_loss = -img_loss
             
         grad_loss = grad_loss_fn(displacement_float).mean()
+        boundary_loss = displacement_float.new_tensor(0.0)
+        if boundary_loss_fn is not None and boundary_loss_weight > 0:
+            boundary_loss = boundary_loss_fn(warped_source_float, target_float, mask=foreground_mask)
         
         # --- Deep Supervision for DAPS/Pyramid coarse flows ---
         deep_sup_loss = 0.0
@@ -902,6 +935,8 @@ def train_epoch(
             
         # 注意：这里的 deep_sup_loss 只包含平滑度惩罚，因此需要乘上平滑度权重 loss_weights[1]
         loss = loss_weights[0] * img_loss + loss_weights[1] * (grad_loss + pyramid_weight * deep_sup_loss)
+        if boundary_loss_weight > 0:
+            loss = loss + boundary_loss_weight * boundary_loss
 
         if not torch.isfinite(loss):
             optimizer.zero_grad(set_to_none=True)
@@ -952,6 +987,7 @@ def train_epoch(
                 effective_update_steps += 1
 
         total_loss += loss.item()
+        total_boundary_loss += boundary_loss.item()
         # Track components for debugging
         # Note: We need to detach to avoid accumulation
         num_steps += 1
@@ -962,7 +998,8 @@ def train_epoch(
     update_ratio = effective_update_steps / max(num_steps, 1)
     if nonfinite_steps > 0:
         print(f'  [Warning] Non-finite train steps: {nonfinite_steps}/{num_steps}. Consider reducing lr or disabling AMP for this loss.')
-    return total_loss / num_steps, img_loss.item(), grad_loss.item() + (deep_sup_loss.item() if isinstance(deep_sup_loss, torch.Tensor) else 0), avg_grad_norm, update_ratio
+    avg_boundary_loss = total_boundary_loss / num_steps if num_steps > 0 else 0.0
+    return total_loss / num_steps, avg_boundary_loss, img_loss.item(), grad_loss.item() + (deep_sup_loss.item() if isinstance(deep_sup_loss, torch.Tensor) else 0), avg_grad_norm, update_ratio
 
 
 def compute_hd95(ground_truth, prediction, spacing=None):
@@ -1005,14 +1042,17 @@ def validate(
     grad_loss_fn: nn.Module,
     loss_weights: Sequence[float],
     device: str = 'cuda',
-    fast: bool = False  # Optimization: Skip slow metrics
+    fast: bool = False,  # Optimization: Skip slow metrics
+    boundary_loss_fn: Optional[nn.Module] = None,
+    boundary_loss_weight: float = 0.0,
 ):
     """
     Run lightweight validation for model selection.
-    Returns: avg_loss, avg_dice, avg_hd95, avg_time, avg_jac, avg_mag
+    Returns: avg_loss, avg_boundary_loss, avg_dice, avg_hd95, avg_time, avg_jac, avg_mag
     """
     model.eval()
     total_loss = 0.0
+    total_boundary_loss = 0.0
     total_dice = 0.0
     total_hd95 = 0.0 
     total_time = 0.0
@@ -1061,7 +1101,16 @@ def validate(
                 img_loss = image_loss_fn(target, warped_source)
             grad_loss = grad_loss_fn(displacement)
             loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
+            boundary_loss = displacement.new_tensor(0.0)
+            if boundary_loss_fn is not None and boundary_loss_weight > 0:
+                boundary_loss = boundary_loss_fn(
+                    warped_source.float(),
+                    target.float(),
+                    mask=build_foreground_mask(target.float()),
+                )
+                loss = loss + boundary_loss_weight * boundary_loss
             total_loss += loss.item()
+            total_boundary_loss += boundary_loss.item()
             num_batches += 1
 
             # Optimization: Skip Jacobian for validation set.
@@ -1126,13 +1175,14 @@ def validate(
                         num_hd95_batches += 1
 
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    avg_boundary_loss = total_boundary_loss / num_batches if num_batches > 0 else 0.0
     avg_dice = total_dice / num_dice_batches if num_dice_batches > 0 else 0.0
     avg_hd95 = total_hd95 / num_hd95_batches if num_hd95_batches > 0 else 0.0
     avg_time = total_time / num_batches if num_batches > 0 else 0.0
     avg_neg_jac = total_neg_jac / num_jac_batches if num_jac_batches > 0 else 0.0
     avg_mag = total_mag / num_batches if num_batches > 0 else 0.0
     
-    return avg_loss, avg_dice, avg_hd95, avg_time, avg_neg_jac, avg_mag
+    return avg_loss, avg_boundary_loss, avg_dice, avg_hd95, avg_time, avg_neg_jac, avg_mag
 
 
 def test_evaluate(
@@ -1142,15 +1192,18 @@ def test_evaluate(
     grad_loss_fn: nn.Module,
     loss_weights: Sequence[float],
     device: str = 'cuda',
-    fast: bool = False
+    fast: bool = False,
+    boundary_loss_fn: Optional[nn.Module] = None,
+    boundary_loss_weight: float = 0.0,
 ):
     """
     Run Comprehensive Testing. 
-    Returns detailed metrics: avg_loss, avg_dice, avg_hd95, avg_time, avg_reg_time, avg_jac, avg_mag, 
+    Returns detailed metrics: avg_loss, avg_boundary_loss, avg_dice, avg_hd95, avg_time, avg_reg_time, avg_jac, avg_mag, 
                               best_sample_idx, per_label_dice_dict, raw_sample_results
     """
     model.eval()
     total_loss = 0.0
+    total_boundary_loss = 0.0
     total_dice = 0.0
     total_dice_per_label = {} 
     total_label_counts = {} 
@@ -1203,7 +1256,16 @@ def test_evaluate(
                 img_loss = image_loss_fn(target, warped_source)
             grad_loss = grad_loss_fn(displacement)
             loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
+            boundary_loss = displacement.new_tensor(0.0)
+            if boundary_loss_fn is not None and boundary_loss_weight > 0:
+                boundary_loss = boundary_loss_fn(
+                    warped_source.float(),
+                    target.float(),
+                    mask=build_foreground_mask(target.float()),
+                )
+                loss = loss + boundary_loss_weight * boundary_loss
             total_loss += loss.item()
+            total_boundary_loss += boundary_loss.item()
             num_batches += 1
 
             # Jacobian (Conditional)
@@ -1350,6 +1412,7 @@ def test_evaluate(
     std_neg_jac = np.std(valid_jac_values) if valid_jac_values else 0.0
 
     avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
+    avg_boundary_loss = total_boundary_loss / num_batches if num_batches > 0 else 0.0
     avg_dice = total_dice / num_dice_batches if num_dice_batches > 0 else 0.0
     avg_time = total_time / num_batches if num_batches > 0 else 0.0
     avg_reg_time = total_reg_time / num_batches if num_batches > 0 else 0.0
@@ -1370,7 +1433,7 @@ def test_evaluate(
             avg_dice_per_label[l_key] = total_dice_per_label[l_key] / total_label_counts[l_key]
             std_dice_per_label[l_key] = np.std(label_dice_lists[l_key]) if label_dice_lists[l_key] else 0.0
     
-    return avg_loss, avg_dice, std_dice, avg_hd95, std_hd95, avg_time, avg_reg_time, avg_neg_jac, std_neg_jac, avg_mag, best_dice_idx, avg_dice_per_label, std_dice_per_label, raw_sample_results
+    return avg_loss, avg_boundary_loss, avg_dice, std_dice, avg_hd95, std_hd95, avg_time, avg_reg_time, avg_neg_jac, std_neg_jac, avg_mag, best_dice_idx, avg_dice_per_label, std_dice_per_label, raw_sample_results
 
 
 def main():
@@ -1420,11 +1483,30 @@ def main():
     parser.add_argument('--use-daps', action='store_true', help='Use original DAPS')
     parser.add_argument('--use-dsin', action='store_true', help='Use DSIN')
     parser.add_argument('--use-cmim', action='store_true', help='Use CMIM')
-    parser.add_argument('--use-wmca', action='store_true', help='Use WMCA (Local Window Attention)')
-    parser.add_argument('--use-pyramid', action='store_true', help='Use Pyramid feature supervision')
+    parser.add_argument('--use-cross-mamba', action='store_true', help='Use Cross-Mamba at deep decoder scales')
+    parser.add_argument('--use-wcv', action='store_true', help='Use window cost volume on deep skip features')
+    parser.add_argument('--use-swcv', action='store_true', help='Use structure-aware window cost volume on deep skip features')
+    parser.add_argument('--use-gcv', action='store_true', help='Use global cost volume on deep features')
+    parser.add_argument('--use-wmca', action='store_true', help='Legacy alias for --use-wcv')
+    parser.add_argument('--use-pyramid', action='store_true', help='Legacy flag kept for compatibility; deep supervision is controlled by --pyramid-weight')
     parser.add_argument('--decouple-layers', type=int, default=0, help='Number of shallow encoder layers with independent source/target weights in SiameseUNetBaseline')
     parser.add_argument('--fusion-method', type=str, default='compress_concat', choices=['add', 'concat', 'compress_concat'], help='Feature fusion method for Siamese encoder')
+    parser.add_argument('--encoder-type', type=str, default='cnn', choices=['cnn', 'mamba'], help='Backbone type for feature extraction')
+    parser.add_argument('--mamba-shallow-multi', action='store_true', help='Enable multi-axis shallow Mamba scanning at 1/8 scale')
+    parser.add_argument('--window-size', type=int, default=9, help='Window size for WCV and S-WCV')
+    parser.add_argument('--pdaps-flow-limit', type=float, default=20.0, help='Maximum physical flow limit for P-DAPS')
+    parser.add_argument('--use-boundary-branch', action='store_true', help='Enable lightweight boundary-guided feature modulation branch')
+    parser.add_argument('--boundary-branch-scales', type=str, default='deep', choices=['deep', 'all'], help='Apply boundary branch on deep features only or all encoder scales')
+    parser.add_argument('--boundary-branch-strength', type=float, default=0.5, help='Residual gate strength for the boundary feature branch')
+    parser.add_argument('--use-boundary-loss', action='store_true', help='Enable explicit boundary consistency loss between warped source and target')
+    parser.add_argument('--boundary-loss-weight', type=float, default=0.1, help='Weight for boundary consistency loss when enabled')
+    parser.add_argument('--boundary-loss-metric', type=str, default='ncc', choices=['ncc', 'l1'], help='Metric used by the boundary consistency loss')
+    parser.add_argument('--boundary-kernel', type=str, default='sobel', choices=['sobel', 'diff'], help='Fixed operator used to extract 3D boundary maps')
+    parser.add_argument('--boundary-smooth-kernel', type=int, default=3, help='Odd smoothing kernel size applied before boundary extraction')
     args = parser.parse_args()
+
+    if args.use_cmim and args.use_cross_mamba:
+        parser.error('--use-cmim and --use-cross-mamba are mutually exclusive interaction modules.')
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f'Using device: {device}')
@@ -1467,8 +1549,20 @@ def main():
             use_pdaps=args.use_pdaps,
             use_dsin=args.use_dsin,
             use_cmim=args.use_cmim,
-            use_wmca=args.use_wmca,
-            use_pyramid=args.use_pyramid
+            use_cross_mamba=args.use_cross_mamba,
+            use_wcv=(args.use_wcv or args.use_wmca),
+            use_swcv=args.use_swcv,
+            use_gcv=args.use_gcv,
+            encoder_type=args.encoder_type,
+            mamba_shallow_multi=args.mamba_shallow_multi,
+            fusion_method=args.fusion_method,
+            window_size=args.window_size,
+            pdaps_flow_limit=args.pdaps_flow_limit,
+            use_boundary_branch=args.use_boundary_branch,
+            boundary_branch_scales=args.boundary_branch_scales,
+            boundary_branch_strength=args.boundary_branch_strength,
+            boundary_kernel=args.boundary_kernel,
+            boundary_smooth_kernel=args.boundary_smooth_kernel,
         ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1501,6 +1595,13 @@ def main():
         image_loss_fn = ne.nn.modules.NCC(window_size=args.ncc_win, eps=1e-3).to(device)
 
     grad_loss_fn = ne.nn.modules.SpatialGradient('l2')
+    boundary_loss_fn = None
+    if args.use_boundary_loss:
+        boundary_loss_fn = vxm.nn.losses.BoundaryConsistencyLoss(
+            operator=args.boundary_kernel,
+            metric=args.boundary_loss_metric,
+            smooth_kernel_size=args.boundary_smooth_kernel,
+        ).to(device)
     loss_weights = [1.0, args.lambda_param]
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
@@ -1609,7 +1710,7 @@ def main():
 
     with open(log_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'train_loss', 'train_grad_norm', 'train_update_ratio', 'val_loss', 'test_loss', 'test_dice', 'test_dice_std', 'test_hd95', 'test_hd95_std', 'test_time_sec', 'test_reg_time_sec', 'test_jac', 'test_jac_std', 'test_mag', 'test_dice_per_label', 'test_dice_per_label_std'])
+        writer.writerow(['epoch', 'train_loss', 'train_boundary_loss', 'train_grad_norm', 'train_update_ratio', 'val_loss', 'val_boundary_loss', 'test_loss', 'test_boundary_loss', 'test_dice', 'test_dice_std', 'test_hd95', 'test_hd95_std', 'test_time_sec', 'test_reg_time_sec', 'test_jac', 'test_jac_std', 'test_mag', 'test_dice_per_label', 'test_dice_per_label_std'])
 
     best_loss = float('inf')
     best_test_dice = 0.0
@@ -1631,7 +1732,7 @@ def main():
     for epoch in range(args.epochs):
         epoch_start_time = time.time()
         
-        avg_loss, last_img_loss, last_grad_loss, avg_grad_norm, update_ratio = train_epoch(
+        avg_loss, train_boundary_loss, last_img_loss, last_grad_loss, avg_grad_norm, update_ratio = train_epoch(
             model=model,
             dataloader=train_loader,
             optimizer=optimizer,
@@ -1642,34 +1743,38 @@ def main():
             pyramid_weight=args.pyramid_weight,
             scaler=scaler,
             device=device,
+            boundary_loss_fn=boundary_loss_fn,
+            boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
         )
 
         # -----------------------------
         # Validation Phase
         # -----------------------------
         # Default values if val_loader is None
-        val_loss, val_dice, val_hd95, val_time, val_jac, val_mag = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        val_loss, val_boundary_loss, val_dice, val_hd95, val_time, val_jac, val_mag = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         current_monitor_loss = avg_loss
 
         if val_loader:
             # Optimization: Skip expensive metrics (HD95, Jacobian) 
             # We now skip Dice and HD95 and Mag for validation, only computing loss.
-            val_loss, val_dice, val_hd95, val_time, val_jac, val_mag = validate(
+            val_loss, val_boundary_loss, val_dice, val_hd95, val_time, val_jac, val_mag = validate(
                 model=model,
                 dataloader=val_loader,
                 image_loss_fn=image_loss_fn,
                 grad_loss_fn=grad_loss_fn,
                 loss_weights=loss_weights,
                 device=device,
-                fast=True
+                fast=True,
+                boundary_loss_fn=boundary_loss_fn,
+                boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
             )
             
-            print(f'Epoch {epoch + 1} | TrainTotal: {avg_loss:.4f} (Img: {last_img_loss:.4f}, Grad: {last_grad_loss:.6f}) | GradNorm: {avg_grad_norm:.6f}, UpdateRatio: {update_ratio:.2%}')
+            print(f'Epoch {epoch + 1} | TrainTotal: {avg_loss:.4f} (Img: {last_img_loss:.4f}, Grad: {last_grad_loss:.6f}, Boundary: {train_boundary_loss:.6f}) | GradNorm: {avg_grad_norm:.6f}, UpdateRatio: {update_ratio:.2%}')
             metric_suffix = " (Fast Val, Loss Only)"
-            print(f'         | Val Loss: {val_loss:.4f}{metric_suffix}')
+            print(f'         | Val Loss: {val_loss:.4f}, Val Boundary: {val_boundary_loss:.6f}{metric_suffix}')
             current_monitor_loss = val_loss
         else:
-            print(f'Epoch {epoch + 1}, Train Loss: {avg_loss:.6f}, GradNorm: {avg_grad_norm:.6f}, UpdateRatio: {update_ratio:.2%}')
+            print(f'Epoch {epoch + 1}, Train Loss: {avg_loss:.6f}, Train Boundary: {train_boundary_loss:.6f}, GradNorm: {avg_grad_norm:.6f}, UpdateRatio: {update_ratio:.2%}')
 
         if update_ratio < 0.1:
             print(f'  [Warning] Low effective update ratio ({update_ratio:.2%}). Model parameters may not be updating properly.')
@@ -1677,9 +1782,11 @@ def main():
         # -----------------------------
         # Test Phase (Detailed Evaluation)
         # -----------------------------
-        test_loss, test_dice, test_hd95, test_time, test_reg_time, test_jac, test_mag = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        test_loss, test_boundary_loss, test_dice, test_hd95, test_time, test_reg_time, test_jac, test_mag = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        test_dice_std, test_hd95_std, test_jac_std = 0.0, 0.0, 0.0
         test_best_idx = None
         test_dice_per_label = {}
+        test_dice_per_label_std = {}
         test_raw_results = []
         is_best_test_dice = False
         
@@ -1688,38 +1795,40 @@ def main():
         run_test_eval = (test_loader is not None)
 
         if run_test_eval:
-             # Evaluate on the test dataset
-             fast_eval = not run_full_metrics
-             test_loss, test_dice, test_dice_std, test_hd95, test_hd95_std, test_time, test_reg_time, test_jac, test_jac_std, test_mag, test_best_idx, test_dice_per_label, test_dice_per_label_std, test_raw_results = test_evaluate(
+            # Evaluate on the test dataset
+            fast_eval = not run_full_metrics
+            test_loss, test_boundary_loss, test_dice, test_dice_std, test_hd95, test_hd95_std, test_time, test_reg_time, test_jac, test_jac_std, test_mag, test_best_idx, test_dice_per_label, test_dice_per_label_std, test_raw_results = test_evaluate(
                 model=model,
                 dataloader=test_loader,
                 image_loss_fn=image_loss_fn,
                 grad_loss_fn=grad_loss_fn,
                 loss_weights=loss_weights,
                 device=device,
-                fast=fast_eval # HD95 only calculated if fast=False
-             )
-             
-             if test_dice > best_test_dice:
-                 best_test_dice = test_dice
-                 is_best_test_dice = True
-                 print(f'  [Monitor] * New best Test Dice: {best_test_dice:.6f} *')
-                 if fast_eval:
-                     pass # 关掉新高test_dice时计算hd95和jac，最大程度加快进度
+                fast=fast_eval, # HD95 only calculated if fast=False
+                boundary_loss_fn=boundary_loss_fn,
+                boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
+            )
+            
+            if test_dice > best_test_dice:
+                best_test_dice = test_dice
+                is_best_test_dice = True
+                print(f'  [Monitor] * New best Test Dice: {best_test_dice:.6f} *')
+                if fast_eval:
+                    pass # 关掉新高test_dice时计算hd95和jac，最大程度加快进度
 
-             test_label_metrics_str = ""
-             # 关掉明细dice打印
-             # if test_dice_per_label:
-             #    test_label_metrics_str = " | LabelDice: " + ", ".join([f"{k}:{v:.3f}±{test_dice_per_label_std[k]:.3f}" for k, v in test_dice_per_label.items()])
+            test_label_metrics_str = ""
+            # 关掉明细dice打印
+            # if test_dice_per_label:
+            #    test_label_metrics_str = " | LabelDice: " + ", ".join([f"{k}:{v:.3f}±{test_dice_per_label_std[k]:.3f}" for k, v in test_dice_per_label.items()])
 
-             metric_suffix = "" if run_full_metrics else (" (Fast Test -> Full)" if is_best_test_dice else " (Fast Test)")
-             print(f'  [Monitor] Test Dice: {test_dice:.6f}±{test_dice_std:.6f}, HD95: {test_hd95:.6f}±{test_hd95_std:.6f}, Loss: {test_loss:.6f}, Jac: {test_jac:.6f}±{test_jac_std:.6f}, Time: {test_time:.4f}s{test_label_metrics_str}{metric_suffix}')
-             
-             if is_best_test_dice:
-                 # Save best pt model based on test dice
-                 best_model_path = out_path.parent / f'{out_path.stem}_best_test.pt'
-                 torch.save(model.state_dict(), best_model_path)
-                 print(f'  [Monitor] Saved new best model to {best_model_path.name}')
+            metric_suffix = "" if run_full_metrics else (" (Fast Test -> Full)" if is_best_test_dice else " (Fast Test)")
+            print(f'  [Monitor] Test Dice: {test_dice:.6f}±{test_dice_std:.6f}, HD95: {test_hd95:.6f}±{test_hd95_std:.6f}, Loss: {test_loss:.6f}, Boundary: {test_boundary_loss:.6f}, Jac: {test_jac:.6f}±{test_jac_std:.6f}, Time: {test_time:.4f}s{test_label_metrics_str}{metric_suffix}')
+            
+            if is_best_test_dice:
+                # Save best pt model based on test dice
+                best_model_path = out_path.parent / f'{out_path.stem}_best_test.pt'
+                torch.save(model.state_dict(), best_model_path)
+                print(f'  [Monitor] Saved new best model to {best_model_path.name}')
 
              # Save detailed per-sample results for Boxplot ONLY when it's the best test dice
              # if is_best_test_dice or run_full_metrics:
@@ -1776,10 +1885,13 @@ def main():
             row = [
                 epoch + 1, 
                 fmt(avg_loss), 
+                fmt(train_boundary_loss),
                 fmt(avg_grad_norm),
                 fmt(update_ratio),
                 fmt(val_loss), 
+                fmt(val_boundary_loss),
                 fmt(test_loss), 
+                fmt(test_boundary_loss),
                 fmt(test_dice), 
                 fmt(test_dice_std),
                 fmt(test_hd95), 

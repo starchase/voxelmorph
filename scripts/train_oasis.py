@@ -78,7 +78,7 @@ def build_registration_model(args, device):
 
     if args.model_config == 'voxelmorph_baseline':
         ignored_flags = []
-        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv'):
+        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv', 'use_boundary_branch'):
             if getattr(args, flag):
                 ignored_flags.append(f'--{flag.replace("_", "-")}')
         if ignored_flags:
@@ -114,7 +114,12 @@ def build_registration_model(args, device):
             encoder_type=getattr(args, 'encoder_type', 'cnn'),
             mamba_shallow_multi=getattr(args, 'mamba_shallow_multi', False),
             window_size=getattr(args, 'window_size', 9),
-            pdaps_flow_limit=getattr(args, 'pdaps_flow_limit', 20.0)
+            pdaps_flow_limit=getattr(args, 'pdaps_flow_limit', 20.0),
+            use_boundary_branch=getattr(args, 'use_boundary_branch', False),
+            boundary_branch_scales=getattr(args, 'boundary_branch_scales', 'deep'),
+            boundary_branch_strength=getattr(args, 'boundary_branch_strength', 0.5),
+            boundary_kernel=getattr(args, 'boundary_kernel', 'sobel'),
+            boundary_smooth_kernel=getattr(args, 'boundary_smooth_kernel', 3),
         )
 
     return model.to(device)
@@ -437,9 +442,18 @@ def validate(
     model: nn.Module,
     dataloader: DataLoader,
     device: str = 'cuda',
-    compute_extra: bool = False
+    compute_extra: bool = False,
+    image_loss_fn: nn.Module = None,
+    grad_loss_fn: nn.Module = None,
+    loss_weights: list = None,
+    boundary_loss_fn: nn.Module = None,
+    boundary_loss_weight: float = 0.0,
+    use_mask: bool = False,
+    loss_type: str = 'mse',
 ) -> tuple:
     model.eval()
+    eval_loss = utils.AverageMeter()
+    eval_boundary_loss = utils.AverageMeter()
     eval_dsc = utils.AverageMeter()
     eval_hd95 = utils.AverageMeter()
     eval_jac = utils.AverageMeter()
@@ -463,6 +477,36 @@ def validate(
                 return_field_type='displacement'
             )
             displacement, warped_source = out[0], out[1]
+
+            target_float = y.float()
+            warped_float = warped_source.float()
+            if use_mask:
+                fg_mask = build_foreground_mask(target_float, y_seg)
+            else:
+                fg_mask = torch.ones_like(target_float)
+
+            boundary_loss = displacement.new_tensor(0.0)
+            if image_loss_fn is not None and grad_loss_fn is not None and loss_weights is not None:
+                if loss_type == 'mse':
+                    squared_diff = (target_float - warped_float) ** 2
+                    img_loss = (squared_diff * fg_mask).sum() / (fg_mask.sum() + 1e-8)
+                elif loss_type == 'ncc':
+                    if use_mask:
+                        img_loss = -image_loss_fn(target_float * fg_mask, warped_float * fg_mask).mean()
+                    else:
+                        img_loss = -image_loss_fn(target_float, warped_float).mean()
+                else:
+                    raise ValueError(f"Unsupported loss_type: {loss_type}")
+
+                grad_loss = grad_loss_fn(displacement.float()).mean()
+                loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
+
+                if boundary_loss_fn is not None and boundary_loss_weight > 0:
+                    boundary_loss = boundary_loss_fn(warped_float, target_float, mask=fg_mask)
+                    loss = loss + boundary_loss_weight * boundary_loss
+
+                eval_loss.update(loss.item(), x.size(0))
+                eval_boundary_loss.update(boundary_loss.item(), x.size(0))
 
             # Warp the segmentations with nearest neighbour
             def_out = reg_model(x_seg.float(), displacement)
@@ -513,8 +557,8 @@ def validate(
                     eval_hd95.update(batch_hd95_sum / batch_hd95_count, x.size(0))
 
     if compute_extra:
-        return eval_dsc.avg, eval_hd95.avg, eval_jac.avg, eval_mag.avg
-    return eval_dsc.avg
+        return eval_loss.avg, eval_boundary_loss.avg, eval_dsc.avg, eval_hd95.avg, eval_jac.avg, eval_mag.avg
+    return eval_loss.avg, eval_boundary_loss.avg, eval_dsc.avg
 
 def _binary_dilate_3d(mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
     return F.max_pool3d(mask, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
@@ -546,10 +590,13 @@ def train_epoch(
     amp_enabled: bool = True,
     use_mask: bool = False,
     loss_type: str = 'mse',
-    image_loss_fn_coarse: nn.Module = None
+    image_loss_fn_coarse: nn.Module = None,
+    boundary_loss_fn: nn.Module = None,
+    boundary_loss_weight: float = 0.0,
 ) -> float:
     model.train()
     total_loss = 0.0
+    total_boundary_loss = 0.0
     valid_batches = 0
 
     for batch_idx, data in enumerate(dataloader):
@@ -609,6 +656,9 @@ def train_epoch(
                 img_loss = -image_loss_fn(target_float, warped_float).mean()
         
         grad_loss = grad_loss_fn(displacement.float()).mean()
+        boundary_loss = displacement.new_tensor(0.0)
+        if boundary_loss_fn is not None and boundary_loss_weight > 0:
+            boundary_loss = boundary_loss_fn(warped_float, target_float, mask=fg_mask)
         
         # --- Deep Supervision for Pyramid/Coarse flows ---
         deep_sup_loss = displacement.new_tensor(0.0)
@@ -670,6 +720,8 @@ def train_epoch(
 
         grad_loss = torch.clamp(grad_loss, min=0.0, max=100.0)
         loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
+        if boundary_loss_weight > 0:
+            loss = loss + boundary_loss_weight * boundary_loss
         if deep_sup_loss.requires_grad or deep_sup_loss.item() != 0:
             loss = loss + deep_sup_loss # Add deep supervision component
 
@@ -677,7 +729,7 @@ def train_epoch(
         if not torch.isfinite(loss):
             print(
                 f"[WARN] Non-finite loss at batch {batch_idx}: "
-                f"img_loss={img_loss.item()}, grad_loss={grad_loss.item()}, total={loss.item()}"
+                f"img_loss={img_loss.item()}, grad_loss={grad_loss.item()}, boundary_loss={boundary_loss.item()}, total={loss.item()}"
             )
             # 彻底释放包含 NaN/Inf 计算图的所有局部变量，防止在遇到 NaN 直接 continue 时显存泄漏引发后续 OOM
             optimizer.zero_grad(set_to_none=True)
@@ -702,11 +754,12 @@ def train_epoch(
             optimizer.step()
             
         total_loss += loss.item()
+        total_boundary_loss += boundary_loss.item()
         valid_batches += 1
 
     if valid_batches == 0:
-        return float('nan')
-    return total_loss / valid_batches
+        return float('nan'), float('nan')
+    return total_loss / valid_batches, total_boundary_loss / valid_batches
 
 def main():
     parser = argparse.ArgumentParser(description='Train 3D VoxelMorph on OASIS data')
@@ -729,6 +782,14 @@ def main():
     parser.add_argument('--use-wcv', action='store_true', help='Enable window cross-attention on shallow skip features')
     parser.add_argument('--use-swcv', action='store_true', help='Enable Structure-Aware WCV on deep skip features')
     parser.add_argument('--use-gcv', action='store_true', help='Enable global cost volume on deep features')
+    parser.add_argument('--use-boundary-branch', action='store_true', help='Enable lightweight boundary-guided feature modulation branch')
+    parser.add_argument('--boundary-branch-scales', type=str, default='deep', choices=['deep', 'all'], help='Apply boundary branch on deep features only or all encoder scales')
+    parser.add_argument('--boundary-branch-strength', type=float, default=0.5, help='Residual gate strength for the boundary feature branch')
+    parser.add_argument('--use-boundary-loss', action='store_true', help='Enable explicit boundary consistency loss between warped source and target')
+    parser.add_argument('--boundary-loss-weight', type=float, default=0.1, help='Weight for boundary consistency loss when enabled')
+    parser.add_argument('--boundary-loss-metric', type=str, default='ncc', choices=['ncc', 'l1'], help='Metric used by the boundary consistency loss')
+    parser.add_argument('--boundary-kernel', type=str, default='sobel', choices=['sobel', 'diff'], help='Fixed operator used to extract 3D boundary maps')
+    parser.add_argument('--boundary-smooth-kernel', type=int, default=3, help='Odd smoothing kernel size applied before boundary extraction')
     parser.add_argument('--encoder-type', type=str, default='cnn', choices=['cnn', 'mamba'], help='Backbone type for feature extraction.')
     parser.add_argument('--mamba-shallow-multi', action='store_true', help='Enable multi-axis (d,h,w) scanning for 1/8 scale shallow features. If disabled, uses single axis (d) to remain stable.')
     parser.add_argument('--model-config', type=str, default='dual_stream', choices=['dual_stream', 'voxelmorph_baseline'], help='Choose between the current dual-stream Siamese setup and the standard Voxelmorph baseline')
@@ -785,6 +846,13 @@ def main():
         image_loss_fn_coarse = ne.nn.modules.MSE()
         
     grad_loss_fn = ne.nn.modules.SpatialGradient('l2')
+    boundary_loss_fn = None
+    if args.use_boundary_loss:
+        boundary_loss_fn = vxm.nn.losses.BoundaryConsistencyLoss(
+            operator=args.boundary_kernel,
+            metric=args.boundary_loss_metric,
+            smooth_kernel_size=args.boundary_smooth_kernel,
+        ).to(device)
     loss_weights = [1.0, args.lambda_param]
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     
@@ -852,7 +920,7 @@ def main():
     # Initialize Logger
     with open(log_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'train_loss', 'val_dsc', 'val_hd95', 'val_jac', 'val_mag'])
+        writer.writerow(['epoch', 'train_loss', 'train_boundary_loss', 'val_loss', 'val_boundary_loss', 'val_dsc', 'val_hd95', 'val_jac', 'val_mag'])
 
     # Training loop
     print(f'Training for {args.epochs} epochs...')
@@ -869,7 +937,7 @@ def main():
     for epoch in range(args.epochs):
         epoch_start_time = time.time()
         
-        avg_loss = train_epoch(
+        avg_loss, train_boundary_loss = train_epoch(
             model=model,
             dataloader=train_loader,
             optimizer=optimizer,
@@ -882,16 +950,25 @@ def main():
             amp_enabled=amp_enabled,
             use_mask=args.use_mask,
             loss_type=args.loss.lower(),
-            image_loss_fn_coarse=image_loss_fn_coarse
+            image_loss_fn_coarse=image_loss_fn_coarse,
+            boundary_loss_fn=boundary_loss_fn,
+            boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
         )
         loss_history.append(avg_loss)
         
         # Calculate Validation metrics (Fast: only DSC)
-        val_dsc = validate(
+        val_loss, val_boundary_loss, val_dsc = validate(
             model=model,
             dataloader=val_loader,
             device=device,
-            compute_extra=False
+            compute_extra=False,
+            image_loss_fn=image_loss_fn,
+            grad_loss_fn=grad_loss_fn,
+            loss_weights=loss_weights,
+            boundary_loss_fn=boundary_loss_fn,
+            boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
+            use_mask=args.use_mask,
+            loss_type=args.loss.lower(),
         )
         
         # Decide if we need to compute heavy extra metrics (HD95, Jac, Mag)
@@ -910,9 +987,16 @@ def main():
                 model=model,
                 dataloader=val_loader,
                 device=device,
-                compute_extra=True
+                compute_extra=True,
+                image_loss_fn=image_loss_fn,
+                grad_loss_fn=grad_loss_fn,
+                loss_weights=loss_weights,
+                boundary_loss_fn=boundary_loss_fn,
+                boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
+                use_mask=args.use_mask,
+                loss_type=args.loss.lower(),
             )
-            _, val_hd95, val_jac, val_mag = val_res_extra
+            _, _, _, val_hd95, val_jac, val_mag = val_res_extra
         else:
             val_hd95, val_jac, val_mag = np.nan, np.nan, np.nan
             
@@ -927,9 +1011,9 @@ def main():
         
         current_lr = optimizer.param_groups[0]['lr']
         if compute_extra:
-            print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Val DSC: {val_dsc:.6f}, HD95: {val_hd95:.2f}, Jac: {val_jac:.4f}, Mag: {val_mag:.4f}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s, Peak: {peak_gpu_mem:.2f}MB')
+            print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Boundary: {train_boundary_loss:.6f}, Val Loss: {val_loss:.6f}, Val Boundary: {val_boundary_loss:.6f}, Val DSC: {val_dsc:.6f}, HD95: {val_hd95:.2f}, Jac: {val_jac:.4f}, Mag: {val_mag:.4f}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s, Peak: {peak_gpu_mem:.2f}MB')
         else:
-            print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Val DSC: {val_dsc:.6f}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s, Peak: {peak_gpu_mem:.2f}MB')
+            print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Boundary: {train_boundary_loss:.6f}, Val Loss: {val_loss:.6f}, Val Boundary: {val_boundary_loss:.6f}, Val DSC: {val_dsc:.6f}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s, Peak: {peak_gpu_mem:.2f}MB')
 
         # Save visualizations periodically or when a new best model is found to reduce epoch overhead
         save_vis = compute_extra
@@ -945,6 +1029,9 @@ def main():
             writer.writerow([
                 epoch + 1, 
                 f"{avg_loss:.6f}", 
+                f"{train_boundary_loss:.6f}",
+                f"{val_loss:.6f}",
+                f"{val_boundary_loss:.6f}",
                 f"{val_dsc:.6f}", 
                 f"{val_hd95:.2f}" if compute_extra else "",
                 f"{val_jac:.6f}" if compute_extra else "",
