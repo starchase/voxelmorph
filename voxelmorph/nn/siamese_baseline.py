@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .modules import SpatialTransformer, IntegrateVelocityField
+from .modules import SpatialTransformer, IntegrateVelocityField, FixedGradientMagnitude3D
 from .cross_mamba import CrossMambaModule
 from .vss_mamba import VSSBlock3D
 
@@ -172,6 +172,27 @@ class DAPS_PLR_Block(nn.Module):
         return skip_concat, coarse_flow
 
 
+class BoundaryGuidanceBlock(nn.Module):
+    """
+    Lightweight boundary-aware feature modulation block.
+    """
+
+    def __init__(self, ndim, channels, hidden_channels=None):
+        super().__init__()
+        Conv = getattr(nn, f'Conv{ndim}d')
+        hidden_channels = hidden_channels or max(channels // 4, 8)
+        self.gate = nn.Sequential(
+            Conv(2, hidden_channels, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2),
+            Conv(hidden_channels, channels, kernel_size=1),
+        )
+
+    def forward(self, feature, primary_boundary, secondary_boundary, strength=0.5):
+        boundary_context = torch.cat([primary_boundary, secondary_boundary], dim=1).to(feature.dtype)
+        boundary_gate = torch.sigmoid(self.gate(boundary_context))
+        return feature * (1.0 + strength * boundary_gate)
+
+
 
 class StructureAwareWindowCostVolume3D(nn.Module):
     """
@@ -282,7 +303,8 @@ class SiameseUNetBaseline(nn.Module):
     - No Frequency Domain Alignment yet
     """
     def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False, use_pdaps=False, use_dsin=False, use_cmim=False, use_cross_mamba=False, use_wcv=False,
-                 use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, fusion_method='compress_concat', window_size=9, pdaps_flow_limit=20.0):
+                 use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, fusion_method='compress_concat', window_size=9, pdaps_flow_limit=20.0, use_boundary_branch=False,
+                 boundary_branch_scales='deep', boundary_branch_strength=0.5, boundary_kernel='sobel', boundary_smooth_kernel=3):
         super().__init__()
         self.inshape = inshape
         self.ndim = ndim
@@ -298,6 +320,9 @@ class SiameseUNetBaseline(nn.Module):
         self.use_swcv = use_swcv
         self.use_gcv = use_gcv
         self.encoder_type = encoder_type
+        self.use_boundary_branch = use_boundary_branch
+        self.boundary_branch_scales = boundary_branch_scales
+        self.boundary_branch_strength = boundary_branch_strength
         
         # --- [Architectural Refactoring] ---
         # Note: P-DAPS natively encapsulates coarse-to-fine deformation (previously isolated as 'pyramid').
@@ -310,6 +335,22 @@ class SiameseUNetBaseline(nn.Module):
             encoder_type=encoder_type,
             mamba_shallow_multi=mamba_shallow_multi
         )
+
+        self.boundary_feature_indices = []
+        self.boundary_guidance = nn.ModuleDict()
+        if self.use_boundary_branch:
+            if boundary_branch_scales == 'all':
+                self.boundary_feature_indices = list(range(len(enc_nf)))
+            else:
+                self.boundary_feature_indices = list(range(max(0, len(enc_nf) - 2), len(enc_nf)))
+
+            self.boundary_extractor = FixedGradientMagnitude3D(
+                operator=boundary_kernel,
+                smooth_kernel_size=boundary_smooth_kernel,
+                normalize=True,
+            )
+            for idx in self.boundary_feature_indices:
+                self.boundary_guidance[str(idx)] = BoundaryGuidanceBlock(ndim, enc_nf[idx])
         
         # 1.5 Cross-Modal Interaction Module
         # CMIM: apply at 1/8 and 1/16 scales
@@ -426,6 +467,10 @@ class SiameseUNetBaseline(nn.Module):
         else:
             self.integrate = None
 
+    def _resize_boundary(self, boundary_map, feature):
+        mode = 'trilinear' if self.ndim == 3 else 'bilinear'
+        return F.interpolate(boundary_map, size=feature.shape[2:], mode=mode, align_corners=False)
+
     def forward(self, source, target, return_warped_source=True, return_field_type='displacement', return_coarse_flows=False):
         # --- [Ablation 1 Hook: FDA will go here] ---
         source_input = source
@@ -433,6 +478,26 @@ class SiameseUNetBaseline(nn.Module):
         
         # 1. Feature Extraction (Decoupled/Shared)
         feat_s, feat_t = self.encoder(source_input, target_input)
+
+        if self.use_boundary_branch:
+            source_boundary = self.boundary_extractor(source_input)
+            target_boundary = self.boundary_extractor(target_input)
+            for idx in self.boundary_feature_indices:
+                source_boundary_scale = self._resize_boundary(source_boundary, feat_s[idx]).to(feat_s[idx].dtype)
+                target_boundary_scale = self._resize_boundary(target_boundary, feat_t[idx]).to(feat_t[idx].dtype)
+                boundary_block = self.boundary_guidance[str(idx)]
+                feat_s[idx] = boundary_block(
+                    feat_s[idx],
+                    source_boundary_scale,
+                    target_boundary_scale,
+                    strength=self.boundary_branch_strength,
+                )
+                feat_t[idx] = boundary_block(
+                    feat_t[idx],
+                    target_boundary_scale,
+                    source_boundary_scale,
+                    strength=self.boundary_branch_strength,
+                )
         
         coarse_flows = []
         pyramid_acc_flow = None

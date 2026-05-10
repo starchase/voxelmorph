@@ -12,10 +12,15 @@ import csv
 import logging
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+import sys
 import time
 from pathlib import Path
 from typing import Sequence, List, Optional
 import scipy.ndimage
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # Set allocator to avoid fragmentation issues
 os.environ['PYTORCH_ALLOC_CONF'] = 'expandable_segments:True'
