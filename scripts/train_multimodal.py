@@ -38,6 +38,61 @@ import neurite as ne
 import voxelmorph as vxm
 
 
+def is_nifti_file(path: Path) -> bool:
+    return path.is_file() and (path.name.endswith('.nii') or path.name.endswith('.nii.gz'))
+
+
+def list_nifti_files(directory: Path) -> List[Path]:
+    if directory is None or not directory.exists():
+        return []
+    return sorted([path for path in directory.iterdir() if is_nifti_file(path)])
+
+
+def discover_mask_dir(image_dir: Path) -> Optional[Path]:
+    split_dir = image_dir.parent.parent
+    mask_dir = split_dir / 'masks' / image_dir.name
+    return mask_dir if mask_dir.exists() else None
+
+
+def load_volume_tensor(path: Path, clamp_to_unit: bool = False, binarize: bool = False) -> torch.Tensor:
+    volume = nib.load(str(path)).get_fdata().astype(np.float32)
+    if clamp_to_unit:
+        volume = np.clip(volume, 0.0, 1.0)
+    if binarize:
+        volume = (volume > 0.5).astype(np.float32)
+    return torch.from_numpy(volume).float().unsqueeze(0)
+
+
+def compute_loss_mask(batch, displacement: torch.Tensor, device: str) -> Optional[torch.Tensor]:
+    mask_parts = []
+
+    if 'target_mask' in batch:
+        target_mask = batch['target_mask'].to(device, non_blocking=True)
+        mask_parts.append((target_mask > 0.5).float())
+
+    if 'source_mask' in batch:
+        source_mask = batch['source_mask'].to(device, non_blocking=True)
+        with torch.no_grad():
+            trf = vxm.nn.modules.SpatialTransformer(interpolation_mode='nearest').to(device)
+            warped_source_mask = trf(source_mask.float(), displacement.detach())
+            mask_parts.append((warped_source_mask > 0.5).float())
+
+    if not mask_parts:
+        return None
+
+    return torch.clamp(sum(mask_parts), min=0.0, max=1.0)
+
+
+def compute_image_loss(image_loss_fn: nn.Module, target: torch.Tensor, warped_source: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    if isinstance(image_loss_fn, ne.nn.modules.NCC):
+        return -image_loss_fn(target, warped_source).mean()
+
+    if isinstance(image_loss_fn, (vxm.nn.losses.MINDLoss, vxm.nn.losses.JointMIMINDLoss)):
+        return image_loss_fn(target, warped_source, mask=mask).mean()
+
+    return image_loss_fn(target, warped_source).mean()
+
+
 class MultimodalTrainDataset(torch.utils.data.Dataset):
     """Dataset yielding CT (source) / MR (target) pairs.
     
@@ -47,6 +102,8 @@ class MultimodalTrainDataset(torch.utils.data.Dataset):
     def __init__(self, ct_dir: str, mr_dir: str, paired_ct_dir: str = None, paired_mr_dir: str = None, device: str = 'cpu', unpaired: bool = True, max_samples: int = 100):
         self.ct_dir = Path(ct_dir)
         self.mr_dir = Path(mr_dir)
+        self.ct_mask_dir = discover_mask_dir(self.ct_dir)
+        self.mr_mask_dir = discover_mask_dir(self.mr_dir)
         # self.device = device # Don't move to GPU in dataset, do it in training loop
         self.max_samples = max_samples if max_samples is not None else 100
         
@@ -55,25 +112,29 @@ class MultimodalTrainDataset(torch.utils.data.Dataset):
         self.cache = {}
         
         # 1. Load Unpaired Pool
-        self.ct_paths = sorted([p for p in self.ct_dir.iterdir() if p.suffix and not p.name.startswith('.')])
-        self.mr_paths = sorted([p for p in self.mr_dir.iterdir() if p.suffix and not p.name.startswith('.')])
+        self.ct_paths = list_nifti_files(self.ct_dir)
+        self.mr_paths = list_nifti_files(self.mr_dir)
+        self.ct_masks = {path.name: path for path in list_nifti_files(self.ct_mask_dir)} if self.ct_mask_dir else {}
+        self.mr_masks = {path.name: path for path in list_nifti_files(self.mr_mask_dir)} if self.mr_mask_dir else {}
         
         # 2. Load Fixed Semi-Supervised Pairs
         self.fixed_pairs = []
         if paired_ct_dir and paired_mr_dir:
             self.fixed_ct_dir = Path(paired_ct_dir)
             self.fixed_mr_dir = Path(paired_mr_dir)
+            self.fixed_ct_mask_dir = discover_mask_dir(self.fixed_ct_dir)
+            self.fixed_mr_mask_dir = discover_mask_dir(self.fixed_mr_dir)
+            self.fixed_ct_masks = {path.name: path for path in list_nifti_files(self.fixed_ct_mask_dir)} if self.fixed_ct_mask_dir else {}
+            self.fixed_mr_masks = {path.name: path for path in list_nifti_files(self.fixed_mr_mask_dir)} if self.fixed_mr_mask_dir else {}
             
             if self.fixed_ct_dir.exists() and self.fixed_mr_dir.exists():
-                f_cts = sorted([p for p in self.fixed_ct_dir.iterdir() if p.suffix and not p.name.startswith('.')])
+                f_cts = list_nifti_files(self.fixed_ct_dir)
                 # Minimal matching logic for these fixed pairs (assuming 0001 <-> 0000 or same name stem)
                 mr_map = {}
-                for p in self.fixed_mr_dir.iterdir():
-                    if p.suffix and not p.name.startswith('.'):
-                        # Key extraction: AbdomenMRCT_0009_0000 -> AbdomenMRCT_0009
-                        stem = p.name.replace('.nii.gz', '').replace('.nii', '')
-                        if stem.endswith('_0000'): stem = stem[:-5]
-                        mr_map[stem] = p
+                for p in list_nifti_files(self.fixed_mr_dir):
+                    stem = p.name.replace('.nii.gz', '').replace('.nii', '')
+                    if stem.endswith('_0000'): stem = stem[:-5]
+                    mr_map[stem] = p
                 
                 for ct in f_cts:
                     stem = ct.name.replace('.nii.gz', '').replace('.nii', '')
@@ -94,10 +155,18 @@ class MultimodalTrainDataset(torch.utils.data.Dataset):
         if getattr(self, 'use_cache', False):
             cache_key = str(path)
             if cache_key not in self.cache:
-                img = torch.from_numpy(np.clip(nib.load(str(path)).get_fdata().astype(np.float32), 0.0, 1.0)).float().unsqueeze(0)
+                img = load_volume_tensor(path, clamp_to_unit=True)
                 self.cache[cache_key] = img
             return self.cache[cache_key]
-        return torch.from_numpy(np.clip(nib.load(str(path)).get_fdata().astype(np.float32), 0.0, 1.0)).float().unsqueeze(0)
+        return load_volume_tensor(path, clamp_to_unit=True)
+
+    def _load_mask(self, path):
+        if getattr(self, 'use_cache', False):
+            cache_key = f'mask::{path}'
+            if cache_key not in self.cache:
+                self.cache[cache_key] = load_volume_tensor(path, binarize=True)
+            return self.cache[cache_key]
+        return load_volume_tensor(path, binarize=True)
 
     def __getitem__(self, idx):
         # Strategy: 
@@ -118,7 +187,21 @@ class MultimodalTrainDataset(torch.utils.data.Dataset):
         ct = self._load_img(ct_path)
         mr = self._load_img(mr_path)
 
-        return {'source': ct, 'target': mr}
+        sample = {'source': ct, 'target': mr}
+
+        if idx < self.max_samples:
+            ct_masks = self.ct_masks
+            mr_masks = self.mr_masks
+        else:
+            ct_masks = getattr(self, 'fixed_ct_masks', {})
+            mr_masks = getattr(self, 'fixed_mr_masks', {})
+
+        if ct_path.name in ct_masks:
+            sample['source_mask'] = self._load_mask(ct_masks[ct_path.name])
+        if mr_path.name in mr_masks:
+            sample['target_mask'] = self._load_mask(mr_masks[mr_path.name])
+
+        return sample
 def save_qualitative_results(
     model,
     dataset,
@@ -767,23 +850,25 @@ class MultimodalValidationDataset(torch.utils.data.Dataset):
         self.mr_dir = Path(mr_dir)
         self.ct_label_dir = Path(ct_label_dir) if ct_label_dir else None
         self.mr_label_dir = Path(mr_label_dir) if mr_label_dir else None
+        self.ct_mask_dir = discover_mask_dir(self.ct_dir)
+        self.mr_mask_dir = discover_mask_dir(self.mr_dir)
         self.device = device
-        self.ct_paths = sorted([p for p in self.ct_dir.iterdir() if p.suffix and not p.name.startswith('.')])
-        self.mr_paths = sorted([p for p in self.mr_dir.iterdir() if p.suffix and not p.name.startswith('.')])
+        self.ct_paths = list_nifti_files(self.ct_dir)
+        self.mr_paths = list_nifti_files(self.mr_dir)
         
         # Verify labels exist if requested
         self.ct_labels = {}
         if self.ct_label_dir:
-            for p in self.ct_label_dir.iterdir():
-                 if p.suffix:
-                     # Assumes label filename matches image filename or is discoverable
-                     self.ct_labels[p.name] = p
+            for p in list_nifti_files(self.ct_label_dir):
+                self.ct_labels[p.name] = p
 
         self.mr_labels = {}
         if self.mr_label_dir:
-            for p in self.mr_label_dir.iterdir():
-                 if p.suffix:
-                     self.mr_labels[p.name] = p
+            for p in list_nifti_files(self.mr_label_dir):
+                self.mr_labels[p.name] = p
+
+        self.ct_masks = {path.name: path for path in list_nifti_files(self.ct_mask_dir)} if self.ct_mask_dir else {}
+        self.mr_masks = {path.name: path for path in list_nifti_files(self.mr_mask_dir)} if self.mr_mask_dir else {}
 
         self.pairs = []
         
@@ -838,10 +923,18 @@ class MultimodalValidationDataset(torch.utils.data.Dataset):
         if getattr(self, 'use_cache', False):
             cache_key = str(path)
             if cache_key not in self.cache:
-                img = torch.from_numpy(np.clip(nib.load(str(path)).get_fdata().astype(np.float32), 0.0, 1.0)).float().unsqueeze(0)
+                img = load_volume_tensor(path, clamp_to_unit=True)
                 self.cache[cache_key] = img
             return self.cache[cache_key]
-        return torch.from_numpy(np.clip(nib.load(str(path)).get_fdata().astype(np.float32), 0.0, 1.0)).float().unsqueeze(0)
+        return load_volume_tensor(path, clamp_to_unit=True)
+
+    def _load_mask(self, path):
+        if getattr(self, 'use_cache', False):
+            cache_key = f'mask::{path}'
+            if cache_key not in self.cache:
+                self.cache[cache_key] = load_volume_tensor(path, binarize=True)
+            return self.cache[cache_key]
+        return load_volume_tensor(path, binarize=True)
 
     def _load_lbl(self, path):
         if getattr(self, 'use_cache', False):
@@ -861,6 +954,11 @@ class MultimodalValidationDataset(torch.utils.data.Dataset):
         mr = self._load_img(mr_path)
         
         sample = {'source': ct, 'target': mr}
+
+        if ct_path.name in self.ct_masks:
+            sample['source_mask'] = self._load_mask(self.ct_masks[ct_path.name])
+        if mr_path.name in self.mr_masks:
+            sample['target_mask'] = self._load_mask(self.mr_masks[mr_path.name])
 
         # Load labels if available and filenames match
         if self.ct_label_dir and ct_path.name in self.ct_labels:
@@ -915,7 +1013,7 @@ def train_epoch(
     loss_weights: Sequence[float],
     steps_per_epoch: int,   # Used only for progress bar calculation now if we iterate full loader
     pyramid_weight: float = 0.5,
-    scaler: Optional[torch.amp.GradScaler] = None,
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,
     device: str = 'cuda',
     boundary_loss_fn: Optional[nn.Module] = None,
     boundary_loss_weight: float = 0.0,
@@ -963,11 +1061,11 @@ def train_epoch(
         warped_source_float = warped_source.float()
         displacement_float = displacement.float()
         foreground_mask = build_foreground_mask(target_float)
-        
-        img_loss = image_loss_fn(target_float, warped_source_float).mean()
-        
-        if isinstance(image_loss_fn, ne.nn.modules.NCC):
-            img_loss = -img_loss
+        loss_mask = compute_loss_mask(batch, displacement_float, device=device)
+        if loss_mask is None:
+            loss_mask = foreground_mask
+
+        img_loss = compute_image_loss(image_loss_fn, target_float, warped_source_float, mask=loss_mask)
             
         grad_loss = grad_loss_fn(displacement_float).mean()
         boundary_loss = displacement_float.new_tensor(0.0)
@@ -1148,10 +1246,10 @@ def validate(
             total_time += (batch_time / source.shape[0])
             
             # 3. Loss
-            if isinstance(image_loss_fn, ne.nn.modules.NCC):
-                img_loss = -image_loss_fn(target, warped_source)
-            else:
-                img_loss = image_loss_fn(target, warped_source)
+            loss_mask = compute_loss_mask(batch, displacement, device=device)
+            if loss_mask is None:
+                loss_mask = build_foreground_mask(target.float())
+            img_loss = compute_image_loss(image_loss_fn, target, warped_source, mask=loss_mask)
             grad_loss = grad_loss_fn(displacement)
             loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
             boundary_loss = displacement.new_tensor(0.0)
@@ -1303,10 +1401,10 @@ def test_evaluate(
             total_mag += disp_mag.mean().item()
 
             # Loss
-            if isinstance(image_loss_fn, ne.nn.modules.NCC):
-                img_loss = -image_loss_fn(target, warped_source)
-            else:
-                img_loss = image_loss_fn(target, warped_source)
+            loss_mask = compute_loss_mask(batch, displacement, device=device)
+            if loss_mask is None:
+                loss_mask = build_foreground_mask(target.float())
+            img_loss = compute_image_loss(image_loss_fn, target, warped_source, mask=loss_mask)
             grad_loss = grad_loss_fn(displacement)
             loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
             boundary_loss = displacement.new_tensor(0.0)
@@ -1748,6 +1846,7 @@ def main():
         f.write(f"MIND Radius: {args.mind_radius}\n")
         f.write(f"MIND Dilation: {args.mind_dilation}\n")
         f.write(f"MIND Eps: {args.mind_eps}\n")
+        f.write(f"Auto MIND Foreground Mask: {args.image_loss in ['mind', 'mi_mind']}\n")
         f.write(f"MI Weight: {args.mi_weight}\n")
         f.write(f"MIND Weight: {args.mind_weight}\n")
         f.write(f"Lambda: {args.lambda_param}\n")

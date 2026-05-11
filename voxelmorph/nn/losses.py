@@ -108,9 +108,9 @@ class MutualInformation(torch.nn.Module):
         y_pred = torch.clamp(y_pred, 0., self.max_clip)
         y_true = torch.clamp(y_true, 0, self.max_clip)
 
-        y_true = y_true.view(y_true.shape[0], -1)
+        y_true = y_true.reshape(y_true.shape[0], -1)
         y_true = torch.unsqueeze(y_true, 2)
-        y_pred = y_pred.view(y_pred.shape[0], -1)
+        y_pred = y_pred.reshape(y_pred.shape[0], -1)
         y_pred = torch.unsqueeze(y_pred, 2)
 
         nb_voxels = y_pred.shape[1] # total num of voxels
@@ -320,9 +320,13 @@ class MINDLoss(nn.Module):
             bg_val = y_true.amin()  # 自动推断背景值 (一般是 0 或 -1)
             mask = (y_true > bg_val + 1e-3) | (y_pred > bg_val + 1e-3)
             
+        mask = mask.to(device=mse.device, dtype=mse.dtype)
+        if mask.shape[1] == 1 and mse.shape[1] != 1:
+            mask = mask.expand(-1, mse.shape[1], -1, -1, -1)
+
         mse = mse * mask
         # 归一化仅针对前景区域
-        return torch.sum(mse) / (mask.sum() * mse.shape[1] + 1e-8)
+        return torch.sum(mse) / mask.sum().clamp_min(1.0)
 
 
 class JointMIMINDLoss(nn.Module):
@@ -338,10 +342,10 @@ class JointMIMINDLoss(nn.Module):
         self.mi_weight = mi_weight
         self.mind_weight = mind_weight
         
-    def forward(self, target, source):
+    def forward(self, target, source, mask=None):
         # MutualInformation already returns -MI, so we minimize it directly
         loss_mi = self.mi_loss(target, source)
-        loss_mind = self.mind_loss(target, source)
+        loss_mind = self.mind_loss(target, source, mask=mask)
         
         return self.mi_weight * loss_mi + self.mind_weight * loss_mind
 
