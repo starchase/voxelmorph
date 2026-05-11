@@ -270,11 +270,32 @@ class MIND(torch.nn.Module):
         self.register_buffer('mshift1', mshift1)
         self.register_buffer('mshift2', mshift2)
         
-    def forward(self, y_true, y_pred):
+    def _forward_impl(self, y_true, y_pred, mask=None):
+        loss_map = (self.mind_ssc(y_true) - self.mind_ssc(y_pred)) ** 2
+
+        if mask is None:
+            return torch.mean(loss_map)
+
+        if mask.dim() != y_true.dim():
+            raise ValueError(
+                f'MIND mask must have shape compatible with inputs. Got mask {tuple(mask.shape)} '
+                f'for input {tuple(y_true.shape)}.'
+            )
+
+        mask = mask.to(device=loss_map.device, dtype=loss_map.dtype)
+        if mask.shape[1] == 1 and loss_map.shape[1] != 1:
+            mask = mask.expand(-1, loss_map.shape[1], -1, -1, -1)
+
+        masked_loss = loss_map * mask
+        normalizer = mask.sum().clamp_min(1.0)
+        return masked_loss.sum() / normalizer
+
+    def forward(self, y_true, y_pred, mask=None):
         """
         Computes the MSE of the MIND-SSC features between the fixed and moving images.
+        Optionally restricts the loss to a foreground mask in target space.
         """
-        return torch.mean((self.mind_ssc(y_true) - self.mind_ssc(y_pred)) ** 2)
+        return self._forward_impl(y_true, y_pred, mask=mask)
 
     def mind_ssc(self, img):
         """
