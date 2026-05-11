@@ -8,6 +8,7 @@ This script assumes preprocessed volumes live in `processed/ct/image` and
 """
 import argparse
 import collections
+from contextlib import nullcontext
 import csv
 import logging
 import os
@@ -15,7 +16,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import sys
 import time
 from pathlib import Path
-from typing import Sequence, List, Optional
+from typing import Any, Sequence, List, Optional
 import scipy.ndimage
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -91,6 +92,29 @@ def compute_image_loss(image_loss_fn: nn.Module, target: torch.Tensor, warped_so
         return image_loss_fn(target, warped_source, mask=mask).mean()
 
     return image_loss_fn(target, warped_source).mean()
+
+
+if hasattr(torch, 'amp') and hasattr(torch.amp, 'GradScaler'):
+    def create_grad_scaler(device: str, enabled: bool):
+        try:
+            return torch.amp.GradScaler(device, enabled=enabled)
+        except TypeError:
+            return torch.amp.GradScaler(enabled=enabled)
+
+    def amp_autocast(device: str, dtype: torch.dtype, enabled: bool):
+        if not enabled:
+            return nullcontext()
+        return torch.amp.autocast(device_type=device, dtype=dtype)
+else:
+    def create_grad_scaler(device: str, enabled: bool):
+        if device == 'cuda':
+            return torch.cuda.amp.GradScaler(enabled=enabled)
+        return None
+
+    def amp_autocast(device: str, dtype: torch.dtype, enabled: bool):
+        if not enabled or device != 'cuda':
+            return nullcontext()
+        return torch.cuda.amp.autocast(dtype=dtype)
 
 
 class MultimodalTrainDataset(torch.utils.data.Dataset):
@@ -1027,7 +1051,7 @@ def train_epoch(
     loss_weights: Sequence[float],
     steps_per_epoch: int,   # Used only for progress bar calculation now if we iterate full loader
     pyramid_weight: float = 0.5,
-    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    scaler: Optional[Any] = None,
     device: str = 'cuda',
     boundary_loss_fn: Optional[nn.Module] = None,
     boundary_loss_weight: float = 0.0,
@@ -1045,7 +1069,8 @@ def train_epoch(
 
     # Keep AMP scaler persistent across epochs. If not provided, fallback to local scaler.
     if scaler is None:
-        scaler = torch.amp.GradScaler('cuda', enabled=(device == 'cuda'))
+        scaler = create_grad_scaler(device, enabled=(device == 'cuda'))
+    amp_enabled = scaler is not None and (not hasattr(scaler, 'is_enabled') or scaler.is_enabled())
 
     # Prefer bfloat16 for better numeric range when available (especially for MI/localMI).
     amp_dtype = torch.bfloat16 if (device == 'cuda' and torch.cuda.is_bf16_supported()) else torch.float16
@@ -1061,7 +1086,7 @@ def train_epoch(
         source = batch['source'].to(device, non_blocking=True)
         target = batch['target'].to(device, non_blocking=True)
 
-        with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=(scaler is not None)):
+        with amp_autocast(device, dtype=amp_dtype, enabled=amp_enabled):
             use_feature_edge_loss = feature_edge_loss_weight > 0 and hasattr(model, '_feature_edge_loss')
             if use_feature_edge_loss:
                 out = model(
@@ -1128,7 +1153,10 @@ def train_epoch(
             continue
         
         # Optimization: Scaled Backward
-        scaler.scale(loss).backward()
+        if scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
         # Unscale before grad-norm computation so the value is meaningful.
         if scaler is not None and scaler.is_enabled():
@@ -1148,9 +1176,9 @@ def train_epoch(
                 grad_sq_sum += torch.sum(g * g).item()
 
         if has_nonfinite_grad:
-            scaler.step(optimizer)
-            scaler.update()
             optimizer.zero_grad(set_to_none=True)
+            if scaler is not None:
+                scaler.update()
             nonfinite_steps += 1
             num_steps += 1
             continue
@@ -1161,8 +1189,11 @@ def train_epoch(
 
         # Monitor whether parameters are updated this step.
         before_ref = ref_param.detach().clone() if ref_param is not None else None
-        scaler.step(optimizer)
-        scaler.update()
+        if scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
 
         if before_ref is not None:
             delta = (ref_param.detach() - before_ref).abs().mean().item()
@@ -1706,7 +1737,7 @@ def main():
     parser.add_argument('--use-gcv', action='store_true', help='Use global cost volume on deep features')
     parser.add_argument('--use-wmca', action='store_true', help='Legacy alias for --use-wcv')
     parser.add_argument('--use-pyramid', action='store_true', help='Legacy flag kept for compatibility; deep supervision is controlled by --pyramid-weight')
-    parser.add_argument('--decouple-layers', type=int, default=0, help='Number of shallow encoder layers with independent source/target weights in SiameseUNetBaseline')
+    parser.add_argument('--decouple-layers', type=int, default=2, help='Number of shallow encoder layers with independent source/target weights in SiameseUNetBaseline')
     parser.add_argument('--fusion-method', type=str, default='compress_concat', choices=['add', 'concat', 'compress_concat'], help='Feature fusion method for Siamese encoder')
     parser.add_argument('--encoder-type', type=str, default='cnn', choices=['cnn', 'mamba'], help='Backbone type for feature extraction')
     parser.add_argument('--mamba-shallow-multi', action='store_true', help='Enable multi-axis shallow Mamba scanning at 1/8 scale')
@@ -1947,7 +1978,7 @@ def main():
     epoch_times = []
 
     # Persistent scaler across all epochs (important for stable AMP training)
-    scaler = torch.amp.GradScaler('cuda', enabled=(device == 'cuda'))
+    scaler = create_grad_scaler(device, enabled=(device == 'cuda'))
 
     # 记录训练前的初始 GPU 显存
     if device == 'cuda':
