@@ -244,25 +244,31 @@ class MIND(torch.nn.Module):
         self.radius = radius
         self.dilation = dilation
         
-        # 3D 12-neighborhood definition (MIND-SSC)
-        # Represents shifts: (x, y, z)
-        six_neighborhood = torch.Tensor([[0, 1, 0],
-                                         [1, 0, 0],
-                                         [0, 0, 1],
-                                         [0,-1, 0],
-                                         [-1,0, 0],
-                                         [0, 0,-1]])
-        
-        # Generates the 12 edges of the cube (SSC patch differences)
-        import math
-        dist = F.pdist(six_neighborhood)
-        edges = torch.combinations(torch.arange(6), 2)[dist == math.sqrt(2)]
-        
-        # Create displacement variables
-        displacement = six_neighborhood[edges[:, 0]] - six_neighborhood[edges[:, 1]]
-        
-        # Shift masks for Conv3d
-        self.register_buffer('displacement', displacement.view(12, 3, 1, 1, 1).long())
+        six_neighborhood = torch.tensor(
+            [[0, 1, 1],
+             [1, 1, 0],
+             [1, 0, 1],
+             [1, 1, 2],
+             [2, 1, 1],
+             [1, 2, 1]],
+            dtype=torch.long,
+        )
+
+        distances = torch.cdist(six_neighborhood.float(), six_neighborhood.float(), p=2)
+        x, y = torch.meshgrid(torch.arange(6), torch.arange(6), indexing='ij')
+        edge_mask = (x > y) & torch.isclose(distances, torch.tensor(2.0).sqrt())
+
+        shift1 = six_neighborhood[x[edge_mask]]
+        shift2 = six_neighborhood[y[edge_mask]]
+
+        mshift1 = torch.zeros(12, 1, 3, 3, 3)
+        mshift2 = torch.zeros(12, 1, 3, 3, 3)
+        for idx in range(12):
+            mshift1[idx, 0, shift1[idx, 0], shift1[idx, 1], shift1[idx, 2]] = 1
+            mshift2[idx, 0, shift2[idx, 0], shift2[idx, 1], shift2[idx, 2]] = 1
+
+        self.register_buffer('mshift1', mshift1)
+        self.register_buffer('mshift2', mshift2)
         
     def forward(self, y_true, y_pred):
         """
@@ -274,41 +280,30 @@ class MIND(torch.nn.Module):
         """
         Compute the MIND-SSC descriptor for a 3D image.
         """
-        # Padding to avoid border issues during shifts
-        pad = self.dilation
-        img_padded = F.pad(img, (pad, pad, pad, pad, pad, pad), mode='replicate')
-        
-        # Compute patch distances
-        Dp = []
-        for i in range(12):
-            dx, dy, dz = (self.displacement[i, :, 0, 0, 0] * self.dilation).tolist()
-            
-            # Shift image
-            shifted_img = img_padded[
-                :, :, 
-                pad+dz : img_padded.shape[2]-pad+dz,
-                pad+dy : img_padded.shape[3]-pad+dy,
-                pad+dx : img_padded.shape[4]-pad+dx
-            ]
-            
-            # Squared difference metric
-            Dp.append((img - shifted_img)**2)
-            
-        Dp = torch.cat(Dp, dim=1)
-        
-        # Compute local variance using average pooling (equivalent to uniform convolution)
-        kernel = torch.ones([1, 1, 3, 3, 3], device=img.device) / 27.0
-        
-        # Grouped conv to apply mean filter channel-wise
-        V = F.conv3d(Dp, kernel.repeat(12, 1, 1, 1, 1), padding=1, groups=12)
-        
-        # Estimate variance (mean of min distances)
-        # Using the smallest 6 distances to approximate variance structurally
-        V_min, _ = torch.min(V, dim=1, keepdim=True)
-        # Added small epsilon for numerical stability
-        V = V_min + 1e-5 
+        if img.shape[1] != 1:
+            raise ValueError(f'MIND expects single-channel inputs, got {img.shape[1]} channels.')
 
-        # Calculate MIND-SSC features (exponentiated normalized distances)
-        mind = torch.exp(-Dp / V)
-        
-        return mind
+        padded_img = F.pad(
+            img,
+            [self.dilation] * 6,
+            mode='replicate',
+        )
+
+        dist = (
+            F.conv3d(padded_img, self.mshift1, dilation=self.dilation)
+            - F.conv3d(padded_img, self.mshift2, dilation=self.dilation)
+        ) ** 2
+        dist = F.avg_pool3d(
+            dist,
+            kernel_size=2 * self.radius + 1,
+            stride=1,
+            padding=self.radius,
+        )
+
+        mind = dist - torch.min(dist, dim=1, keepdim=True)[0]
+        mind_var = torch.mean(mind, dim=1, keepdim=True)
+        mind_var_mean = torch.mean(mind_var.detach())
+        mind_var = torch.clamp(mind_var, min=mind_var_mean * 0.001, max=mind_var_mean * 1000)
+        mind = torch.exp(-mind / (mind_var + 1e-8))
+
+        return mind[:, [6, 8, 1, 11, 2, 10, 0, 7, 9, 4, 5, 3], ...]
