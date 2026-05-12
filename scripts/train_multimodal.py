@@ -47,6 +47,10 @@ class MultimodalTrainDataset(torch.utils.data.Dataset):
         # 1. Load Unpaired Pool
         self.ct_paths = sorted([p for p in self.ct_dir.iterdir() if p.suffix and not p.name.startswith('.')])
         self.mr_paths = sorted([p for p in self.mr_dir.iterdir() if p.suffix and not p.name.startswith('.')])
+        self.all_random_pairs = [(ct_path, mr_path) for ct_path in self.ct_paths for mr_path in self.mr_paths]
+        self.total_random_pairs = len(self.all_random_pairs)
+        self.random_sample_count = min(self.max_samples, self.total_random_pairs)
+        self.current_random_pairs = []
         
         # 2. Load Fixed Semi-Supervised Pairs
         self.fixed_pairs = []
@@ -72,28 +76,37 @@ class MultimodalTrainDataset(torch.utils.data.Dataset):
                     if stem in mr_map:
                         self.fixed_pairs.append((ct, mr_map[stem]))
         
+        self.resample_epoch()
+
         print(f"Training Dataset: {len(self.ct_paths)} Unpaired CTs, {len(self.mr_paths)} Unpaired MRs.")
+        print(f"                  = {self.total_random_pairs} Total Random CT-MR Pairs")
         print(f"                  + {len(self.fixed_pairs)} Fixed Pairs found in {paired_ct_dir if paired_ct_dir else 'None'}")
-        print(f"                  Epoch Length: {self.max_samples} Random + {len(self.fixed_pairs)} Fixed = {self.max_samples + len(self.fixed_pairs)}")
+        print(f"                  Epoch Length: {self.random_sample_count} Random (Without Replacement) + {len(self.fixed_pairs)} Fixed = {self.random_sample_count + len(self.fixed_pairs)}")
+
+    def resample_epoch(self):
+        import random
+
+        if self.random_sample_count >= self.total_random_pairs:
+            self.current_random_pairs = list(self.all_random_pairs)
+            random.shuffle(self.current_random_pairs)
+        else:
+            self.current_random_pairs = random.sample(self.all_random_pairs, k=self.random_sample_count)
 
     def __len__(self):
         # Epoch length = Random Samples + Fixed Pairs
-        return self.max_samples + len(self.fixed_pairs)
+        return len(self.current_random_pairs) + len(self.fixed_pairs)
 
     def __getitem__(self, idx):
         # Strategy: 
-        # Indices [0 ... max_samples-1] -> Randomly sampled unpaired data
-        # Indices [max_samples ... end] -> Fixed paired data
+        # Indices [0 ... random_sample_count-1] -> Epoch-specific random subset without replacement
+        # Indices [random_sample_count ... end] -> Fixed paired data
         
-        if idx < self.max_samples:
-            # Random Unpaired Mode
-            import random
-            ct_path = random.choice(self.ct_paths)
-            mr_path = random.choice(self.mr_paths)
+        if idx < len(self.current_random_pairs):
+            ct_path, mr_path = self.current_random_pairs[idx]
         else:
             # Fixed Paired Mode
             # Map idx back to 0..N range
-            fixed_idx = idx - self.max_samples
+            fixed_idx = idx - len(self.current_random_pairs)
             ct_path, mr_path = self.fixed_pairs[fixed_idx]
             
         ct_nii = nib.load(str(ct_path))
@@ -1172,10 +1185,6 @@ def test_evaluate(
             end_time = time.time()
             total_time += ((end_time - start_time) / source.shape[0])
             
-            # Metrics: Magnitude
-            disp_mag = torch.sqrt(torch.sum(displacement ** 2, dim=1))
-            total_mag += disp_mag.mean().item()
-
             # Loss
             if isinstance(image_loss_fn, ne.nn.modules.NCC):
                 img_loss = -image_loss_fn(target, warped_source)
@@ -1185,6 +1194,11 @@ def test_evaluate(
             loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
             total_loss += loss.item()
             num_batches += 1
+
+            # Extra metrics (Conditional)
+            if not fast:
+                disp_mag = torch.sqrt(torch.sum(displacement ** 2, dim=1))
+                total_mag += disp_mag.mean().item()
 
             # Jacobian (Conditional)
             disp_np = displacement.detach().cpu().numpy()
@@ -1334,7 +1348,7 @@ def test_evaluate(
     avg_time = total_time / num_batches if num_batches > 0 else 0.0
     avg_reg_time = total_reg_time / num_batches if num_batches > 0 else 0.0
     avg_neg_jac = total_neg_jac / num_jac_batches if num_jac_batches > 0 else 0.0
-    avg_mag = total_mag / num_batches if num_batches > 0 else 0.0
+    avg_mag = total_mag / num_batches if (not fast and num_batches > 0) else 0.0
     
     # Calculate Per-Label Average Dice and Std
     avg_dice_per_label = {}
@@ -1541,10 +1555,11 @@ def main():
 
     with open(log_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'train_loss', 'test_dice', 'test_hd95', 'test_jac', 'test_mag', 'train_grad_norm', 'train_update_ratio', 'val_loss', 'test_loss', 'test_dice_std', 'test_hd95_std', 'test_jac_std', 'test_time_sec', 'test_reg_time_sec', 'test_dice_per_label', 'test_dice_per_label_std'])
+        writer.writerow(['epoch', 'train_loss', 'train_time_sec', 'test_dice', 'test_hd95', 'test_jac', 'test_mag', 'train_grad_norm', 'train_update_ratio', 'val_loss', 'test_loss', 'test_dice_std', 'test_hd95_std', 'test_jac_std', 'test_time_sec', 'test_reg_time_sec', 'test_dice_per_label', 'test_dice_per_label_std'])
 
     best_loss = float('inf')
     best_test_dice = 0.0
+    BEST_TEST_DICE_EXTRA_THRESHOLD = 0.42
     # Threshold for "acceptable" folding (NegJac ratio). 
     # If NegJac > 0.01 (1%), we consider the deformation unrealistic despite high Dice.
     NEG_JAC_THRESHOLD = 0.01 
@@ -1556,6 +1571,8 @@ def main():
 
     print(f'Training for {args.epochs} epochs...')
     for epoch in range(args.epochs):
+        dataset.resample_epoch()
+        train_start_time = time.time()
         avg_loss, last_img_loss, last_grad_loss, avg_grad_norm, update_ratio = train_epoch(
             model=model,
             dataloader=train_loader,
@@ -1567,6 +1584,7 @@ def main():
             scaler=scaler,
             device=device,
         )
+        train_time = time.time() - train_start_time
 
         # -----------------------------
         # Validation Phase
@@ -1588,12 +1606,12 @@ def main():
                 fast=True
             )
             
-            print(f'Epoch {epoch + 1} | TrainTotal: {avg_loss:.4f} (Img: {last_img_loss:.4f}, Grad: {last_grad_loss:.6f}) | GradNorm: {avg_grad_norm:.6f}, UpdateRatio: {update_ratio:.2%}')
+            print(f'Epoch {epoch + 1} | TrainTotal: {avg_loss:.4f} (Img: {last_img_loss:.4f}, Grad: {last_grad_loss:.6f}) | GradNorm: {avg_grad_norm:.6f}, UpdateRatio: {update_ratio:.2%}, TrainTime: {train_time:.2f}s')
             metric_suffix = " (Fast Val, Loss Only)"
             print(f'         | Val Loss: {val_loss:.4f}{metric_suffix}')
             current_monitor_loss = val_loss
         else:
-            print(f'Epoch {epoch + 1}, Train Loss: {avg_loss:.6f}, GradNorm: {avg_grad_norm:.6f}, UpdateRatio: {update_ratio:.2%}')
+            print(f'Epoch {epoch + 1}, Train Loss: {avg_loss:.6f}, GradNorm: {avg_grad_norm:.6f}, UpdateRatio: {update_ratio:.2%}, TrainTime: {train_time:.2f}s')
 
         if update_ratio < 0.1:
             print(f'  [Warning] Low effective update ratio ({update_ratio:.2%}). Model parameters may not be updating properly.')
@@ -1602,13 +1620,16 @@ def main():
         # Test Phase (Detailed Evaluation)
         # -----------------------------
         test_loss, test_dice, test_hd95, test_time, test_reg_time, test_jac, test_mag = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+        test_dice_std, test_hd95_std, test_jac_std = 0.0, 0.0, 0.0
         test_best_idx = None
         test_dice_per_label = {}
+        test_dice_per_label_std = {}
         test_raw_results = []
         is_best_test_dice = False
         
-        # Optimization: Always run test evaluation to get Dice and HD95 for CSV, skip slow metrics (Jac) unless run_full_metrics
-        run_full_metrics = ((epoch + 1) == 1) or ((epoch + 1) % 5 == 0)
+        # Follow train_oasis.py cadence: first epoch and then every 10 epochs.
+        # If a new best Dice appears on a non-extra epoch, only rerun full metrics when Dice is high enough.
+        run_full_metrics = (epoch == 0 or (epoch + 1) % 10 == 0)
         run_test_eval = (test_loader is not None)
 
         if run_test_eval:
@@ -1628,16 +1649,29 @@ def main():
                  best_test_dice = test_dice
                  is_best_test_dice = True
                  print(f'  [Monitor] * New best Test Dice: {best_test_dice:.6f} *')
-                 if fast_eval:
-                     pass # 关掉新高test_dice时计算hd95和jac，最大程度加快进度
+             
+             if is_best_test_dice and (not run_full_metrics) and (test_dice > BEST_TEST_DICE_EXTRA_THRESHOLD):
+                 print(f'  [Monitor] New best Dice exceeds {BEST_TEST_DICE_EXTRA_THRESHOLD:.2f}; computing extra metrics and visualization...')
+                 run_full_metrics = True
+                 test_loss, test_dice, test_dice_std, test_hd95, test_hd95_std, test_time, test_reg_time, test_jac, test_jac_std, test_mag, test_best_idx, test_dice_per_label, test_dice_per_label_std, test_raw_results = test_evaluate(
+                    model=model,
+                    dataloader=test_loader,
+                    image_loss_fn=image_loss_fn,
+                    grad_loss_fn=grad_loss_fn,
+                    loss_weights=loss_weights,
+                    device=device,
+                    fast=False
+                 )
 
              test_label_metrics_str = ""
              # 关掉明细dice打印
              # if test_dice_per_label:
              #    test_label_metrics_str = " | LabelDice: " + ", ".join([f"{k}:{v:.3f}±{test_dice_per_label_std[k]:.3f}" for k, v in test_dice_per_label.items()])
 
-             metric_suffix = "" if run_full_metrics else (" (Fast Test -> Full)" if is_best_test_dice else " (Fast Test)")
-             print(f'  [Monitor] Test Dice: {test_dice:.6f}±{test_dice_std:.6f}, HD95: {test_hd95:.6f}±{test_hd95_std:.6f}, Loss: {test_loss:.6f}, Jac: {test_jac:.6f}±{test_jac_std:.6f}, Time: {test_time:.4f}s{test_label_metrics_str}{metric_suffix}')
+             if run_full_metrics:
+                 print(f'  [Monitor] Test Dice: {test_dice:.6f}±{test_dice_std:.6f}, HD95: {test_hd95:.6f}±{test_hd95_std:.6f}, Loss: {test_loss:.6f}, Jac: {test_jac:.6f}±{test_jac_std:.6f}, Mag: {test_mag:.6f}, Time: {test_time:.4f}s{test_label_metrics_str}')
+             else:
+                 print(f'  [Monitor] Test Dice: {test_dice:.6f}±{test_dice_std:.6f}, Loss: {test_loss:.6f}, Time: {test_time:.4f}s{test_label_metrics_str} (Fast Test)')
              
              if is_best_test_dice:
                  # Save best pt model based on test dice
@@ -1700,17 +1734,18 @@ def main():
             row = [
                 epoch + 1, 
                 fmt(avg_loss), 
+                fmt(train_time),
                 fmt(test_dice), 
-                fmt(test_hd95), 
-                fmt(test_jac), 
-                fmt(test_mag), 
+                fmt(test_hd95) if run_full_metrics else '', 
+                fmt(test_jac) if run_full_metrics else '', 
+                fmt(test_mag) if run_full_metrics else '', 
                 fmt(avg_grad_norm),
                 fmt(update_ratio),
                 fmt(val_loss), 
                 fmt(test_loss), 
                 fmt(test_dice_std),
-                fmt(test_hd95_std),
-                fmt(test_jac_std),
+                fmt(test_hd95_std) if run_full_metrics else '',
+                fmt(test_jac_std) if run_full_metrics else '',
                 fmt(test_time), 
                 fmt(test_reg_time), 
                 test_dice_per_label_str,
@@ -1723,7 +1758,7 @@ def main():
         # -----------------------------
         # Visualization
         # -----------------------------
-        do_visualization = is_best_test_dice or run_full_metrics
+        do_visualization = run_full_metrics
         
         if do_visualization:
             vis_dataset = None
