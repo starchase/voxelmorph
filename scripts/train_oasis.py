@@ -712,7 +712,9 @@ def train_epoch(
 ) -> float:
     model.train()
     total_loss = 0.0
-    total_boundary_loss = 0.0
+    total_img_loss = 0.0
+    total_grad_loss = 0.0
+    total_feature_edge_loss = 0.0
     valid_batches = 0
 
     for batch_idx, data in enumerate(dataloader):
@@ -883,12 +885,19 @@ def train_epoch(
             optimizer.step()
             
         total_loss += loss.item()
-        total_boundary_loss += boundary_loss.item()
+        total_img_loss += img_loss.item()
+        total_grad_loss += grad_loss.item()
+        total_feature_edge_loss += feature_edge_loss.float().item()
         valid_batches += 1
 
     if valid_batches == 0:
-        return float('nan'), float('nan')
-    return total_loss / valid_batches, total_boundary_loss / valid_batches
+            return float('nan'), float('nan'), float('nan'), float('nan')
+    return (
+        total_loss / valid_batches,
+        total_img_loss / valid_batches,
+        total_grad_loss / valid_batches,
+        total_feature_edge_loss / valid_batches,
+    )
 
 def main():
     parser = argparse.ArgumentParser(description='Train 3D VoxelMorph on OASIS data')
@@ -925,6 +934,7 @@ def main():
     parser.add_argument('--use-feature-edge-loss', action='store_true', help='Enable feature-level multi-scale gradient magnitude consistency on encoder features')
     parser.add_argument('--feature-edge-loss-weight', type=float, default=0.05, help='Weight for feature-level multi-scale gradient magnitude consistency loss')
     parser.add_argument('--feature-edge-scales', type=str, default='1/2,1/4', help='Comma-separated encoder scales or indices for feature edge loss, e.g. 1/2,1/4 or 0,1')
+    parser.add_argument('--feature-edge-start-epoch', type=int, default=1, help='Enable feature-edge loss from this 1-based epoch index; e.g. 5 starts applying it at epoch 5')
     parser.add_argument('--encoder-type', type=str, default='cnn', choices=['cnn', 'mamba'], help='Backbone type for feature extraction.')
     parser.add_argument('--mamba-shallow-multi', action='store_true', help='Enable multi-axis (d,h,w) scanning for 1/8 scale shallow features. If disabled, uses single axis (d) to remain stable.')
     parser.add_argument('--model-config', type=str, default='dual_stream', choices=['dual_stream', 'voxelmorph_baseline'], help='Choose between the current dual-stream Siamese setup and the standard Voxelmorph baseline')
@@ -951,6 +961,8 @@ def main():
         parser.error('--boundary-ring-inner-kernel and --boundary-ring-outer-kernel must be positive integers.')
     if args.boundary_ring_outer_kernel < args.boundary_ring_inner_kernel:
         parser.error('--boundary-ring-outer-kernel must be greater than or equal to --boundary-ring-inner-kernel.')
+    if args.feature_edge_start_epoch < 1:
+        parser.error('--feature-edge-start-epoch must be a positive integer.')
 
     # Set device
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
@@ -994,7 +1006,7 @@ def main():
         ).to(device)
     loss_weights = [1.0, args.lambda_param]
     feature_edge_indices = parse_feature_edge_indices(args.feature_edge_scales)
-    active_feature_edge_loss_weight = args.feature_edge_loss_weight if args.use_feature_edge_loss else 0.0
+    base_feature_edge_loss_weight = args.feature_edge_loss_weight if args.use_feature_edge_loss else 0.0
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     
     # Scheduler: Warmup (Linear) then Cosine annealing to gradually lower LR
@@ -1054,7 +1066,8 @@ def main():
         f.write(f"Epochs: {args.epochs}\n")
         f.write(f"Batch Size: {args.batch_size}\n")
         f.write(f"Lambda: {args.lambda_param}\n")
-        f.write(f"Feature Edge Loss Weight: {active_feature_edge_loss_weight}\n")
+        f.write(f"Feature Edge Loss Weight: {base_feature_edge_loss_weight}\n")
+        f.write(f"Feature Edge Start Epoch: {args.feature_edge_start_epoch}\n")
         f.write(f"Feature Edge Scales: {args.feature_edge_scales}\n")
         f.write(f"LR: {args.lr}\n")
         f.write(f"Integration Steps: {args.integration_steps}\n")
@@ -1063,7 +1076,7 @@ def main():
     # Initialize Logger
     with open(log_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'train_loss', 'train_boundary_loss', 'val_loss', 'val_boundary_loss', 'val_dsc', 'val_hd95', 'val_jac', 'val_mag'])
+        writer.writerow(['epoch', 'train_loss', 'train_img_loss', 'train_grad_loss', 'train_feature_edge_loss', 'val_dsc', 'val_hd95', 'val_jac', 'val_mag'])
 
     # Training loop
     print(f'Training for {args.epochs} epochs...')
@@ -1082,8 +1095,10 @@ def main():
         epoch_num = epoch + 1
         boundary_loss_active = args.use_boundary_loss and (epoch_num > args.boundary_loss_start_epoch)
         active_boundary_loss_weight = args.boundary_loss_weight if boundary_loss_active else 0.0
+        feature_edge_active = args.use_feature_edge_loss and (epoch_num >= args.feature_edge_start_epoch)
+        active_feature_edge_loss_weight = base_feature_edge_loss_weight if feature_edge_active else 0.0
         
-        avg_loss, train_boundary_loss = train_epoch(
+        avg_loss, train_img_loss, train_grad_loss, train_feature_edge_loss = train_epoch(
             model=model,
             dataloader=train_loader,
             optimizer=optimizer,
@@ -1107,7 +1122,7 @@ def main():
         loss_history.append(avg_loss)
         
         # Calculate Validation metrics (Fast: only DSC)
-        val_loss, val_boundary_loss, val_dsc = validate(
+        _, _, val_dsc = validate(
             model=model,
             dataloader=val_loader,
             device=device,
@@ -1167,9 +1182,9 @@ def main():
         
         current_lr = optimizer.param_groups[0]['lr']
         if compute_extra:
-            print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Boundary: {train_boundary_loss:.6f}, Val Loss: {val_loss:.6f}, Val Boundary: {val_boundary_loss:.6f}, Val DSC: {val_dsc:.6f}, HD95: {val_hd95:.2f}, Jac: {val_jac:.4f}, Mag: {val_mag:.4f}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s, Peak: {peak_gpu_mem:.2f}MB')
+            print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Img: {train_img_loss:.6f}, Grad: {train_grad_loss:.6f}, FeatureEdge: {train_feature_edge_loss:.6f}, Val DSC: {val_dsc:.6f}, HD95: {val_hd95:.2f}, Jac: {val_jac:.4f}, Mag: {val_mag:.4f}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s, Peak: {peak_gpu_mem:.2f}MB')
         else:
-            print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Boundary: {train_boundary_loss:.6f}, Val Loss: {val_loss:.6f}, Val Boundary: {val_boundary_loss:.6f}, Val DSC: {val_dsc:.6f}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s, Peak: {peak_gpu_mem:.2f}MB')
+            print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Img: {train_img_loss:.6f}, Grad: {train_grad_loss:.6f}, FeatureEdge: {train_feature_edge_loss:.6f}, Val DSC: {val_dsc:.6f}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s, Peak: {peak_gpu_mem:.2f}MB')
 
         # Save visualizations periodically or when a new best model is found to reduce epoch overhead
         save_vis = compute_extra
@@ -1195,9 +1210,9 @@ def main():
             writer.writerow([
                 epoch + 1, 
                 f"{avg_loss:.6f}", 
-                f"{train_boundary_loss:.6f}",
-                f"{val_loss:.6f}",
-                f"{val_boundary_loss:.6f}",
+                f"{train_img_loss:.6f}",
+                f"{train_grad_loss:.6f}",
+                f"{train_feature_edge_loss:.6f}",
                 f"{val_dsc:.6f}", 
                 f"{val_hd95:.2f}" if compute_extra else "",
                 f"{val_jac:.6f}" if compute_extra else "",
