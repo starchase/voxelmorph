@@ -24,6 +24,7 @@ import matplotlib.pyplot as plt
 import nibabel as nib
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import IterableDataset, DataLoader
 from tqdm import tqdm
@@ -57,7 +58,48 @@ def load_volume_tensor(path: Path, clamp_to_unit: bool = False, binarize: bool =
     return torch.from_numpy(volume).float().unsqueeze(0)
 
 
-def compute_loss_mask(batch, displacement: torch.Tensor, device: str) -> Optional[torch.Tensor]:
+def _binary_dilate_3d(mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    return F.max_pool3d(mask, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+
+
+def _binary_erode_3d(mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    return 1.0 - F.max_pool3d(1.0 - mask, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+
+
+def build_foreground_mask(image: torch.Tensor) -> torch.Tensor:
+    bg_val = image.amin(dim=(2, 3, 4), keepdim=True)
+    mask = (image > (bg_val + 1e-3)).float()
+    mask = _binary_dilate_3d(mask, kernel_size=5)
+    mask = _binary_erode_3d(mask, kernel_size=5)
+    mask = _binary_dilate_3d(mask, kernel_size=3)
+    return mask.clamp_(0.0, 1.0)
+
+
+def compute_loss_mask(batch, displacement: torch.Tensor, device: str, mode: str = 'manual') -> Optional[torch.Tensor]:
+    if mode == 'none':
+        return None
+
+    if mode == 'auto':
+        mask_parts = []
+
+        if 'target' in batch:
+            target = batch['target'].to(device, non_blocking=True)
+            mask_parts.append(build_foreground_mask(target))
+
+        if 'source' in batch:
+            source = batch['source'].to(device, non_blocking=True)
+            source_mask = build_foreground_mask(source)
+            with torch.no_grad():
+                trf = vxm.nn.modules.SpatialTransformer(interpolation_mode='nearest').to(device)
+                warped_source_mask = trf(source_mask.float(), displacement.detach())
+                mask_parts.append((warped_source_mask > 0.5).float())
+
+        if not mask_parts:
+            return None
+
+        combined_mask = torch.clamp(sum(mask_parts), min=0.0, max=1.0)
+        return combined_mask
+
     mask_parts = []
 
     if 'target_mask' in batch:
@@ -895,7 +937,8 @@ def train_epoch(
     loss_weights: Sequence[float],
     steps_per_epoch: int,   # Used only for progress bar calculation now if we iterate full loader
     scaler: Optional[torch.cuda.amp.GradScaler] = None,
-    device: str = 'cuda'
+    device: str = 'cuda',
+    loss_mask_mode: str = 'manual'
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -938,7 +981,7 @@ def train_epoch(
             if field_type == 'velocity':
                 with torch.no_grad():
                     displacement_for_mask = model.velocity_field_integrator(field_float.detach())
-            loss_mask = compute_loss_mask(batch, displacement_for_mask, device=device)
+            loss_mask = compute_loss_mask(batch, displacement_for_mask, device=device, mode=loss_mask_mode)
 
             with torch.cuda.amp.autocast(enabled=False):
                 img_loss = compute_image_loss(image_loss_fn, target_float, warped_source_float, mask=loss_mask)
@@ -953,7 +996,7 @@ def train_epoch(
             if field_type == 'velocity':
                 with torch.no_grad():
                     displacement_for_mask = model.velocity_field_integrator(field.detach())
-            loss_mask = compute_loss_mask(batch, displacement_for_mask, device=device)
+            loss_mask = compute_loss_mask(batch, displacement_for_mask, device=device, mode=loss_mask_mode)
 
             img_loss = compute_image_loss(image_loss_fn, target, warped_source, mask=loss_mask)
 
@@ -1058,7 +1101,8 @@ def validate(
     grad_loss_fn: nn.Module,
     loss_weights: Sequence[float],
     device: str = 'cuda',
-    fast: bool = False  # Optimization: Skip slow metrics
+    fast: bool = False,  # Optimization: Skip slow metrics
+    loss_mask_mode: str = 'manual'
 ):
     """
     Run lightweight validation for model selection.
@@ -1108,7 +1152,7 @@ def validate(
             total_time += (batch_time / source.shape[0])
             
             # 3. Loss
-            loss_mask = compute_loss_mask(batch, displacement, device=device)
+            loss_mask = compute_loss_mask(batch, displacement, device=device, mode=loss_mask_mode)
             img_loss = compute_image_loss(image_loss_fn, target, warped_source, mask=loss_mask)
             grad_loss = grad_loss_fn(displacement)
             loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
@@ -1193,7 +1237,8 @@ def test_evaluate(
     grad_loss_fn: nn.Module,
     loss_weights: Sequence[float],
     device: str = 'cuda',
-    fast: bool = False
+    fast: bool = False,
+    loss_mask_mode: str = 'manual'
 ):
     """
     Run Comprehensive Testing. 
@@ -1244,7 +1289,7 @@ def test_evaluate(
             total_time += ((end_time - start_time) / source.shape[0])
             
             # Loss
-            loss_mask = compute_loss_mask(batch, displacement, device=device)
+            loss_mask = compute_loss_mask(batch, displacement, device=device, mode=loss_mask_mode)
             img_loss = compute_image_loss(image_loss_fn, target, warped_source, mask=loss_mask)
             grad_loss = grad_loss_fn(displacement)
             loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
@@ -1453,6 +1498,7 @@ def main():
     parser.add_argument('--mi-bins', type=int, default=32, help='Bins for Mutual Information')
     parser.add_argument('--mind-radius', type=int, default=2, help='Radius for MIND loss')
     parser.add_argument('--mind-dilation', type=int, default=2, help='Dilation for MIND loss')
+    parser.add_argument('--loss-mask-mode', type=str, choices=['manual', 'auto', 'none'], default='manual', help='Foreground mask source for masked losses: manual=dataset masks, auto=intensity-derived masks, none=disable loss masking')
     parser.add_argument('--unpaired', action='store_true', default=False, help='If set, force unpaired training even if filenames match.')
     parser.add_argument('--val-paired', action='store_true', default=False, help='Validation data is paired')
     parser.add_argument('--patience', type=int, default=20, help='Early stopping patience')
@@ -1604,6 +1650,7 @@ def main():
         f.write(f"Lambda: {args.lambda_param}\n")
         f.write(f"LR: {args.lr}\n")
         f.write(f"Integration Steps: {args.integration_steps}\n")
+        f.write(f"Loss Mask Mode: {args.loss_mask_mode}\n")
         f.write(f"Unpaired: {args.unpaired}\n")
         f.write(f"Val Paired: {args.val_paired}\n")
         f.write(f"Model Architecture: VxmPairwise\n")
@@ -1640,6 +1687,7 @@ def main():
             steps_per_epoch=len(train_loader),
             scaler=scaler,
             device=device,
+            loss_mask_mode=args.loss_mask_mode,
         )
         train_time = time.time() - train_start_time
 
@@ -1660,7 +1708,8 @@ def main():
                 grad_loss_fn=grad_loss_fn,
                 loss_weights=loss_weights,
                 device=device,
-                fast=True
+                fast=True,
+                loss_mask_mode=args.loss_mask_mode,
             )
             
             print(f'Epoch {epoch + 1} | TrainTotal: {avg_loss:.4f} (Img: {last_img_loss:.4f}, Grad: {last_grad_loss:.6f}) | GradNorm: {avg_grad_norm:.6f}, UpdateRatio: {update_ratio:.2%}, TrainTime: {train_time:.2f}s')
@@ -1699,7 +1748,8 @@ def main():
                 grad_loss_fn=grad_loss_fn,
                 loss_weights=loss_weights,
                 device=device,
-                fast=fast_eval # HD95 only calculated if fast=False
+                     fast=fast_eval, # HD95 only calculated if fast=False
+                     loss_mask_mode=args.loss_mask_mode
              )
              
              if test_dice > best_test_dice:
@@ -1717,7 +1767,8 @@ def main():
                     grad_loss_fn=grad_loss_fn,
                     loss_weights=loss_weights,
                     device=device,
-                    fast=False
+                          fast=False,
+                          loss_mask_mode=args.loss_mask_mode
                  )
 
              test_label_metrics_str = ""
