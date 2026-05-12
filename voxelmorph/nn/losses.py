@@ -96,7 +96,6 @@ class MutualInformation(torch.nn.Module):
 
         """Sigma for Gaussian approx."""
         sigma = np.mean(np.diff(bin_centers)) * sigma_ratio
-        print(sigma)
 
         self.preterm = 1 / (2 * sigma**2)
         self.bin_centers = bin_centers
@@ -243,9 +242,10 @@ class MINDLoss(nn.Module):
     Self-Similarity Context) loss.
 
     This implementation follows the common 12-channel formulation used in
-    deformable multimodal registration. It builds self-similarity descriptors
-    from pairwise patch SSDs in a 6-neighbourhood and compares descriptors with
-    a voxel-wise squared error.
+    deformable multimodal registration and matches the descriptor ordering used
+    by the baseline branch. It builds self-similarity descriptors from pairwise
+    patch SSDs in a 6-neighbourhood and compares descriptors with a voxel-wise
+    squared error.
     """
     def __init__(self, radius=2, dilation=2, eps=1e-8):
         super(MINDLoss, self).__init__()
@@ -261,23 +261,21 @@ class MINDLoss(nn.Module):
             [2, 1, 1],
             [1, 2, 1],
         ], dtype=torch.long)
-        pairwise_dist = torch.sum(
-            (neighbourhood[:, None, :] - neighbourhood[None, :, :]) ** 2,
-            dim=-1,
-        )
-        pair_indices = torch.nonzero(
-            torch.triu((pairwise_dist == 2), diagonal=1),
-            as_tuple=False,
-        )
+        distances = torch.cdist(neighbourhood.float(), neighbourhood.float(), p=2)
+        first_index, second_index = torch.meshgrid(torch.arange(6), torch.arange(6), indexing='ij')
+        pair_mask = (first_index > second_index) & torch.isclose(distances, torch.tensor(2.0).sqrt())
+        shift_1 = neighbourhood[first_index[pair_mask]]
+        shift_2 = neighbourhood[second_index[pair_mask]]
 
-        kernel_1 = torch.zeros((pair_indices.shape[0], 1, 3, 3, 3), dtype=torch.float32)
-        kernel_2 = torch.zeros((pair_indices.shape[0], 1, 3, 3, 3), dtype=torch.float32)
-        for idx, (first, second) in enumerate(pair_indices):
-            kernel_1[idx, 0, neighbourhood[first, 0], neighbourhood[first, 1], neighbourhood[first, 2]] = 1.0
-            kernel_2[idx, 0, neighbourhood[second, 0], neighbourhood[second, 1], neighbourhood[second, 2]] = 1.0
+        kernel_1 = torch.zeros((shift_1.shape[0], 1, 3, 3, 3), dtype=torch.float32)
+        kernel_2 = torch.zeros((shift_2.shape[0], 1, 3, 3, 3), dtype=torch.float32)
+        for idx in range(shift_1.shape[0]):
+            kernel_1[idx, 0, shift_1[idx, 0], shift_1[idx, 1], shift_1[idx, 2]] = 1.0
+            kernel_2[idx, 0, shift_2[idx, 0], shift_2[idx, 1], shift_2[idx, 2]] = 1.0
 
         self.register_buffer('kernel_1', kernel_1)
         self.register_buffer('kernel_2', kernel_2)
+        self.register_buffer('descriptor_permutation', torch.tensor([6, 8, 1, 11, 2, 10, 0, 7, 9, 4, 5, 3], dtype=torch.long))
 
     def _mind_ssc(self, image):
         if image.dim() != 5:
@@ -303,12 +301,11 @@ class MINDLoss(nn.Module):
 
         patch_ssd = patch_ssd - patch_ssd.amin(dim=1, keepdim=True)
         mind_var = patch_ssd.mean(dim=1, keepdim=True)
-        mind_var = torch.clamp(mind_var, min=self.eps)
-        mind_var = torch.clamp(mind_var, min=mind_var.detach().mean() * 1e-3, max=mind_var.detach().mean() * 1e3)
+        mind_var_mean = mind_var.detach().mean()
+        mind_var = torch.clamp(mind_var, min=mind_var_mean * 1e-3, max=mind_var_mean * 1e3)
 
-        descriptor = torch.exp(-patch_ssd / mind_var)
-        descriptor = descriptor / (descriptor.sum(dim=1, keepdim=True) + self.eps)
-        return descriptor
+        descriptor = torch.exp(-patch_ssd / (mind_var + self.eps))
+        return descriptor[:, self.descriptor_permutation, ...]
 
     def forward(self, y_pred, y_true, mask=None):
         mind_pred = self._mind_ssc(y_pred)
@@ -316,17 +313,18 @@ class MINDLoss(nn.Module):
         mse = (mind_pred - mind_true) ** 2
         
         if mask is None:
-            # 自动生成前景 Mask，过滤掉医疗图像中大面积全黑背景区域的异常平方差运算
-            bg_val = y_true.amin()  # 自动推断背景值 (一般是 0 或 -1)
-            mask = (y_true > bg_val + 1e-3) | (y_pred > bg_val + 1e-3)
+            return mse.mean()
             
         mask = mask.to(device=mse.device, dtype=mse.dtype)
         if mask.shape[1] == 1 and mse.shape[1] != 1:
             mask = mask.expand(-1, mse.shape[1], -1, -1, -1)
 
         mse = mse * mask
-        # 归一化仅针对前景区域
         return torch.sum(mse) / mask.sum().clamp_min(1.0)
+
+
+class MIND(MINDLoss):
+    """Backward-compatible alias for the baseline branch MIND-SSC loss."""
 
 
 class JointMIMINDLoss(nn.Module):

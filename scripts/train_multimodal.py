@@ -84,6 +84,25 @@ def compute_loss_mask(batch, displacement: torch.Tensor, device: str) -> Optiona
     return torch.clamp(sum(mask_parts), min=0.0, max=1.0)
 
 
+def resolve_loss_mask(
+    batch,
+    displacement: torch.Tensor,
+    target: torch.Tensor,
+    device: str,
+    mode: str = 'manual',
+) -> Optional[torch.Tensor]:
+    if mode == 'none':
+        return None
+
+    if mode == 'auto':
+        return build_foreground_mask(target.float())
+
+    if mode == 'manual':
+        return compute_loss_mask(batch, displacement, device=device)
+
+    raise ValueError(f'Unsupported loss mask mode: {mode!r}')
+
+
 def compute_image_loss(image_loss_fn: nn.Module, target: torch.Tensor, warped_source: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
     if isinstance(image_loss_fn, ne.nn.modules.NCC):
         return -image_loss_fn(target, warped_source).mean()
@@ -1055,6 +1074,7 @@ def train_epoch(
     device: str = 'cuda',
     boundary_loss_fn: Optional[nn.Module] = None,
     boundary_loss_weight: float = 0.0,
+    loss_mask_mode: str = 'manual',
     feature_edge_loss_weight: float = 0.0,
     feature_edge_indices: tuple = (0, 1),
 ) -> float:
@@ -1116,9 +1136,13 @@ def train_epoch(
         warped_source_float = warped_source.float()
         displacement_float = displacement.float()
         foreground_mask = build_foreground_mask(target_float)
-        loss_mask = compute_loss_mask(batch, displacement_float, device=device)
-        if loss_mask is None:
-            loss_mask = foreground_mask
+        loss_mask = resolve_loss_mask(
+            batch,
+            displacement_float,
+            target_float,
+            device=device,
+            mode=loss_mask_mode,
+        )
 
         img_loss = compute_image_loss(image_loss_fn, target_float, warped_source_float, mask=loss_mask)
             
@@ -1259,6 +1283,7 @@ def validate(
     fast: bool = False,  # Optimization: Skip slow metrics
     boundary_loss_fn: Optional[nn.Module] = None,
     boundary_loss_weight: float = 0.0,
+    loss_mask_mode: str = 'manual',
     feature_edge_loss_weight: float = 0.0,
     feature_edge_indices: tuple = (0, 1),
 ):
@@ -1324,9 +1349,13 @@ def validate(
             total_time += (batch_time / source.shape[0])
             
             # 3. Loss
-            loss_mask = compute_loss_mask(batch, displacement, device=device)
-            if loss_mask is None:
-                loss_mask = build_foreground_mask(target.float())
+            loss_mask = resolve_loss_mask(
+                batch,
+                displacement,
+                target,
+                device=device,
+                mode=loss_mask_mode,
+            )
             img_loss = compute_image_loss(image_loss_fn, target, warped_source, mask=loss_mask)
             grad_loss = grad_loss_fn(displacement)
             loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
@@ -1426,6 +1455,7 @@ def test_evaluate(
     fast: bool = False,
     boundary_loss_fn: Optional[nn.Module] = None,
     boundary_loss_weight: float = 0.0,
+    loss_mask_mode: str = 'manual',
     feature_edge_loss_weight: float = 0.0,
     feature_edge_indices: tuple = (0, 1),
 ):
@@ -1496,9 +1526,13 @@ def test_evaluate(
             total_mag += disp_mag.mean().item()
 
             # Loss
-            loss_mask = compute_loss_mask(batch, displacement, device=device)
-            if loss_mask is None:
-                loss_mask = build_foreground_mask(target.float())
+            loss_mask = resolve_loss_mask(
+                batch,
+                displacement,
+                target,
+                device=device,
+                mode=loss_mask_mode,
+            )
             img_loss = compute_image_loss(image_loss_fn, target, warped_source, mask=loss_mask)
             grad_loss = grad_loss_fn(displacement)
             loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
@@ -1715,7 +1749,8 @@ def main():
     parser.add_argument('--mi-bins', type=int, default=32, help='Bins for Mutual Information')
     parser.add_argument('--mind-radius', type=int, default=2, help='MIND-SSC local patch radius')
     parser.add_argument('--mind-dilation', type=int, default=2, help='MIND-SSC neighbour dilation')
-    parser.add_argument('--mind-eps', type=float, default=1e-4, help='MIND-SSC numerical stability epsilon')
+    parser.add_argument('--mind-eps', type=float, default=1e-8, help='MIND-SSC numerical stability epsilon')
+    parser.add_argument('--loss-mask-mode', type=str, default='manual', choices=['manual', 'auto', 'none'], help='Masking mode for image loss: use manual masks, auto-generated foreground mask, or no mask')
     parser.add_argument('--mi-weight', type=float, default=1.0, help='Weight for MI loss in mi_mind (Default 1.0)')
     parser.add_argument('--mind-weight', type=float, default=1.0, help='Weight for MIND loss in mi_mind (Default 1.0)')
     parser.add_argument('--unpaired', action='store_true', default=False, help='If set, force unpaired training even if filenames match.')
@@ -1948,7 +1983,7 @@ def main():
         f.write(f"MIND Radius: {args.mind_radius}\n")
         f.write(f"MIND Dilation: {args.mind_dilation}\n")
         f.write(f"MIND Eps: {args.mind_eps}\n")
-        f.write(f"Auto MIND Foreground Mask: {args.image_loss in ['mind', 'mi_mind']}\n")
+        f.write(f"Loss Mask Mode: {args.loss_mask_mode}\n")
         f.write(f"MI Weight: {args.mi_weight}\n")
         f.write(f"MIND Weight: {args.mind_weight}\n")
         f.write(f"Lambda: {args.lambda_param}\n")
@@ -2001,6 +2036,7 @@ def main():
             device=device,
             boundary_loss_fn=boundary_loss_fn,
             boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
+            loss_mask_mode=args.loss_mask_mode,
             feature_edge_loss_weight=active_feature_edge_loss_weight,
             feature_edge_indices=feature_edge_indices,
         )
@@ -2025,6 +2061,7 @@ def main():
                 fast=True,
                 boundary_loss_fn=boundary_loss_fn,
                 boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
+                loss_mask_mode=args.loss_mask_mode,
                 feature_edge_loss_weight=active_feature_edge_loss_weight,
                 feature_edge_indices=feature_edge_indices,
             )
@@ -2067,6 +2104,7 @@ def main():
                 fast=fast_eval, # HD95 only calculated if fast=False
                 boundary_loss_fn=boundary_loss_fn,
                 boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
+                loss_mask_mode=args.loss_mask_mode,
                 feature_edge_loss_weight=active_feature_edge_loss_weight,
                 feature_edge_indices=feature_edge_indices,
             )
