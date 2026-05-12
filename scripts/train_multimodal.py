@@ -1004,6 +1004,20 @@ def build_foreground_mask(target: torch.Tensor) -> torch.Tensor:
     return mask.clamp_(0.0, 1.0)
 
 
+def parse_feature_edge_indices(scales: str) -> tuple:
+    scale_to_index = {'1/2': 0, '1/4': 1, '1/8': 2, '1/16': 3}
+    indices = []
+    for token in scales.split(','):
+        token = token.strip()
+        if not token:
+            continue
+        if token in scale_to_index:
+            indices.append(scale_to_index[token])
+        else:
+            indices.append(int(token))
+    return tuple(indices)
+
+
 def train_epoch(
     model: nn.Module,
     dataloader: torch.utils.data.DataLoader,
@@ -1017,6 +1031,8 @@ def train_epoch(
     device: str = 'cuda',
     boundary_loss_fn: Optional[nn.Module] = None,
     boundary_loss_weight: float = 0.0,
+    feature_edge_loss_weight: float = 0.0,
+    feature_edge_indices: tuple = (0, 1),
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -1046,13 +1062,27 @@ def train_epoch(
         target = batch['target'].to(device, non_blocking=True)
 
         with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=(scaler is not None)):
-            displacement, warped_source, coarse_flows = model(
-                source,
-                target,
-                return_warped_source=True,
-                return_field_type='displacement',
-                return_coarse_flows=True
-            )
+            use_feature_edge_loss = feature_edge_loss_weight > 0 and hasattr(model, '_feature_edge_loss')
+            if use_feature_edge_loss:
+                out = model(
+                    source,
+                    target,
+                    return_warped_source=True,
+                    return_field_type='displacement',
+                    return_coarse_flows=True,
+                    return_feature_edge_loss=True,
+                    feature_edge_indices=feature_edge_indices,
+                )
+            else:
+                out = model(
+                    source,
+                    target,
+                    return_warped_source=True,
+                    return_field_type='displacement',
+                    return_coarse_flows=True,
+                )
+            displacement, warped_source, coarse_flows = out[0], out[1], out[2]
+            feature_edge_loss = out[3] if use_feature_edge_loss and len(out) > 3 else displacement.new_tensor(0.0)
 
         # AMP 兼容性保护：强制将预测结果和 Loss 计算切回 float32。
         # 这是配准任务的常见坑，因为形变场和损失求导在 float16 下极易精度溢出
@@ -1088,6 +1118,8 @@ def train_epoch(
         loss = loss_weights[0] * img_loss + loss_weights[1] * (grad_loss + pyramid_weight * deep_sup_loss)
         if boundary_loss_weight > 0:
             loss = loss + boundary_loss_weight * boundary_loss
+        if feature_edge_loss_weight > 0:
+            loss = loss + feature_edge_loss_weight * feature_edge_loss.float()
 
         if not torch.isfinite(loss):
             optimizer.zero_grad(set_to_none=True)
@@ -1196,6 +1228,8 @@ def validate(
     fast: bool = False,  # Optimization: Skip slow metrics
     boundary_loss_fn: Optional[nn.Module] = None,
     boundary_loss_weight: float = 0.0,
+    feature_edge_loss_weight: float = 0.0,
+    feature_edge_indices: tuple = (0, 1),
 ):
     """
     Run lightweight validation for model selection.
@@ -1225,12 +1259,25 @@ def validate(
             if device == 'cuda':
                 torch.cuda.synchronize()
             
-            displacement, warped_source = model(
-                source,
-                target,
-                return_warped_source=True,
-                return_field_type='displacement'
-            )
+            use_feature_edge_loss = feature_edge_loss_weight > 0 and hasattr(model, '_feature_edge_loss')
+            if use_feature_edge_loss:
+                out = model(
+                    source,
+                    target,
+                    return_warped_source=True,
+                    return_field_type='displacement',
+                    return_feature_edge_loss=True,
+                    feature_edge_indices=feature_edge_indices,
+                )
+            else:
+                out = model(
+                    source,
+                    target,
+                    return_warped_source=True,
+                    return_field_type='displacement',
+                )
+            displacement, warped_source = out[0], out[1]
+            feature_edge_loss = out[2] if use_feature_edge_loss and len(out) > 2 else displacement.new_tensor(0.0)
             
             if device == 'cuda':
                 torch.cuda.synchronize()
@@ -1260,6 +1307,8 @@ def validate(
                     mask=build_foreground_mask(target.float()),
                 )
                 loss = loss + boundary_loss_weight * boundary_loss
+            if feature_edge_loss_weight > 0:
+                loss = loss + feature_edge_loss_weight * feature_edge_loss.float()
             total_loss += loss.item()
             total_boundary_loss += boundary_loss.item()
             num_batches += 1
@@ -1346,6 +1395,8 @@ def test_evaluate(
     fast: bool = False,
     boundary_loss_fn: Optional[nn.Module] = None,
     boundary_loss_weight: float = 0.0,
+    feature_edge_loss_weight: float = 0.0,
+    feature_edge_indices: tuple = (0, 1),
 ):
     """
     Run Comprehensive Testing. 
@@ -1391,7 +1442,20 @@ def test_evaluate(
             # 2. Measure Full Inference Time & Forward
             start_time = time.time()
             if device == 'cuda': torch.cuda.synchronize()
-            displacement, warped_source = model(source, target, return_warped_source=True, return_field_type='displacement')
+            use_feature_edge_loss = feature_edge_loss_weight > 0 and hasattr(model, '_feature_edge_loss')
+            if use_feature_edge_loss:
+                out = model(
+                    source,
+                    target,
+                    return_warped_source=True,
+                    return_field_type='displacement',
+                    return_feature_edge_loss=True,
+                    feature_edge_indices=feature_edge_indices,
+                )
+            else:
+                out = model(source, target, return_warped_source=True, return_field_type='displacement')
+            displacement, warped_source = out[0], out[1]
+            feature_edge_loss = out[2] if use_feature_edge_loss and len(out) > 2 else displacement.new_tensor(0.0)
             if device == 'cuda': torch.cuda.synchronize()
             end_time = time.time()
             total_time += ((end_time - start_time) / source.shape[0])
@@ -1415,6 +1479,8 @@ def test_evaluate(
                     mask=build_foreground_mask(target.float()),
                 )
                 loss = loss + boundary_loss_weight * boundary_loss
+            if feature_edge_loss_weight > 0:
+                loss = loss + feature_edge_loss_weight * feature_edge_loss.float()
             total_loss += loss.item()
             total_boundary_loss += boundary_loss.item()
             num_batches += 1
@@ -1654,6 +1720,9 @@ def main():
     parser.add_argument('--boundary-loss-metric', type=str, default='l1', choices=['ncc', 'l1'], help='Metric used by the boundary consistency loss; `l1` compares 3D Sobel gradient maps more directly and usually overlaps less with the main image NCC/MI term')
     parser.add_argument('--boundary-kernel', type=str, default='sobel', choices=['sobel', 'diff'], help='Fixed operator used to extract 3D boundary maps')
     parser.add_argument('--boundary-smooth-kernel', type=int, default=3, help='Odd smoothing kernel size applied before boundary extraction')
+    parser.add_argument('--use-feature-edge-loss', action='store_true', help='Enable feature-level multi-scale gradient magnitude consistency on encoder features')
+    parser.add_argument('--feature-edge-loss-weight', type=float, default=0.05, help='Weight for feature-level multi-scale gradient magnitude consistency loss')
+    parser.add_argument('--feature-edge-scales', type=str, default='1/2,1/4', help='Comma-separated encoder scales or indices for feature edge loss, e.g. 1/2,1/4 or 0,1')
     args = parser.parse_args()
 
     if args.use_cmim and args.use_cross_mamba:
@@ -1754,6 +1823,8 @@ def main():
             smooth_kernel_size=args.boundary_smooth_kernel,
         ).to(device)
     loss_weights = [1.0, args.lambda_param]
+    feature_edge_indices = parse_feature_edge_indices(args.feature_edge_scales)
+    active_feature_edge_loss_weight = args.feature_edge_loss_weight if args.use_feature_edge_loss else 0.0
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
 
@@ -1850,6 +1921,8 @@ def main():
         f.write(f"MI Weight: {args.mi_weight}\n")
         f.write(f"MIND Weight: {args.mind_weight}\n")
         f.write(f"Lambda: {args.lambda_param}\n")
+        f.write(f"Feature Edge Loss Weight: {active_feature_edge_loss_weight}\n")
+        f.write(f"Feature Edge Scales: {args.feature_edge_scales}\n")
         f.write(f"LR: {args.lr}\n")
         f.write(f"Integration Steps: {args.integration_steps}\n")
         f.write(f"Decouple Layers: {args.decouple_layers}\n")
@@ -1897,6 +1970,8 @@ def main():
             device=device,
             boundary_loss_fn=boundary_loss_fn,
             boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
+            feature_edge_loss_weight=active_feature_edge_loss_weight,
+            feature_edge_indices=feature_edge_indices,
         )
 
         # -----------------------------
@@ -1919,6 +1994,8 @@ def main():
                 fast=True,
                 boundary_loss_fn=boundary_loss_fn,
                 boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
+                feature_edge_loss_weight=active_feature_edge_loss_weight,
+                feature_edge_indices=feature_edge_indices,
             )
             
             print(f'Epoch {epoch + 1} | TrainTotal: {avg_loss:.4f} (Img: {last_img_loss:.4f}, Grad: {last_grad_loss:.6f}, Boundary: {train_boundary_loss:.6f}) | GradNorm: {avg_grad_norm:.6f}, UpdateRatio: {update_ratio:.2%}')
@@ -1959,6 +2036,8 @@ def main():
                 fast=fast_eval, # HD95 only calculated if fast=False
                 boundary_loss_fn=boundary_loss_fn,
                 boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
+                feature_edge_loss_weight=active_feature_edge_loss_weight,
+                feature_edge_indices=feature_edge_indices,
             )
             
             if test_dice > best_test_dice:

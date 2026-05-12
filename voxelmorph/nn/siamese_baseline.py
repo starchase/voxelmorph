@@ -471,7 +471,54 @@ class SiameseUNetBaseline(nn.Module):
         mode = 'trilinear' if self.ndim == 3 else 'bilinear'
         return F.interpolate(boundary_map, size=feature.shape[2:], mode=mode, align_corners=False)
 
-    def forward(self, source, target, return_warped_source=True, return_field_type='displacement', return_coarse_flows=False):
+    def _resize_displacement_to_feature(self, displacement, feature):
+        mode = 'trilinear' if self.ndim == 3 else 'bilinear'
+        feature_shape = feature.shape[2:]
+        displacement_shape = displacement.shape[2:]
+        if displacement_shape != feature_shape:
+            displacement = F.interpolate(displacement, size=feature_shape, mode=mode, align_corners=False)
+            scale = displacement.new_tensor([
+                feature_shape[axis] / displacement_shape[axis]
+                for axis in range(self.ndim)
+            ]).view(1, self.ndim, *([1] * self.ndim))
+            displacement = displacement * scale
+        return displacement
+
+    def _feature_gradient_magnitude(self, feature):
+        gradients = []
+        for axis in range(self.ndim):
+            diff = feature.diff(dim=axis + 2)
+            pad = [0, 0] * self.ndim
+            pad_index = 2 * (self.ndim - axis - 1) + 1
+            pad[pad_index] = 1
+            gradients.append(F.pad(diff, tuple(pad)))
+
+        grad_sq = sum(grad ** 2 for grad in gradients)
+        return torch.sqrt(grad_sq + 1e-6)
+
+    def _feature_edge_loss(self, source_features, target_features, displacement, feature_edge_indices):
+        feature_edge_loss = displacement.new_tensor(0.0)
+        valid_scales = 0
+        for idx in feature_edge_indices:
+            if idx < 0:
+                idx = len(source_features) + idx
+            if idx < 0 or idx >= len(source_features):
+                continue
+
+            source_feature = source_features[idx]
+            target_feature = target_features[idx]
+            feature_displacement = self._resize_displacement_to_feature(displacement, source_feature)
+            warped_source_feature = self.spatial_transform(source_feature, feature_displacement)
+            source_grad = self._feature_gradient_magnitude(warped_source_feature.float())
+            target_grad = self._feature_gradient_magnitude(target_feature.float())
+            feature_edge_loss = feature_edge_loss + torch.mean(torch.abs(source_grad - target_grad))
+            valid_scales += 1
+
+        if valid_scales == 0:
+            return feature_edge_loss
+        return feature_edge_loss / valid_scales
+
+    def forward(self, source, target, return_warped_source=True, return_field_type='displacement', return_coarse_flows=False, return_feature_edge_loss=False, feature_edge_indices=(0, 1)):
         # --- [Ablation 1 Hook: FDA will go here] ---
         source_input = source
         target_input = target
@@ -635,11 +682,14 @@ class SiameseUNetBaseline(nn.Module):
             outputs.append(velocity)
             
         if return_warped_source:
-             outputs.append(self.spatial_transform(source, displacement))
-             
+            outputs.append(self.spatial_transform(source, displacement))
+
         if return_coarse_flows:
-             outputs.append(coarse_flows)
-             
+            outputs.append(coarse_flows)
+
+        if return_feature_edge_loss:
+            outputs.append(self._feature_edge_loss(feat_s, feat_t, displacement, feature_edge_indices))
+
         return tuple(outputs) if len(outputs) > 1 else outputs[0]
 import torch
 import torch.nn as nn

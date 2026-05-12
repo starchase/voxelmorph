@@ -59,6 +59,8 @@ class VxmBaselineAdapter(nn.Module):
         return_warped_target=False,
         return_field_type='displacement',
         return_coarse_flows=False,
+        return_feature_edge_loss=False,
+        feature_edge_indices=(0, 1),
     ):
         out = self.model(
             source,
@@ -508,6 +510,8 @@ def validate(
     boundary_loss_weight: float = 0.0,
     boundary_ring_inner_kernel: int = 3,
     boundary_ring_outer_kernel: int = 7,
+    feature_edge_loss_weight: float = 0.0,
+    feature_edge_indices: tuple = (0, 1),
     use_mask: bool = False,
     loss_type: str = 'mse',
 ) -> tuple:
@@ -530,13 +534,17 @@ def validate(
             y_seg = data[3].to(device)
 
             # Get the displacement fields
+            use_feature_edge_loss = feature_edge_loss_weight > 0 and hasattr(model, '_feature_edge_loss')
             out = model(
                 x,
                 y,
                 return_warped_source=True,
-                return_field_type='displacement'
+                return_field_type='displacement',
+                return_feature_edge_loss=use_feature_edge_loss,
+                feature_edge_indices=feature_edge_indices,
             )
             displacement, warped_source = out[0], out[1]
+            feature_edge_loss = out[2] if use_feature_edge_loss and len(out) > 2 else displacement.new_tensor(0.0)
 
             target_float = y.float()
             warped_float = warped_source.float()
@@ -570,6 +578,9 @@ def validate(
                 if boundary_loss_fn is not None and boundary_loss_weight > 0:
                     boundary_loss = boundary_loss_fn(warped_float, target_float, mask=boundary_ring_mask)
                     loss = loss + boundary_loss_weight * boundary_loss
+
+                if feature_edge_loss_weight > 0:
+                    loss = loss + feature_edge_loss_weight * feature_edge_loss.float()
 
                 eval_loss.update(loss.item(), x.size(0))
                 eval_boundary_loss.update(boundary_loss.item(), x.size(0))
@@ -665,6 +676,19 @@ def build_boundary_ring_mask(
         return foreground_mask
     return ring_mask
 
+def parse_feature_edge_indices(scales: str) -> tuple:
+    scale_to_index = {'1/2': 0, '1/4': 1, '1/8': 2, '1/16': 3}
+    indices = []
+    for token in scales.split(','):
+        token = token.strip()
+        if not token:
+            continue
+        if token in scale_to_index:
+            indices.append(scale_to_index[token])
+        else:
+            indices.append(int(token))
+    return tuple(indices)
+
 def train_epoch(
     model: nn.Module,
     dataloader: torch.utils.data.DataLoader,
@@ -683,6 +707,8 @@ def train_epoch(
     boundary_loss_weight: float = 0.0,
     boundary_ring_inner_kernel: int = 3,
     boundary_ring_outer_kernel: int = 7,
+    feature_edge_loss_weight: float = 0.0,
+    feature_edge_indices: tuple = (0, 1),
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -701,16 +727,20 @@ def train_epoch(
 
         # 使用 AMP autocast
         with torch.autocast('cuda', enabled=amp_enabled, dtype=torch.bfloat16):
+            use_feature_edge_loss = feature_edge_loss_weight > 0 and hasattr(model, '_feature_edge_loss')
             # Get the displacement and the warped source image from the model
             out = model(
                 x,
                 y,
                 return_warped_source=True,
                 return_field_type='displacement',
-                return_coarse_flows=True
+                return_coarse_flows=True,
+                return_feature_edge_loss=use_feature_edge_loss,
+                feature_edge_indices=feature_edge_indices,
             )
             displacement, warped_source = out[0], out[1]
             coarse_flows = out[2] if len(out) > 2 else []
+            feature_edge_loss = out[3] if use_feature_edge_loss and len(out) > 3 else displacement.new_tensor(0.0)
 
         # 🔥【关键修复】：在这里退出模型前向的 AMP autocast 作用域！
         # 如果把损失函数（不论是 NCC 还是 MSE）放在 autocast 里面算，因为 Loss 内部往往会有 Conv3d 或者平方项操作，
@@ -819,6 +849,8 @@ def train_epoch(
         loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
         if boundary_loss_weight > 0:
             loss = loss + boundary_loss_weight * boundary_loss
+        if feature_edge_loss_weight > 0:
+            loss = loss + feature_edge_loss_weight * feature_edge_loss.float()
         if deep_sup_loss.requires_grad or deep_sup_loss.item() != 0:
             loss = loss + deep_sup_loss # Add deep supervision component
 
@@ -826,7 +858,7 @@ def train_epoch(
         if not torch.isfinite(loss):
             print(
                 f"[WARN] Non-finite loss at batch {batch_idx}: "
-                f"img_loss={img_loss.item()}, grad_loss={grad_loss.item()}, boundary_loss={boundary_loss.item()}, total={loss.item()}"
+                f"img_loss={img_loss.item()}, grad_loss={grad_loss.item()}, boundary_loss={boundary_loss.item()}, feature_edge_loss={feature_edge_loss.item()}, total={loss.item()}"
             )
             # 彻底释放包含 NaN/Inf 计算图的所有局部变量，防止在遇到 NaN 直接 continue 时显存泄漏引发后续 OOM
             optimizer.zero_grad(set_to_none=True)
@@ -890,6 +922,9 @@ def main():
     parser.add_argument('--boundary-smooth-kernel', type=int, default=3, help='Odd smoothing kernel size applied before boundary extraction')
     parser.add_argument('--boundary-ring-inner-kernel', type=int, default=3, help='Inner erosion kernel size for the foreground boundary ring mask')
     parser.add_argument('--boundary-ring-outer-kernel', type=int, default=7, help='Outer dilation kernel size for the foreground boundary ring mask')
+    parser.add_argument('--use-feature-edge-loss', action='store_true', help='Enable feature-level multi-scale gradient magnitude consistency on encoder features')
+    parser.add_argument('--feature-edge-loss-weight', type=float, default=0.05, help='Weight for feature-level multi-scale gradient magnitude consistency loss')
+    parser.add_argument('--feature-edge-scales', type=str, default='1/2,1/4', help='Comma-separated encoder scales or indices for feature edge loss, e.g. 1/2,1/4 or 0,1')
     parser.add_argument('--encoder-type', type=str, default='cnn', choices=['cnn', 'mamba'], help='Backbone type for feature extraction.')
     parser.add_argument('--mamba-shallow-multi', action='store_true', help='Enable multi-axis (d,h,w) scanning for 1/8 scale shallow features. If disabled, uses single axis (d) to remain stable.')
     parser.add_argument('--model-config', type=str, default='dual_stream', choices=['dual_stream', 'voxelmorph_baseline'], help='Choose between the current dual-stream Siamese setup and the standard Voxelmorph baseline')
@@ -958,6 +993,8 @@ def main():
             smooth_kernel_size=args.boundary_smooth_kernel,
         ).to(device)
     loss_weights = [1.0, args.lambda_param]
+    feature_edge_indices = parse_feature_edge_indices(args.feature_edge_scales)
+    active_feature_edge_loss_weight = args.feature_edge_loss_weight if args.use_feature_edge_loss else 0.0
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     
     # Scheduler: Warmup (Linear) then Cosine annealing to gradually lower LR
@@ -1017,6 +1054,8 @@ def main():
         f.write(f"Epochs: {args.epochs}\n")
         f.write(f"Batch Size: {args.batch_size}\n")
         f.write(f"Lambda: {args.lambda_param}\n")
+        f.write(f"Feature Edge Loss Weight: {active_feature_edge_loss_weight}\n")
+        f.write(f"Feature Edge Scales: {args.feature_edge_scales}\n")
         f.write(f"LR: {args.lr}\n")
         f.write(f"Integration Steps: {args.integration_steps}\n")
         f.write(f"Arguments: {vars(args)}\n")
@@ -1062,6 +1101,8 @@ def main():
             boundary_loss_weight=active_boundary_loss_weight,
             boundary_ring_inner_kernel=args.boundary_ring_inner_kernel,
             boundary_ring_outer_kernel=args.boundary_ring_outer_kernel,
+            feature_edge_loss_weight=active_feature_edge_loss_weight,
+            feature_edge_indices=feature_edge_indices,
         )
         loss_history.append(avg_loss)
         
@@ -1078,6 +1119,8 @@ def main():
             boundary_loss_weight=active_boundary_loss_weight,
             boundary_ring_inner_kernel=args.boundary_ring_inner_kernel,
             boundary_ring_outer_kernel=args.boundary_ring_outer_kernel,
+            feature_edge_loss_weight=active_feature_edge_loss_weight,
+            feature_edge_indices=feature_edge_indices,
             use_mask=args.use_mask,
             loss_type=args.loss.lower(),
         )
@@ -1104,6 +1147,8 @@ def main():
                 boundary_loss_weight=active_boundary_loss_weight,
                 boundary_ring_inner_kernel=args.boundary_ring_inner_kernel,
                 boundary_ring_outer_kernel=args.boundary_ring_outer_kernel,
+                feature_edge_loss_weight=active_feature_edge_loss_weight,
+                feature_edge_indices=feature_edge_indices,
                 use_mask=args.use_mask,
                 loss_type=args.loss.lower(),
             )
