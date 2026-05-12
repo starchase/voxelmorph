@@ -505,12 +505,12 @@ class SiameseUNetBaseline(nn.Module):
             if idx < 0 or idx >= len(source_features):
                 continue
 
-            source_feature = source_features[idx]
-            target_feature = target_features[idx]
+            source_feature = source_features[idx].float().detach()
+            target_feature = target_features[idx].float().detach()
             feature_displacement = self._resize_displacement_to_feature(displacement, source_feature)
             warped_source_feature = self.spatial_transform(source_feature, feature_displacement)
-            source_grad = self._feature_gradient_magnitude(warped_source_feature.float())
-            target_grad = self._feature_gradient_magnitude(target_feature.float())
+            source_grad = self._feature_gradient_magnitude(warped_source_feature)
+            target_grad = self._feature_gradient_magnitude(target_feature)
             feature_edge_loss = feature_edge_loss + torch.mean(torch.abs(source_grad - target_grad))
             valid_scales += 1
 
