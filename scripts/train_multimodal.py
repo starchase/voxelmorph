@@ -218,9 +218,11 @@ class MultimodalTrainDataset(torch.utils.data.Dataset):
         
         if idx < self.max_samples:
             # Random Unpaired Mode
-            import random
-            ct_path = random.choice(self.ct_paths)
-            mr_path = random.choice(self.mr_paths)
+            import torch
+            ct_idx = torch.randint(0, len(self.ct_paths), (1,)).item()
+            mr_idx = torch.randint(0, len(self.mr_paths), (1,)).item()
+            ct_path = self.ct_paths[ct_idx]
+            mr_path = self.mr_paths[mr_idx]
         else:
             # Fixed Paired Mode
             # Map idx back to 0..N range
@@ -2001,7 +2003,7 @@ def main():
 
     with open(log_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'train_loss', 'train_boundary_loss', 'train_grad_norm', 'train_update_ratio', 'val_loss', 'val_boundary_loss', 'test_loss', 'test_boundary_loss', 'test_dice', 'test_dice_std', 'test_hd95', 'test_hd95_std', 'test_time_sec', 'test_reg_time_sec', 'test_jac', 'test_jac_std', 'test_mag', 'test_dice_per_label', 'test_dice_per_label_std'])
+        writer.writerow(['epoch', 'train_loss', 'test_dice', 'test_hd95', 'test_jac', 'test_mag', 'train_grad_norm', 'train_update_ratio', 'val_loss', 'test_loss', 'test_dice_std', 'test_hd95_std', 'test_jac_std', 'test_time_sec', 'test_reg_time_sec', 'test_dice_per_label', 'test_dice_per_label_std'])
 
     best_loss = float('inf')
     best_test_dice = 0.0
@@ -2066,12 +2068,12 @@ def main():
                 feature_edge_indices=feature_edge_indices,
             )
             
-            print(f'Epoch {epoch + 1} | TrainTotal: {avg_loss:.4f} (Img: {last_img_loss:.4f}, Grad: {last_grad_loss:.6f}, Boundary: {train_boundary_loss:.6f}) | GradNorm: {avg_grad_norm:.6f}, UpdateRatio: {update_ratio:.2%}')
+            print(f'Epoch {epoch + 1} | TrainTotal: {avg_loss:.4f} (Img: {last_img_loss:.4f}, Grad: {last_grad_loss:.6f}) | GradNorm: {avg_grad_norm:.6f}, UpdateRatio: {update_ratio:.2%}')
             metric_suffix = " (Fast Val, Loss Only)"
-            print(f'         | Val Loss: {val_loss:.4f}, Val Boundary: {val_boundary_loss:.6f}{metric_suffix}')
+            print(f'         | Val Loss: {val_loss:.4f}{metric_suffix}')
             current_monitor_loss = val_loss
         else:
-            print(f'Epoch {epoch + 1}, Train Loss: {avg_loss:.6f}, Train Boundary: {train_boundary_loss:.6f}, GradNorm: {avg_grad_norm:.6f}, UpdateRatio: {update_ratio:.2%}')
+            print(f'Epoch {epoch + 1}, Train Loss: {avg_loss:.6f}, GradNorm: {avg_grad_norm:.6f}, UpdateRatio: {update_ratio:.2%}')
 
         if update_ratio < 0.1:
             print(f'  [Warning] Low effective update ratio ({update_ratio:.2%}). Model parameters may not be updating properly.')
@@ -2088,7 +2090,7 @@ def main():
         is_best_test_dice = False
         
         # Optimization: Always run test evaluation to get Dice and HD95 for CSV, skip slow metrics (Jac) unless run_full_metrics
-        run_full_metrics = ((epoch + 1) == 1) or ((epoch + 1) % 5 == 0)
+        run_full_metrics = ((epoch + 1) in [1, 3, 5, 7]) or ((epoch + 1) % 10 == 0)
         run_test_eval = (test_loader is not None)
 
         if run_test_eval:
@@ -2113,8 +2115,22 @@ def main():
                 best_test_dice = test_dice
                 is_best_test_dice = True
                 print(f'  [Monitor] * New best Test Dice: {best_test_dice:.6f} *')
-                if fast_eval:
-                    pass # 关掉新高test_dice时计算hd95和jac，最大程度加快进度
+                if fast_eval and test_dice > 0.45:
+                    print('  [Monitor] New high Dice > 0.45 detected. Re-evaluating full metrics (HD95, Jac)...')
+                    _, _, _, _, test_hd95, test_hd95_std, _, _, test_jac, test_jac_std, test_mag, _, _, _, _ = test_evaluate(
+                        model=model,
+                        dataloader=test_loader,
+                        image_loss_fn=image_loss_fn,
+                        grad_loss_fn=grad_loss_fn,
+                        loss_weights=loss_weights,
+                        device=device,
+                        fast=False, # Now run full
+                        boundary_loss_fn=boundary_loss_fn,
+                        boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
+                        loss_mask_mode=args.loss_mask_mode,
+                        feature_edge_loss_weight=active_feature_edge_loss_weight,
+                        feature_edge_indices=feature_edge_indices,
+                    )
 
             test_label_metrics_str = ""
             # 关掉明细dice打印
@@ -2122,7 +2138,7 @@ def main():
             #    test_label_metrics_str = " | LabelDice: " + ", ".join([f"{k}:{v:.3f}±{test_dice_per_label_std[k]:.3f}" for k, v in test_dice_per_label.items()])
 
             metric_suffix = "" if run_full_metrics else (" (Fast Test -> Full)" if is_best_test_dice else " (Fast Test)")
-            print(f'  [Monitor] Test Dice: {test_dice:.6f}±{test_dice_std:.6f}, HD95: {test_hd95:.6f}±{test_hd95_std:.6f}, Loss: {test_loss:.6f}, Boundary: {test_boundary_loss:.6f}, Jac: {test_jac:.6f}±{test_jac_std:.6f}, Time: {test_time:.4f}s{test_label_metrics_str}{metric_suffix}')
+            print(f'  [Monitor] Test Dice: {test_dice:.6f}±{test_dice_std:.6f}, HD95: {test_hd95:.6f}±{test_hd95_std:.6f}, Loss: {test_loss:.6f}, Jac: {test_jac:.6f}±{test_jac_std:.6f}, Time: {test_time:.4f}s{test_label_metrics_str}{metric_suffix}')
             
             if is_best_test_dice:
                 # Save best pt model based on test dice
@@ -2183,24 +2199,21 @@ def main():
                  test_dice_per_label_std_str = "{" + "; ".join(items_std) + "}"
 
             row = [
-                epoch + 1, 
-                fmt(avg_loss), 
-                fmt(train_boundary_loss),
+                epoch + 1,
+                fmt(avg_loss),
+                fmt(test_dice),
+                fmt(test_hd95),
+                fmt(test_jac),
+                fmt(test_mag),
                 fmt(avg_grad_norm),
                 fmt(update_ratio),
-                fmt(val_loss), 
-                fmt(val_boundary_loss),
-                fmt(test_loss), 
-                fmt(test_boundary_loss),
-                fmt(test_dice), 
+                fmt(val_loss),
+                fmt(test_loss),
                 fmt(test_dice_std),
-                fmt(test_hd95), 
                 fmt(test_hd95_std),
-                fmt(test_time), 
-                fmt(test_reg_time), 
-                fmt(test_jac), 
                 fmt(test_jac_std),
-                fmt(test_mag), 
+                fmt(test_time),
+                fmt(test_reg_time),
                 test_dice_per_label_str,
                 test_dice_per_label_std_str
             ]
@@ -2211,7 +2224,7 @@ def main():
         # -----------------------------
         # Visualization
         # -----------------------------
-        do_visualization = False # 快速验证超参期间关闭可视化 (原为: is_best_test_dice or run_full_metrics)
+        do_visualization = is_best_test_dice or run_full_metrics
         
         if do_visualization:
             vis_dataset = None
