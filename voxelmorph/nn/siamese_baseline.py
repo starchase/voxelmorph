@@ -369,6 +369,7 @@ class SiameseUNetBaseline(nn.Module):
     - No Frequency Domain Alignment yet
     """
     def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False, use_pdaps=False, use_dsin=False, use_cmim=False, use_cross_mamba=False, use_wcv=False,
+                 cross_mamba_scales='1/16,1/8',
                  use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, mamba_quarter_scale=False, mamba_parallel_block=False, fusion_method='compress_concat', window_size=9, pdaps_flow_limit=20.0, use_boundary_branch=False,
                  boundary_branch_scales='deep', boundary_branch_strength=0.5, boundary_kernel='sobel', boundary_smooth_kernel=3):
         super().__init__()
@@ -389,6 +390,7 @@ class SiameseUNetBaseline(nn.Module):
         self.use_boundary_branch = use_boundary_branch
         self.boundary_branch_scales = boundary_branch_scales
         self.boundary_branch_strength = boundary_branch_strength
+        self.cross_mamba_scales = self._parse_cross_mamba_scales(cross_mamba_scales)
         
         # --- [Architectural Refactoring] ---
         # Note: P-DAPS natively encapsulates coarse-to-fine deformation (previously isolated as 'pyramid').
@@ -422,14 +424,21 @@ class SiameseUNetBaseline(nn.Module):
         
         # 1.5 Cross-Modal Interaction Module
         # CMIM: apply at 1/8 and 1/16 scales
-        # Cross-Mamba: apply to resolutions 1/16(idx=1) and 1/8(idx=0)
+        # Cross-Mamba: configurable deep interaction scales, defaulting to 1/16 + 1/8.
         self.cmim_blocks = nn.ModuleList()
+        self.cross_mamba_blocks = nn.ModuleDict()
         if self.use_cmim:
             self.cmim_blocks.append(CrossModalInteractionModule(enc_nf[-1]))
             self.cmim_blocks.append(CrossModalInteractionModule(enc_nf[-2]))
         elif self.use_cross_mamba:
-            self.cmim_blocks.append(CrossMambaModule(enc_nf[-1])) # 1/16 bottleneck
-            self.cmim_blocks.append(CrossMambaModule(enc_nf[-2])) # 1/8 scale
+            if '1/16' in self.cross_mamba_scales:
+                self.cross_mamba_blocks['1_16'] = CrossMambaModule(enc_nf[-1])
+            if '1/8' in self.cross_mamba_scales:
+                self.cross_mamba_blocks['1_8'] = CrossMambaModule(enc_nf[-2])
+            if '1/4' in self.cross_mamba_scales:
+                self.cross_mamba_blocks['1_4'] = CrossMambaModule(enc_nf[-3])
+            if '1/2' in self.cross_mamba_scales:
+                self.cross_mamba_blocks['1_2'] = CrossMambaModule(enc_nf[-4])
             
         # 1.6 Window Cost Volume (WCV) at shallow scales
         
@@ -586,6 +595,25 @@ class SiameseUNetBaseline(nn.Module):
             return feature_edge_loss
         return feature_edge_loss / valid_scales
 
+    def _parse_cross_mamba_scales(self, cross_mamba_scales):
+        if cross_mamba_scales is None:
+            return {'1/16', '1/8'}
+
+        if isinstance(cross_mamba_scales, str):
+            items = [item.strip() for item in cross_mamba_scales.split(',') if item.strip()]
+        else:
+            items = [str(item).strip() for item in cross_mamba_scales if str(item).strip()]
+
+        if not items:
+            return {'1/16', '1/8'}
+
+        valid = {'1/16', '1/8', '1/4', '1/2'}
+        invalid = sorted(set(items) - valid)
+        if invalid:
+            raise ValueError(f'Unsupported cross_mamba_scales: {invalid}. Valid values are {sorted(valid)}')
+
+        return set(items)
+
     def forward(self, source, target, return_warped_source=True, return_field_type='displacement', return_coarse_flows=False, return_feature_edge_loss=False, feature_edge_indices=(0, 1)):
         # --- [Ablation 1 Hook: FDA will go here] ---
         source_input = source
@@ -619,8 +647,10 @@ class SiameseUNetBaseline(nn.Module):
         
         # 2. Decoding (Standard U-Net Upsampling)
         # Start from the bottom-most features (1/16 scale)
-        if self.use_cmim or getattr(self, 'use_cross_mamba', False):
+        if self.use_cmim:
             feat_s[-1] = self.cmim_blocks[0](feat_s[-1], feat_t[-1])
+        elif getattr(self, 'use_cross_mamba', False) and '1_16' in self.cross_mamba_blocks:
+            feat_s[-1] = self.cross_mamba_blocks['1_16'](feat_s[-1], feat_t[-1])
         if getattr(self, 'use_wcv', False) and "bottleneck" in self.wcv_blocks:
             feat_s[-1] = self.wcv_blocks["bottleneck"](x_fixed=feat_t[-1], x_moving=feat_s[-1])
         if getattr(self, 'use_swcv', False) and "bottleneck" in self.swcv_blocks:
@@ -652,8 +682,12 @@ class SiameseUNetBaseline(nn.Module):
                 
                 # --- [Cross-Mamba at multi scales] ---
                 if getattr(self, 'use_cross_mamba', False):
-                    if skip_idx == len(feat_s) - 2:   # 1/8 scale
-                        s_skip = self.cmim_blocks[1](s_skip, t_skip)
+                    if skip_idx == len(feat_s) - 2 and '1_8' in self.cross_mamba_blocks:   # 1/8 scale
+                        s_skip = self.cross_mamba_blocks['1_8'](s_skip, t_skip)
+                    elif skip_idx == len(feat_s) - 3 and '1_4' in self.cross_mamba_blocks: # 1/4 scale
+                        s_skip = self.cross_mamba_blocks['1_4'](s_skip, t_skip)
+                    elif skip_idx == len(feat_s) - 4 and '1_2' in self.cross_mamba_blocks: # 1/2 scale
+                        s_skip = self.cross_mamba_blocks['1_2'](s_skip, t_skip)
                 
                 # --- [GCV at Deep Scales] ---
                 if getattr(self, 'use_gcv', False) and str(skip_idx) in self.gcv_blocks:

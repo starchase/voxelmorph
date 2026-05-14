@@ -114,6 +114,7 @@ def build_registration_model(args, device):
             use_dsin=args.use_dsin,
             use_cmim=args.use_cmim,
             use_cross_mamba=args.use_cross_mamba,
+            cross_mamba_scales=getattr(args, 'cross_mamba_scales', '1/16,1/8'),
             use_wcv=args.use_wcv,
             use_swcv=args.use_swcv,
             use_gcv=args.use_gcv,
@@ -919,6 +920,7 @@ def main():
     parser.add_argument('--use-dsin', action='store_true', help='Enable DSIN in the shallow decoupled encoder layers')
     parser.add_argument('--use-cmim', action='store_true', help='Enable CMIM at deep decoder scales')
     parser.add_argument('--use-cross-mamba', action='store_true', help='Enable Cross-Mamba at deep decoder scales')
+    parser.add_argument('--cross-mamba-scales', type=str, default='1/16,1/8', help='Comma-separated deep scales for Cross-Mamba, e.g. 1/16 or 1/16,1/8,1/4,1/2')
     parser.add_argument('--use-wcv', action='store_true', help='Enable window cross-attention on shallow skip features')
     parser.add_argument('--use-swcv', action='store_true', help='Enable Structure-Aware WCV on deep skip features')
     parser.add_argument('--use-gcv', action='store_true', help='Enable global cost volume on deep features')
