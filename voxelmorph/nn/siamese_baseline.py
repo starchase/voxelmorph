@@ -67,17 +67,63 @@ class SharedEncoder(nn.Module):
         return features
 
 
+class ParallelLocalGlobalBlock(nn.Module):
+    """
+    轻量级并联双轨模块：通道切割 (Channel Split)
+    - 局部高频分支：3D Convolution
+    - 全局低频分支：Mamba
+    """
+    def __init__(self, in_channels, num_blocks=1, scan_axes=('d', 'h', 'w'), gamma_init=0.2):
+        super().__init__()
+        # 为了极度节省显存，通道对半切
+        self.half_c = in_channels // 2
+        
+        # 1. 局部分支 (Local CNN): 捕捉小器官或血管边缘的突变纹理
+        self.local_branch = nn.Sequential(
+            nn.Conv3d(self.half_c, self.half_c, kernel_size=3, padding=1, bias=False),
+            nn.InstanceNorm3d(self.half_c),
+            nn.LeakyReLU(0.2)
+        )
+        
+        # 2. 全局分支 (Global Mamba): 长序列拓扑提取和大位移估计
+        self.global_branch = ResidualMambaBlock(
+            self.half_c, 
+            num_blocks=num_blocks, 
+            scan_axes=scan_axes, 
+            gamma_init=gamma_init
+        )
+        
+        # 3. 融合层 (Fusion): 让 3x3 空间和序列空间特征深度重组
+        self.fusion_conv = nn.Conv3d(in_channels, in_channels, kernel_size=1)
+
+    def forward(self, x):
+        # 按特征通道切分 (B, C, D, H, W) => 变成两个 (B, C//2, D, H, W)
+        x_local, x_global = torch.split(x, self.half_c, dim=1)
+        
+        # 并联运算
+        out_local = self.local_branch(x_local)
+        out_global = self.global_branch(x_global)
+        
+        # 拼接还原回全通道
+        out_cat = torch.cat([out_local, out_global], dim=1)
+        
+        # 残差连接
+        return x + self.fusion_conv(out_cat)
+
+
 class DecoupledEncoder(nn.Module):
     """
     Dual-stream encoder for Siamese Network with Appearance Decoupling.
     Allows specifying the number of decoupled layers at the beginning.
     """
-    def __init__(self, in_channels=1, enc_nf=[16, 32, 32, 32], ndim=3, decouple_layers=2, use_dsin=False, encoder_type='cnn', mamba_shallow_multi=False):
+    def __init__(self, in_channels=1, enc_nf=[16, 32, 32, 32], ndim=3, decouple_layers=2, use_dsin=False, encoder_type='cnn', mamba_shallow_multi=False, mamba_quarter_scale=False, mamba_parallel_block=False):
         super().__init__()
         self.decouple_layers = decouple_layers
         self.use_dsin = use_dsin
         self.encoder_type = encoder_type
         self.mamba_shallow_multi = mamba_shallow_multi
+        self.mamba_quarter_scale = mamba_quarter_scale
+        self.mamba_parallel_block = mamba_parallel_block
         
         self.enc_blocks_source = nn.ModuleList()
         self.enc_blocks_target = nn.ModuleList()
@@ -89,25 +135,45 @@ class DecoupledEncoder(nn.Module):
             # DSIN: Apply norm only to the decoupled shallow layers (or conditionally all)
             apply_norm = self.use_dsin and (i < decouple_layers)
             
+            use_mamba_here = (self.encoder_type == 'mamba') and (
+                (i >= 2) or (i == 1 and self.mamba_quarter_scale)
+            )
+            
             if i < decouple_layers:
                 # Decoupled convolution weights + Decoupled (Domain-Specific) Instance Norms
-                self.enc_blocks_source.append(ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=apply_norm))
-                self.enc_blocks_target.append(ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=apply_norm))
+                if use_mamba_here:
+                    # Dynamically choose between pure ResidualMamba or Parallel Local-Global Mamba
+                    MambaClass = ParallelLocalGlobalBlock if self.mamba_parallel_block else ResidualMambaBlock
+                    self.enc_blocks_source.append(nn.Sequential(
+                        ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=apply_norm),
+                        MambaClass(nf, num_blocks=1, scan_axes=('d',), gamma_init=0.2)
+                    ))
+                    self.enc_blocks_target.append(nn.Sequential(
+                        ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=apply_norm),
+                        MambaClass(nf, num_blocks=1, scan_axes=('d',), gamma_init=0.2)
+                    ))
+                else:
+                    self.enc_blocks_source.append(ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=apply_norm))
+                    self.enc_blocks_target.append(ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=apply_norm))
             else:
                 # Shared convolution weights, usually no norm here for cross-modal interactive consistency
-                if self.encoder_type == 'mamba' and i >= 2:
+                if use_mamba_here:
                     # Thick Deep Bottleneck: 1 block at 1/8 scale, 3 blocks at 1/16 scale
                     num_mamba = 3 if i == len(enc_nf) - 1 else 1
                     if i == len(enc_nf) - 1:
                         # 1/16 deep bottleneck always uses full 3D scanning
                         scan_axes = ('d', 'h', 'w')
-                    else:
+                    elif i == 2:
                         # 1/8 shallow block uses multi-axis only if configured
                         scan_axes = ('d', 'h', 'w') if self.mamba_shallow_multi else ('d',)
+                    else:
+                        # 1/4 block uses single-axis only to save memory
+                        scan_axes = ('d',)
                         
+                    MambaClass = ParallelLocalGlobalBlock if self.mamba_parallel_block else ResidualMambaBlock
                     self.shared_blocks.append(nn.Sequential(
                         ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=False),
-                        ResidualMambaBlock(nf, num_blocks=num_mamba, scan_axes=scan_axes, gamma_init=0.2)
+                        MambaClass(nf, num_blocks=num_mamba, scan_axes=scan_axes, gamma_init=0.2)
                     ))
                 else:
                     self.shared_blocks.append(ConvBlock(ndim, prev_channels, nf, stride=2, use_norm=False))
@@ -303,7 +369,7 @@ class SiameseUNetBaseline(nn.Module):
     - No Frequency Domain Alignment yet
     """
     def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False, use_pdaps=False, use_dsin=False, use_cmim=False, use_cross_mamba=False, use_wcv=False,
-                 use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, fusion_method='compress_concat', window_size=9, pdaps_flow_limit=20.0, use_boundary_branch=False,
+                 use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, mamba_quarter_scale=False, mamba_parallel_block=False, fusion_method='compress_concat', window_size=9, pdaps_flow_limit=20.0, use_boundary_branch=False,
                  boundary_branch_scales='deep', boundary_branch_strength=0.5, boundary_kernel='sobel', boundary_smooth_kernel=3):
         super().__init__()
         self.inshape = inshape
@@ -333,7 +399,9 @@ class SiameseUNetBaseline(nn.Module):
             decouple_layers=decouple_layers, 
             use_dsin=use_dsin,
             encoder_type=encoder_type,
-            mamba_shallow_multi=mamba_shallow_multi
+            mamba_shallow_multi=mamba_shallow_multi,
+            mamba_quarter_scale=mamba_quarter_scale,
+            mamba_parallel_block=mamba_parallel_block
         )
 
         self.boundary_feature_indices = []

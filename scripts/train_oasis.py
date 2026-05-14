@@ -119,6 +119,8 @@ def build_registration_model(args, device):
             use_gcv=args.use_gcv,
             encoder_type=getattr(args, 'encoder_type', 'cnn'),
             mamba_shallow_multi=getattr(args, 'mamba_shallow_multi', False),
+            mamba_quarter_scale=getattr(args, 'mamba_quarter_scale', False),
+            mamba_parallel_block=getattr(args, 'mamba_parallel_block', False),
             window_size=getattr(args, 'window_size', 9),
             pdaps_flow_limit=getattr(args, 'pdaps_flow_limit', 20.0),
             use_boundary_branch=getattr(args, 'use_boundary_branch', False),
@@ -937,6 +939,8 @@ def main():
     parser.add_argument('--feature-edge-start-epoch', type=int, default=1, help='Enable feature-edge loss from this 1-based epoch index; e.g. 5 starts applying it at epoch 5')
     parser.add_argument('--encoder-type', type=str, default='cnn', choices=['cnn', 'mamba'], help='Backbone type for feature extraction.')
     parser.add_argument('--mamba-shallow-multi', action='store_true', help='Enable multi-axis (d,h,w) scanning for 1/8 scale shallow features. If disabled, uses single axis (d) to remain stable.')
+    parser.add_argument('--mamba-quarter-scale', action='store_true', help='Enable Mamba scanning (single-axis) at 1/4 scale (i=1) to improve fine structural alignment.')
+    parser.add_argument('--mamba-parallel-block', action='store_true', help='Use Parallel Local(CNN)-Global(Mamba) Block instead of serial Mamba to protect local edges.')
     parser.add_argument('--model-config', type=str, default='dual_stream', choices=['dual_stream', 'voxelmorph_baseline'], help='Choose between the current dual-stream Siamese setup and the standard Voxelmorph baseline')
     parser.add_argument('--decouple-layers', type=int, default=2, help='Number of shallow decoupled encoder layers used in dual-stream mode')
     parser.add_argument('--gpu', type=str, default='0', help='GPU ID')

@@ -1778,6 +1778,8 @@ def main():
     parser.add_argument('--fusion-method', type=str, default='compress_concat', choices=['add', 'concat', 'compress_concat'], help='Feature fusion method for Siamese encoder')
     parser.add_argument('--encoder-type', type=str, default='cnn', choices=['cnn', 'mamba'], help='Backbone type for feature extraction')
     parser.add_argument('--mamba-shallow-multi', action='store_true', help='Enable multi-axis shallow Mamba scanning at 1/8 scale')
+    parser.add_argument('--mamba-quarter-scale', action='store_true', help='Enable Mamba scanning (single-axis) at 1/4 scale (i=1) to improve fine structural alignment.')
+    parser.add_argument('--mamba-parallel-block', action='store_true', help='Use Parallel Local(CNN)-Global(Mamba) Block instead of serial Mamba to protect local edges.')
     parser.add_argument('--window-size', type=int, default=9, help='Window size for WCV and S-WCV')
     parser.add_argument('--pdaps-flow-limit', type=float, default=20.0, help='Maximum physical flow limit for P-DAPS')
     parser.add_argument('--use-boundary-branch', action='store_true', help='Enable lightweight boundary-guided feature modulation branch')
@@ -1843,6 +1845,8 @@ def main():
             use_gcv=args.use_gcv,
             encoder_type=args.encoder_type,
             mamba_shallow_multi=args.mamba_shallow_multi,
+            mamba_quarter_scale=args.mamba_quarter_scale,
+            mamba_parallel_block=args.mamba_parallel_block,
             fusion_method=args.fusion_method,
             window_size=args.window_size,
             pdaps_flow_limit=args.pdaps_flow_limit,
