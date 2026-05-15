@@ -1777,7 +1777,9 @@ def main():
     parser.add_argument('--decouple-layers', type=int, default=2, help='Number of shallow encoder layers with independent source/target weights in SiameseUNetBaseline')
     parser.add_argument('--fusion-method', type=str, default='compress_concat', choices=['add', 'concat', 'compress_concat'], help='Feature fusion method for Siamese encoder')
     parser.add_argument('--encoder-type', type=str, default='cnn', choices=['cnn', 'mamba'], help='Backbone type for feature extraction')
-    parser.add_argument('--mamba-shallow-multi', action='store_true', help='Enable multi-axis shallow Mamba scanning at 1/8 scale')
+    parser.add_argument('--mamba-shallow-multi', action='store_true', help='Legacy shorthand: enable multi-axis scanning for both encoder and decoder 1/8-scale Mamba blocks')
+    parser.add_argument('--mamba-enc-shallow-multi', action='store_true', help='Enable multi-axis scanning for the encoder 1/8-scale Mamba block')
+    parser.add_argument('--mamba-dec-shallow-multi', action='store_true', help='Enable multi-axis scanning for the decoder 1/8-scale Mamba block')
     parser.add_argument('--mamba-quarter-scale', action='store_true', help='Enable Mamba scanning (single-axis) at 1/4 scale (i=1) to improve fine structural alignment.')
     parser.add_argument('--mamba-parallel-block', action='store_true', help='Use Parallel Local(CNN)-Global(Mamba) Block instead of serial Mamba to protect local edges.')
     parser.add_argument('--window-size', type=int, default=9, help='Window size for WCV and S-WCV')
@@ -1794,6 +1796,10 @@ def main():
     parser.add_argument('--feature-edge-loss-weight', type=float, default=0.05, help='Weight for feature-level multi-scale gradient magnitude consistency loss')
     parser.add_argument('--feature-edge-scales', type=str, default='1/2,1/4', help='Comma-separated encoder scales or indices for feature edge loss, e.g. 1/2,1/4 or 0,1')
     args = parser.parse_args()
+
+    if args.mamba_shallow_multi:
+        args.mamba_enc_shallow_multi = True
+        args.mamba_dec_shallow_multi = True
 
     if args.use_cmim and args.use_cross_mamba:
         parser.error('--use-cmim and --use-cross-mamba are mutually exclusive interaction modules.')
@@ -1845,6 +1851,8 @@ def main():
             use_gcv=args.use_gcv,
             encoder_type=args.encoder_type,
             mamba_shallow_multi=args.mamba_shallow_multi,
+            mamba_enc_shallow_multi=args.mamba_enc_shallow_multi,
+            mamba_dec_shallow_multi=args.mamba_dec_shallow_multi,
             mamba_quarter_scale=args.mamba_quarter_scale,
             mamba_parallel_block=args.mamba_parallel_block,
             fusion_method=args.fusion_method,

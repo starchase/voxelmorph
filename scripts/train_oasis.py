@@ -120,6 +120,8 @@ def build_registration_model(args, device):
             use_gcv=args.use_gcv,
             encoder_type=getattr(args, 'encoder_type', 'cnn'),
             mamba_shallow_multi=getattr(args, 'mamba_shallow_multi', False),
+            mamba_enc_shallow_multi=getattr(args, 'mamba_enc_shallow_multi', False),
+            mamba_dec_shallow_multi=getattr(args, 'mamba_dec_shallow_multi', False),
             mamba_quarter_scale=getattr(args, 'mamba_quarter_scale', False),
             mamba_parallel_block=getattr(args, 'mamba_parallel_block', False),
             window_size=getattr(args, 'window_size', 9),
@@ -940,7 +942,9 @@ def main():
     parser.add_argument('--feature-edge-scales', type=str, default='1/2,1/4', help='Comma-separated encoder scales or indices for feature edge loss, e.g. 1/2,1/4 or 0,1')
     parser.add_argument('--feature-edge-start-epoch', type=int, default=1, help='Enable feature-edge loss from this 1-based epoch index; e.g. 5 starts applying it at epoch 5')
     parser.add_argument('--encoder-type', type=str, default='cnn', choices=['cnn', 'mamba'], help='Backbone type for feature extraction.')
-    parser.add_argument('--mamba-shallow-multi', action='store_true', help='Enable multi-axis (d,h,w) scanning for 1/8 scale shallow features. If disabled, uses single axis (d) to remain stable.')
+    parser.add_argument('--mamba-shallow-multi', action='store_true', help='Legacy shorthand: enable multi-axis (d,h,w) scanning for both encoder and decoder 1/8-scale Mamba blocks.')
+    parser.add_argument('--mamba-enc-shallow-multi', action='store_true', help='Enable multi-axis (d,h,w) scanning for the encoder 1/8-scale Mamba block.')
+    parser.add_argument('--mamba-dec-shallow-multi', action='store_true', help='Enable multi-axis (d,h,w) scanning for the decoder 1/8-scale Mamba block.')
     parser.add_argument('--mamba-quarter-scale', action='store_true', help='Enable Mamba scanning (single-axis) at 1/4 scale (i=1) to improve fine structural alignment.')
     parser.add_argument('--mamba-parallel-block', action='store_true', help='Use Parallel Local(CNN)-Global(Mamba) Block instead of serial Mamba to protect local edges.')
     parser.add_argument('--model-config', type=str, default='dual_stream', choices=['dual_stream', 'voxelmorph_baseline'], help='Choose between the current dual-stream Siamese setup and the standard Voxelmorph baseline')
@@ -958,6 +962,10 @@ def main():
     parser.add_argument('--train-dir', type=str, default='/root/autodl-tmp/OASIS_L2R_2021_task03/All/')
     parser.add_argument('--val-dir', type=str, default='/root/autodl-tmp/OASIS_L2R_2021_task03/Test/')
     args = parser.parse_args()
+
+    if args.mamba_shallow_multi:
+        args.mamba_enc_shallow_multi = True
+        args.mamba_dec_shallow_multi = True
 
     if args.use_daps and args.use_pdaps:
         parser.error('--use-daps and --use-pdaps are mutually exclusive. Use --use-pdaps for the current pyramid design.')
