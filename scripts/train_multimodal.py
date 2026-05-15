@@ -1741,6 +1741,7 @@ def main():
     parser.add_argument('--steps-per-epoch', type=int, default=100, help='Steps per epoch')
     parser.add_argument('--max-train-samples', type=int, default=None, help='Max training samples to use (subsample)')
     parser.add_argument('--batch-size', type=int, default=1, help='Batch size')
+    parser.add_argument('--warmup-epochs', type=int, default=10, help='Number of epochs for learning rate warmup')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--lambda', type=float, dest='lambda_param', default=0.01, help='Regularization weight (0.01 for smooth, 1.0 for rigid)')
     parser.add_argument('--gpu', type=str, default='0', help='GPU ID')
@@ -1769,6 +1770,7 @@ def main():
     parser.add_argument('--use-dsin', action='store_true', help='Use DSIN')
     parser.add_argument('--use-cmim', action='store_true', help='Use CMIM')
     parser.add_argument('--use-cross-mamba', action='store_true', help='Use Cross-Mamba at deep decoder scales')
+    parser.add_argument('--cross-mamba-scales', type=str, default='1/16,1/8', help='Comma-separated deep scales for Cross-Mamba, e.g. 1/16 or 1/16,1/8,1/4,1/2')
     parser.add_argument('--use-wcv', action='store_true', help='Use window cost volume on deep skip features')
     parser.add_argument('--use-swcv', action='store_true', help='Use structure-aware window cost volume on deep skip features')
     parser.add_argument('--use-gcv', action='store_true', help='Use global cost volume on deep features')
@@ -1795,6 +1797,7 @@ def main():
     parser.add_argument('--use-feature-edge-loss', action='store_true', help='Enable feature-level multi-scale gradient magnitude consistency on encoder features')
     parser.add_argument('--feature-edge-loss-weight', type=float, default=0.05, help='Weight for feature-level multi-scale gradient magnitude consistency loss')
     parser.add_argument('--feature-edge-scales', type=str, default='1/2,1/4', help='Comma-separated encoder scales or indices for feature edge loss, e.g. 1/2,1/4 or 0,1')
+    parser.add_argument('--feature-edge-start-epoch', type=int, default=1, help='Enable feature-edge loss from this 1-based epoch index; e.g. 5 starts applying it at epoch 5')
     args = parser.parse_args()
 
     if args.mamba_shallow_multi:
@@ -1846,6 +1849,7 @@ def main():
             use_dsin=args.use_dsin,
             use_cmim=args.use_cmim,
             use_cross_mamba=args.use_cross_mamba,
+            cross_mamba_scales=getattr(args, 'cross_mamba_scales', '1/16,1/8'),
             use_wcv=(args.use_wcv or args.use_wmca),
             use_swcv=args.use_swcv,
             use_gcv=args.use_gcv,
@@ -1906,7 +1910,13 @@ def main():
     feature_edge_indices = parse_feature_edge_indices(args.feature_edge_scales)
     active_feature_edge_loss_weight = args.feature_edge_loss_weight if args.use_feature_edge_loss else 0.0
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=10)
+
+    # Scheduler: Warmup (Linear) then Cosine annealing to gradually lower LR
+    warmup_epochs = args.warmup_epochs
+    cosine_epochs = max(1, args.epochs - warmup_epochs)
+    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=0.01, total_iters=warmup_epochs)
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cosine_epochs)
+    scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_epochs])
 
     # Dataloader Datasets were initialized above
     # Shuffle is KEY here: it mixes Easy and Hard pairs within each epoch
@@ -2036,6 +2046,10 @@ def main():
     print(f'Training for {args.epochs} epochs...')
     for epoch in range(args.epochs):
         epoch_start_time = time.time()
+        curr_epoch_1_based = epoch + 1
+        
+        feature_edge_active = args.use_feature_edge_loss and (curr_epoch_1_based >= args.feature_edge_start_epoch)
+        active_feature_edge_loss_weight = args.feature_edge_loss_weight if feature_edge_active else 0.0
         
         avg_loss, train_boundary_loss, last_img_loss, last_grad_loss, avg_grad_norm, update_ratio = train_epoch(
             model=model,
@@ -2289,8 +2303,8 @@ def main():
             best_loss = current_monitor_loss
             print(f'New best val loss: {best_loss:.6f}.')
 
-        # Scheduler step based on Test Dice (maximize)
-        scheduler.step(test_dice)
+        # Scheduler step (unconditional for CosineAnnealing / Warmup)
+        scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
         
         epoch_time = time.time() - epoch_start_time
