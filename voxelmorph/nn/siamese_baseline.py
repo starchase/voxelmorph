@@ -372,7 +372,7 @@ class SiameseUNetBaseline(nn.Module):
     """
     def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False, use_pdaps=False, use_dsin=False, use_cmim=False, use_cross_mamba=False, use_wcv=False,
                  cross_mamba_scales='1/16,1/8',
-                 use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, mamba_enc_shallow_multi=None, mamba_dec_shallow_multi=None, mamba_quarter_scale=False, mamba_parallel_block=False, fusion_method='compress_concat', window_size=9, pdaps_flow_limit=20.0, use_residual_flow_pyramid=False, residual_flow_limit=4.0, cross_mamba_offset_limit=0.0, cross_mamba_offset_smooth_kernel=1, use_boundary_branch=False,
+                 use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, mamba_enc_shallow_multi=None, mamba_dec_shallow_multi=None, mamba_quarter_scale=False, mamba_parallel_block=False, fusion_method='compress_concat', window_size=9, pdaps_flow_limit=20.0, use_residual_flow_pyramid=False, residual_flow_limit=4.0, use_error_guided_residual=False, cross_mamba_offset_limit=0.0, cross_mamba_offset_smooth_kernel=1, use_boundary_branch=False,
                  boundary_branch_scales='deep', boundary_branch_strength=0.5, boundary_kernel='sobel', boundary_smooth_kernel=3):
         super().__init__()
         self.inshape = inshape
@@ -382,6 +382,7 @@ class SiameseUNetBaseline(nn.Module):
         self.fusion_method = fusion_method
         self.use_pdaps = use_pdaps
         self.use_residual_flow_pyramid = use_residual_flow_pyramid
+        self.use_error_guided_residual = use_error_guided_residual
         self.residual_flow_limit = residual_flow_limit
         self.use_dsin = use_dsin
         self.use_cmim = use_cmim
@@ -554,8 +555,13 @@ class SiameseUNetBaseline(nn.Module):
 
         if self.use_residual_flow_pyramid:
             self.residual_flow_heads = nn.ModuleList()
-            for nf in dec_nf:
-                flow_head = Conv(nf, ndim, kernel_size=3, padding=1)
+            for i, nf in enumerate(dec_nf):
+                skip_idx = len(enc_nf) - 2 - i
+                if skip_idx >= 0 and getattr(self, 'use_error_guided_residual', False):
+                    head_in_ch = nf + enc_nf[skip_idx] * 3
+                else:
+                    head_in_ch = nf
+                flow_head = Conv(head_in_ch, ndim, kernel_size=3, padding=1)
                 flow_head.weight.data.normal_(0, 1e-6)
                 flow_head.bias.data.zero_()
                 self.residual_flow_heads.append(flow_head)
@@ -714,9 +720,14 @@ class SiameseUNetBaseline(nn.Module):
             
             # Skip connections
             skip_idx = len(feat_s) - 2 - i
+            s_skip_raw = None
+            t_skip_raw = None
             if skip_idx >= 0:
                 s_skip = feat_s[skip_idx]
                 t_skip = feat_t[skip_idx]
+                
+                s_skip_raw = s_skip
+                t_skip_raw = t_skip
                 
                 # --- [CMIM at 1/8 Scale] ---
                 if self.use_cmim and skip_idx == len(feat_s) - 2:
@@ -791,7 +802,26 @@ class SiameseUNetBaseline(nn.Module):
 
             if self.use_residual_flow_pyramid:
                 sub_flow_limit = torch.as_tensor(self.residual_flow_limit, dtype=x.dtype, device=x.device).clamp(min=1e-3)
-                raw_residual_flow = self.residual_flow_heads[i](x)
+                
+                if getattr(self, 'use_error_guided_residual', False) and skip_idx >= 0:
+                    if residual_acc_flow is not None:
+                        mode = 'trilinear' if self.ndim == 3 else 'bilinear'
+                        flow_up = F.interpolate(residual_acc_flow, size=s_skip_raw.shape[2:], mode=mode, align_corners=False)
+                        flow_up = flow_up * 2.0
+                        if self.integrate is not None:
+                            disp_up = self.integrate(flow_up)
+                        else:
+                            disp_up = flow_up
+                        s_skip_warped_for_head = self.spatial_transform(s_skip_raw, disp_up)
+                    else:
+                        s_skip_warped_for_head = s_skip_raw
+                        
+                    diff = torch.abs(s_skip_warped_for_head - t_skip_raw)
+                    head_input = torch.cat([x, s_skip_warped_for_head, t_skip_raw, diff], dim=1)
+                else:
+                    head_input = x
+                
+                raw_residual_flow = self.residual_flow_heads[i](head_input)
                 residual_flow = sub_flow_limit * torch.tanh(raw_residual_flow / sub_flow_limit)
                 residual_flows.append(residual_flow)
 

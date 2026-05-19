@@ -1987,6 +1987,7 @@ def main():
     parser.add_argument('--integration-steps', type=int, default=0, help='number of integration steps for diffeomorphic registration')
     parser.add_argument('--pyramid-weight', type=float, default=0.5, help='Weight for intermediate pyramid deep supervision loss')
     parser.add_argument('--use-residual-flow-pyramid', action='store_true', help='Use lightweight coarse-to-fine residual flow accumulation without warping skip features')
+    parser.add_argument('--use-error-guided-residual', action='store_true', help='Enhance residual flow pyramid with Structure-aware & Error-guided side branch')
     parser.add_argument('--residual-flow-limit', type=float, default=4.0, help='Per-stage magnitude cap for residual flow heads when residual flow pyramid is enabled')
     parser.add_argument('--pyramid-image-weight', type=float, default=0.0, help='Weight for multi-scale image supervision on intermediate pyramid displacements')
     parser.add_argument('--pyramid-image-weights', type=str, default='0.2,0.35,0.5', help='Comma-separated relative weights for intermediate pyramid image supervision from coarse to fine')
@@ -2093,6 +2094,7 @@ def main():
             window_size=args.window_size,
             pdaps_flow_limit=args.pdaps_flow_limit,
             use_residual_flow_pyramid=args.use_residual_flow_pyramid,
+    use_error_guided_residual=args.use_error_guided_residual,
             residual_flow_limit=args.residual_flow_limit,
             use_boundary_branch=args.use_boundary_branch,
             boundary_branch_scales=args.boundary_branch_scales,
@@ -2247,6 +2249,7 @@ def main():
         f.write(f"Lambda: {args.lambda_param}\n")
         f.write(f"Bend Weight: {args.bend_weight}\n")
         f.write(f"Use Residual Flow Pyramid: {args.use_residual_flow_pyramid}\n")
+        f.write(f"Use Error-Guided Residual: {args.use_error_guided_residual}\n")
         f.write(f"Residual Flow Limit: {args.residual_flow_limit}\n")
         f.write(f"Pyramid Image Weight: {args.pyramid_image_weight}\n")
         f.write(f"Pyramid Image Weights: {args.pyramid_image_weights}\n")
