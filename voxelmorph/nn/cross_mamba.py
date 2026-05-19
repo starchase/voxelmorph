@@ -2,15 +2,28 @@ import torch
 import torch.nn as nn
 from mamba_ssm import Mamba
 
+
 class CrossMambaModule(nn.Module):
     """
     Improved 3D Cross-Mamba Module with Multi-Directional Scanning.
     Inspired by VMamba/SegMamba's Cross-Scan Module to preserve spatial locality.
     """
-    def __init__(self, channels, d_state=16, d_conv=4, expand=2, img_size=(10, 12, 10), use_resampling=True):
+    def __init__(
+        self,
+        channels,
+        d_state=16,
+        d_conv=4,
+        expand=2,
+        img_size=(10, 12, 10),
+        use_resampling=True,
+        offset_limit=0.75,
+        offset_smooth_kernel=3,
+    ):
         super().__init__()
         self.channels = channels
         self.use_resampling = use_resampling
+        self.offset_limit = float(offset_limit)
+        self.offset_smooth_kernel = int(offset_smooth_kernel)
         
         # 3D learnable positional embedding (optional but highly recommended for 1D scanning)
         # 用一个极小的晶格尺寸 (10x12x10) 作为连续位置编码的种子，大大降低参数量
@@ -45,6 +58,20 @@ class CrossMambaModule(nn.Module):
         
         self.act = nn.GELU()
         self.norm = nn.InstanceNorm3d(channels)
+
+    def _regularize_offset(self, offset):
+        if self.offset_limit > 0:
+            offset = self.offset_limit * torch.tanh(offset / self.offset_limit)
+
+        if self.offset_smooth_kernel > 1:
+            offset = nn.functional.avg_pool3d(
+                offset,
+                kernel_size=self.offset_smooth_kernel,
+                stride=1,
+                padding=self.offset_smooth_kernel // 2,
+            )
+
+        return offset
         
     def forward(self, source, target):
         # 加上 3D 选择性位置编码
@@ -95,6 +122,7 @@ class CrossMambaModule(nn.Module):
             # 🌟 方案一实施：利用 Mamba 获取的长距离指导，执行显式局部特征重采样
             # 1. 预测特征级的微观偏移量 (Offset) 和调制权重 (Mask)
             offset = self.offset_conv(mamba_guidance)  # (B, 3, D, H, W)
+            offset = self._regularize_offset(offset)
             mask = torch.sigmoid(self.mask_conv(mamba_guidance))  # (B, C, D, H, W)
             
             # 2. 构建特征级的仿射网格 (Feature Grid)

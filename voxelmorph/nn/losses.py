@@ -82,6 +82,60 @@ class Grad:
             "voxelmorph.nn.losses.Grad is deprecated. Use neurite.nn.modules.Grad instead."
         )
 
+
+class BendingEnergyLoss(nn.Module):
+    """
+    Second-order bending energy regularization for displacement fields.
+
+    Expects a displacement field with shape (B, C, *spatial_dims), where C is
+    the number of spatial dimensions.
+    """
+
+    def __init__(self, reduction: str = 'mean'):
+        super().__init__()
+        if reduction not in {'mean', 'sum', 'none'}:
+            raise ValueError(f'Unsupported reduction: {reduction!r}')
+        self.reduction = reduction
+
+    def _first_diff(self, field: torch.Tensor, dim: int) -> torch.Tensor:
+        head = [slice(None)] * field.dim()
+        tail = [slice(None)] * field.dim()
+        head[dim] = slice(1, None)
+        tail[dim] = slice(None, -1)
+        diff = field[tuple(head)] - field[tuple(tail)]
+
+        pad = [0, 0] * (field.dim() - 2)
+        axis = dim - 2
+        pad_index = 2 * (field.dim() - 3 - axis)
+        pad[pad_index + 1] = 1
+        return F.pad(diff, tuple(pad))
+
+    def forward(self, displacement: torch.Tensor) -> torch.Tensor:
+        if displacement.dim() < 4:
+            raise ValueError(
+                f'displacement must have shape (B, C, *spatial_dims), got {tuple(displacement.shape)}'
+            )
+
+        spatial_dims = list(range(2, displacement.dim()))
+        first_diffs = {dim: self._first_diff(displacement, dim) for dim in spatial_dims}
+        bending_terms = []
+
+        for dim in spatial_dims:
+            second = self._first_diff(first_diffs[dim], dim)
+            bending_terms.append(second.pow(2))
+
+        for idx, dim_i in enumerate(spatial_dims):
+            for dim_j in spatial_dims[idx + 1:]:
+                mixed = self._first_diff(first_diffs[dim_i], dim_j)
+                bending_terms.append(2.0 * mixed.pow(2))
+
+        loss = sum(bending_terms)
+        if self.reduction == 'sum':
+            return loss.sum()
+        if self.reduction == 'none':
+            return loss.mean(dim=tuple(range(1, loss.dim())))
+        return loss.mean()
+
 class MutualInformation(torch.nn.Module):
     """
     Mutual Information

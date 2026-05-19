@@ -372,7 +372,7 @@ class SiameseUNetBaseline(nn.Module):
     """
     def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False, use_pdaps=False, use_dsin=False, use_cmim=False, use_cross_mamba=False, use_wcv=False,
                  cross_mamba_scales='1/16,1/8',
-                 use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, mamba_enc_shallow_multi=None, mamba_dec_shallow_multi=None, mamba_quarter_scale=False, mamba_parallel_block=False, fusion_method='compress_concat', window_size=9, pdaps_flow_limit=20.0, use_boundary_branch=False,
+                 use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, mamba_enc_shallow_multi=None, mamba_dec_shallow_multi=None, mamba_quarter_scale=False, mamba_parallel_block=False, fusion_method='compress_concat', window_size=9, pdaps_flow_limit=20.0, use_residual_flow_pyramid=False, residual_flow_limit=4.0, cross_mamba_offset_limit=0.0, cross_mamba_offset_smooth_kernel=1, use_boundary_branch=False,
                  boundary_branch_scales='deep', boundary_branch_strength=0.5, boundary_kernel='sobel', boundary_smooth_kernel=3):
         super().__init__()
         self.inshape = inshape
@@ -381,6 +381,8 @@ class SiameseUNetBaseline(nn.Module):
         self.use_pdaps = use_pdaps
         self.fusion_method = fusion_method
         self.use_pdaps = use_pdaps
+        self.use_residual_flow_pyramid = use_residual_flow_pyramid
+        self.residual_flow_limit = residual_flow_limit
         self.use_dsin = use_dsin
         self.use_cmim = use_cmim
         self.use_daps = use_daps
@@ -393,12 +395,17 @@ class SiameseUNetBaseline(nn.Module):
         self.boundary_branch_scales = boundary_branch_scales
         self.boundary_branch_strength = boundary_branch_strength
         self.cross_mamba_scales = self._parse_cross_mamba_scales(cross_mamba_scales)
+        self.cross_mamba_offset_limit = float(cross_mamba_offset_limit)
+        self.cross_mamba_offset_smooth_kernel = int(cross_mamba_offset_smooth_kernel)
         if mamba_enc_shallow_multi is None:
             mamba_enc_shallow_multi = mamba_shallow_multi
         if mamba_dec_shallow_multi is None:
             mamba_dec_shallow_multi = mamba_shallow_multi
         self.mamba_enc_shallow_multi = mamba_enc_shallow_multi
         self.mamba_dec_shallow_multi = mamba_dec_shallow_multi
+
+        if self.use_pdaps and self.use_residual_flow_pyramid:
+            raise ValueError('use_pdaps and use_residual_flow_pyramid cannot be enabled at the same time')
         
         # --- [Architectural Refactoring] ---
         # Note: P-DAPS natively encapsulates coarse-to-fine deformation (previously isolated as 'pyramid').
@@ -441,13 +448,29 @@ class SiameseUNetBaseline(nn.Module):
             self.cmim_blocks.append(CrossModalInteractionModule(enc_nf[-2]))
         elif self.use_cross_mamba:
             if '1/16' in self.cross_mamba_scales:
-                self.cross_mamba_blocks['1_16'] = CrossMambaModule(enc_nf[-1])
+                self.cross_mamba_blocks['1_16'] = CrossMambaModule(
+                    enc_nf[-1],
+                    offset_limit=self.cross_mamba_offset_limit,
+                    offset_smooth_kernel=self.cross_mamba_offset_smooth_kernel,
+                )
             if '1/8' in self.cross_mamba_scales:
-                self.cross_mamba_blocks['1_8'] = CrossMambaModule(enc_nf[-2])
+                self.cross_mamba_blocks['1_8'] = CrossMambaModule(
+                    enc_nf[-2],
+                    offset_limit=self.cross_mamba_offset_limit,
+                    offset_smooth_kernel=self.cross_mamba_offset_smooth_kernel,
+                )
             if '1/4' in self.cross_mamba_scales:
-                self.cross_mamba_blocks['1_4'] = CrossMambaModule(enc_nf[-3])
+                self.cross_mamba_blocks['1_4'] = CrossMambaModule(
+                    enc_nf[-3],
+                    offset_limit=self.cross_mamba_offset_limit,
+                    offset_smooth_kernel=self.cross_mamba_offset_smooth_kernel,
+                )
             if '1/2' in self.cross_mamba_scales:
-                self.cross_mamba_blocks['1_2'] = CrossMambaModule(enc_nf[-4])
+                self.cross_mamba_blocks['1_2'] = CrossMambaModule(
+                    enc_nf[-4],
+                    offset_limit=self.cross_mamba_offset_limit,
+                    offset_smooth_kernel=self.cross_mamba_offset_smooth_kernel,
+                )
             
         # 1.6 Window Cost Volume (WCV) at shallow scales
         
@@ -528,6 +551,14 @@ class SiameseUNetBaseline(nn.Module):
         # Initialize flow weights to very small values
         self.flow_conv.weight.data.normal_(0, 1e-6)
         self.flow_conv.bias.data.zero_()
+
+        if self.use_residual_flow_pyramid:
+            self.residual_flow_heads = nn.ModuleList()
+            for nf in dec_nf:
+                flow_head = Conv(nf, ndim, kernel_size=3, padding=1)
+                flow_head.weight.data.normal_(0, 1e-6)
+                flow_head.bias.data.zero_()
+                self.residual_flow_heads.append(flow_head)
 
         # --- [P-DAPS Coarse-to-fine Flows] ---
         if self.use_pdaps:
@@ -623,7 +654,7 @@ class SiameseUNetBaseline(nn.Module):
 
         return set(items)
 
-    def forward(self, source, target, return_warped_source=True, return_field_type='displacement', return_coarse_flows=False, return_feature_edge_loss=False, feature_edge_indices=(0, 1)):
+    def forward(self, source, target, return_warped_source=True, return_field_type='displacement', return_coarse_flows=False, return_residual_flows=False, return_feature_edge_loss=False, feature_edge_indices=(0, 1)):
         # --- [Ablation 1 Hook: FDA will go here] ---
         source_input = source
         target_input = target
@@ -652,7 +683,9 @@ class SiameseUNetBaseline(nn.Module):
                 )
         
         coarse_flows = []
+        residual_flows = []
         pyramid_acc_flow = None
+        residual_acc_flow = None
         
         # 2. Decoding (Standard U-Net Upsampling)
         # Start from the bottom-most features (1/16 scale)
@@ -756,6 +789,26 @@ class SiameseUNetBaseline(nn.Module):
                 
             x = block(x)
 
+            if self.use_residual_flow_pyramid:
+                sub_flow_limit = torch.as_tensor(self.residual_flow_limit, dtype=x.dtype, device=x.device).clamp(min=1e-3)
+                raw_residual_flow = self.residual_flow_heads[i](x)
+                residual_flow = sub_flow_limit * torch.tanh(raw_residual_flow / sub_flow_limit)
+                residual_flows.append(residual_flow)
+
+                if residual_acc_flow is None:
+                    residual_acc_flow = residual_flow
+                else:
+                    mode = 'trilinear' if self.ndim == 3 else 'bilinear'
+                    up_flow = F.interpolate(residual_acc_flow, size=residual_flow.shape[2:], mode=mode, align_corners=False)
+                    up_flow = up_flow * 2.0
+                    residual_acc_flow = up_flow + residual_flow
+
+                if return_coarse_flows and i < len(self.dec_blocks) - 1:
+                    if self.integrate is not None:
+                        coarse_flows.append(self.integrate(residual_acc_flow))
+                    else:
+                        coarse_flows.append(residual_acc_flow)
+
             # --- [P-DAPS Coarse-to-fine Flow generation & Deep Supervision] ---
             if getattr(self, 'use_pdaps', False):
                 sub_flow_limit = torch.clamp(self.pdaps_flow_limits[i], min=1e-3).to(dtype=x.dtype)
@@ -778,6 +831,8 @@ class SiameseUNetBaseline(nn.Module):
         # --- [Ablation 3 Hook: Coarse-to-fine FPN handling will replace this] ---
         if getattr(self, 'use_pdaps', False):
             velocity = pyramid_acc_flow
+        elif self.use_residual_flow_pyramid:
+            velocity = residual_acc_flow
         else:
             velocity = 20.0 * torch.tanh(self.flow_conv(x) / 20.0)
         
@@ -797,6 +852,9 @@ class SiameseUNetBaseline(nn.Module):
 
         if return_coarse_flows:
             outputs.append(coarse_flows)
+
+        if return_residual_flows:
+            outputs.append(residual_flows)
 
         if return_feature_edge_loss:
             outputs.append(self._feature_edge_loss(feat_s, feat_t, displacement, feature_edge_indices))

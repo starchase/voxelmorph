@@ -1063,12 +1063,129 @@ def parse_feature_edge_indices(scales: str) -> tuple:
     return tuple(indices)
 
 
+def parse_pyramid_image_weights(weights: str) -> tuple:
+    values = []
+    for token in weights.split(','):
+        token = token.strip()
+        if not token:
+            continue
+        values.append(float(token))
+    return tuple(values)
+
+
+def _match_weight_count(weights: Sequence[float], count: int) -> list[float]:
+    if count <= 0:
+        return []
+    if not weights:
+        return [1.0] * count
+    matched = list(weights[:count])
+    if len(matched) < count:
+        matched.extend([matched[-1]] * (count - len(matched)))
+    return matched
+
+
+def unpack_model_outputs(
+    out,
+    expect_coarse_flows: bool = False,
+    expect_residual_flows: bool = False,
+    expect_feature_edge_loss: bool = False,
+):
+    idx = 0
+    displacement = out[idx]
+    idx += 1
+    warped_source = out[idx] if len(out) > idx else None
+    idx += 1
+
+    coarse_flows = []
+    if expect_coarse_flows:
+        coarse_flows = out[idx]
+        idx += 1
+
+    residual_flows = []
+    if expect_residual_flows:
+        residual_flows = out[idx]
+        idx += 1
+
+    feature_edge_loss = displacement.new_tensor(0.0)
+    if expect_feature_edge_loss and len(out) > idx:
+        feature_edge_loss = out[idx]
+
+    return displacement, warped_source, coarse_flows, residual_flows, feature_edge_loss
+
+
+def build_scaled_batch(batch, size: Sequence[int], device: str) -> dict:
+    scaled_batch = {}
+    for key in ('source_mask', 'target_mask'):
+        if key in batch:
+            scaled_batch[key] = F.interpolate(
+                batch[key].to(device, non_blocking=True).float(),
+                size=size,
+                mode='nearest',
+            )
+    return scaled_batch
+
+
+def compute_pyramid_auxiliary_losses(
+    model: nn.Module,
+    batch,
+    source: torch.Tensor,
+    target: torch.Tensor,
+    coarse_flows: Sequence[torch.Tensor],
+    residual_flows: Sequence[torch.Tensor],
+    image_loss_fn: nn.Module,
+    grad_loss_fn: nn.Module,
+    device: str,
+    loss_mask_mode: str,
+    pyramid_image_weight: float = 0.0,
+    pyramid_image_weights: Sequence[float] = (),
+    residual_flow_reg_weight: float = 0.0,
+):
+    zero = source.new_tensor(0.0)
+    pyramid_img_loss = zero
+    residual_flow_reg_loss = zero
+
+    if pyramid_image_weight > 0 and len(coarse_flows) > 0:
+        scale_weights = _match_weight_count(pyramid_image_weights, len(coarse_flows))
+        weight_sum = max(sum(scale_weights), 1e-6)
+        for scale_weight, flow in zip(scale_weights, coarse_flows):
+            flow_float = flow.float()
+            spatial_size = flow_float.shape[2:]
+            source_scaled = F.interpolate(source.float(), size=spatial_size, mode='trilinear', align_corners=False)
+            target_scaled = F.interpolate(target.float(), size=spatial_size, mode='trilinear', align_corners=False)
+            warped_source_scaled = model.spatial_transform(source_scaled, flow_float)
+            scaled_batch = build_scaled_batch(batch, spatial_size, device=device)
+            loss_mask = resolve_loss_mask(
+                scaled_batch,
+                flow_float,
+                target_scaled,
+                device=device,
+                mode=loss_mask_mode,
+            )
+            pyramid_img_loss = pyramid_img_loss + scale_weight * compute_image_loss(
+                image_loss_fn,
+                target_scaled,
+                warped_source_scaled,
+                mask=loss_mask,
+            )
+        pyramid_img_loss = pyramid_img_loss / weight_sum
+
+    if residual_flow_reg_weight > 0 and len(residual_flows) > 0:
+        stage_weights = [float(idx + 1) for idx in range(len(residual_flows))]
+        weight_sum = max(sum(stage_weights), 1e-6)
+        for stage_weight, residual_flow in zip(stage_weights, residual_flows):
+            residual_flow_reg_loss = residual_flow_reg_loss + stage_weight * grad_loss_fn(residual_flow.float()).mean()
+        residual_flow_reg_loss = residual_flow_reg_loss / weight_sum
+
+    return pyramid_img_loss, residual_flow_reg_loss
+
+
 def train_epoch(
     model: nn.Module,
     dataloader: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
     image_loss_fn: nn.Module,
     grad_loss_fn: nn.Module,
+    bend_loss_fn: Optional[nn.Module],
     loss_weights: Sequence[float],
     steps_per_epoch: int,   # Used only for progress bar calculation now if we iterate full loader
     pyramid_weight: float = 0.5,
@@ -1076,9 +1193,13 @@ def train_epoch(
     device: str = 'cuda',
     boundary_loss_fn: Optional[nn.Module] = None,
     boundary_loss_weight: float = 0.0,
+    bend_loss_weight: float = 0.0,
     loss_mask_mode: str = 'manual',
     feature_edge_loss_weight: float = 0.0,
     feature_edge_indices: tuple = (0, 1),
+    pyramid_image_weight: float = 0.0,
+    pyramid_image_weights: Sequence[float] = (),
+    residual_flow_reg_weight: float = 0.0,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -1110,26 +1231,23 @@ def train_epoch(
 
         with amp_autocast(device, dtype=amp_dtype, enabled=amp_enabled):
             use_feature_edge_loss = feature_edge_loss_weight > 0 and hasattr(model, '_feature_edge_loss')
-            if use_feature_edge_loss:
-                out = model(
-                    source,
-                    target,
-                    return_warped_source=True,
-                    return_field_type='displacement',
-                    return_coarse_flows=True,
-                    return_feature_edge_loss=True,
-                    feature_edge_indices=feature_edge_indices,
-                )
-            else:
-                out = model(
-                    source,
-                    target,
-                    return_warped_source=True,
-                    return_field_type='displacement',
-                    return_coarse_flows=True,
-                )
-            displacement, warped_source, coarse_flows = out[0], out[1], out[2]
-            feature_edge_loss = out[3] if use_feature_edge_loss and len(out) > 3 else displacement.new_tensor(0.0)
+            use_residual_flow_pyramid = getattr(model, 'use_residual_flow_pyramid', False)
+            out = model(
+                source,
+                target,
+                return_warped_source=True,
+                return_field_type='displacement',
+                return_coarse_flows=True,
+                return_residual_flows=use_residual_flow_pyramid,
+                return_feature_edge_loss=use_feature_edge_loss,
+                feature_edge_indices=feature_edge_indices,
+            )
+            displacement, warped_source, coarse_flows, residual_flows, feature_edge_loss = unpack_model_outputs(
+                out,
+                expect_coarse_flows=True,
+                expect_residual_flows=use_residual_flow_pyramid,
+                expect_feature_edge_loss=use_feature_edge_loss,
+            )
 
         # AMP 兼容性保护：强制将预测结果和 Loss 计算切回 float32。
         # 这是配准任务的常见坑，因为形变场和损失求导在 float16 下极易精度溢出
@@ -1149,9 +1267,28 @@ def train_epoch(
         img_loss = compute_image_loss(image_loss_fn, target_float, warped_source_float, mask=loss_mask)
             
         grad_loss = grad_loss_fn(displacement_float).mean()
+        bend_loss = displacement_float.new_tensor(0.0)
+        if bend_loss_fn is not None and bend_loss_weight > 0:
+            bend_loss = bend_loss_fn(displacement_float)
         boundary_loss = displacement_float.new_tensor(0.0)
         if boundary_loss_fn is not None and boundary_loss_weight > 0:
             boundary_loss = boundary_loss_fn(warped_source_float, target_float, mask=foreground_mask)
+
+        pyramid_img_loss, residual_flow_reg_loss = compute_pyramid_auxiliary_losses(
+            model,
+            batch,
+            source_float,
+            target_float,
+            coarse_flows,
+            residual_flows,
+            image_loss_fn,
+            grad_loss_fn,
+            device=device,
+            loss_mask_mode=loss_mask_mode,
+            pyramid_image_weight=pyramid_image_weight,
+            pyramid_image_weights=pyramid_image_weights,
+            residual_flow_reg_weight=residual_flow_reg_weight,
+        )
         
         # --- Deep Supervision for DAPS/Pyramid coarse flows ---
         deep_sup_loss = 0.0
@@ -1167,10 +1304,16 @@ def train_epoch(
             
         # 注意：这里的 deep_sup_loss 只包含平滑度惩罚，因此需要乘上平滑度权重 loss_weights[1]
         loss = loss_weights[0] * img_loss + loss_weights[1] * (grad_loss + pyramid_weight * deep_sup_loss)
+        if pyramid_image_weight > 0:
+            loss = loss + pyramid_image_weight * pyramid_img_loss
+        if bend_loss_weight > 0:
+            loss = loss + bend_loss_weight * bend_loss
         if boundary_loss_weight > 0:
             loss = loss + boundary_loss_weight * boundary_loss
         if feature_edge_loss_weight > 0:
             loss = loss + feature_edge_loss_weight * feature_edge_loss.float()
+        if residual_flow_reg_weight > 0:
+            loss = loss + residual_flow_reg_weight * residual_flow_reg_loss
 
         if not torch.isfinite(loss):
             optimizer.zero_grad(set_to_none=True)
@@ -1280,14 +1423,20 @@ def validate(
     dataloader: torch.utils.data.DataLoader,
     image_loss_fn: nn.Module,
     grad_loss_fn: nn.Module,
+    bend_loss_fn: Optional[nn.Module],
     loss_weights: Sequence[float],
     device: str = 'cuda',
     fast: bool = False,  # Optimization: Skip slow metrics
     boundary_loss_fn: Optional[nn.Module] = None,
     boundary_loss_weight: float = 0.0,
+    bend_loss_weight: float = 0.0,
     loss_mask_mode: str = 'manual',
     feature_edge_loss_weight: float = 0.0,
     feature_edge_indices: tuple = (0, 1),
+    pyramid_weight: float = 0.5,
+    pyramid_image_weight: float = 0.0,
+    pyramid_image_weights: Sequence[float] = (),
+    residual_flow_reg_weight: float = 0.0,
 ):
     """
     Run lightweight validation for model selection.
@@ -1318,24 +1467,24 @@ def validate(
                 torch.cuda.synchronize()
             
             use_feature_edge_loss = feature_edge_loss_weight > 0 and hasattr(model, '_feature_edge_loss')
-            if use_feature_edge_loss:
-                out = model(
-                    source,
-                    target,
-                    return_warped_source=True,
-                    return_field_type='displacement',
-                    return_feature_edge_loss=True,
-                    feature_edge_indices=feature_edge_indices,
-                )
-            else:
-                out = model(
-                    source,
-                    target,
-                    return_warped_source=True,
-                    return_field_type='displacement',
-                )
-            displacement, warped_source = out[0], out[1]
-            feature_edge_loss = out[2] if use_feature_edge_loss and len(out) > 2 else displacement.new_tensor(0.0)
+            use_residual_flow_pyramid = getattr(model, 'use_residual_flow_pyramid', False)
+            request_pyramid_outputs = use_residual_flow_pyramid and (pyramid_weight > 0 or pyramid_image_weight > 0 or residual_flow_reg_weight > 0)
+            out = model(
+                source,
+                target,
+                return_warped_source=True,
+                return_field_type='displacement',
+                return_coarse_flows=request_pyramid_outputs,
+                return_residual_flows=use_residual_flow_pyramid and request_pyramid_outputs,
+                return_feature_edge_loss=use_feature_edge_loss,
+                feature_edge_indices=feature_edge_indices,
+            )
+            displacement, warped_source, coarse_flows, residual_flows, feature_edge_loss = unpack_model_outputs(
+                out,
+                expect_coarse_flows=request_pyramid_outputs,
+                expect_residual_flows=use_residual_flow_pyramid and request_pyramid_outputs,
+                expect_feature_edge_loss=use_feature_edge_loss,
+            )
             
             if device == 'cuda':
                 torch.cuda.synchronize()
@@ -1360,7 +1509,35 @@ def validate(
             )
             img_loss = compute_image_loss(image_loss_fn, target, warped_source, mask=loss_mask)
             grad_loss = grad_loss_fn(displacement)
+            bend_loss = displacement.new_tensor(0.0)
+            if bend_loss_fn is not None and bend_loss_weight > 0:
+                bend_loss = bend_loss_fn(displacement)
             loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
+            if len(coarse_flows) > 0:
+                deep_sup_loss = 0.0
+                for c_flow in coarse_flows:
+                    deep_sup_loss += grad_loss_fn(c_flow.float()).mean()
+                deep_sup_loss = deep_sup_loss / len(coarse_flows)
+                loss = loss + loss_weights[1] * pyramid_weight * deep_sup_loss
+            pyramid_img_loss, residual_flow_reg_loss = compute_pyramid_auxiliary_losses(
+                model,
+                batch,
+                source,
+                target,
+                coarse_flows,
+                residual_flows,
+                image_loss_fn,
+                grad_loss_fn,
+                device=device,
+                loss_mask_mode=loss_mask_mode,
+                pyramid_image_weight=pyramid_image_weight,
+                pyramid_image_weights=pyramid_image_weights,
+                residual_flow_reg_weight=residual_flow_reg_weight,
+            )
+            if pyramid_image_weight > 0:
+                loss = loss + pyramid_image_weight * pyramid_img_loss
+            if bend_loss_weight > 0:
+                loss = loss + bend_loss_weight * bend_loss
             boundary_loss = displacement.new_tensor(0.0)
             if boundary_loss_fn is not None and boundary_loss_weight > 0:
                 boundary_loss = boundary_loss_fn(
@@ -1371,6 +1548,8 @@ def validate(
                 loss = loss + boundary_loss_weight * boundary_loss
             if feature_edge_loss_weight > 0:
                 loss = loss + feature_edge_loss_weight * feature_edge_loss.float()
+            if residual_flow_reg_weight > 0:
+                loss = loss + residual_flow_reg_weight * residual_flow_reg_loss
             total_loss += loss.item()
             total_boundary_loss += boundary_loss.item()
             num_batches += 1
@@ -1452,14 +1631,20 @@ def test_evaluate(
     dataloader: torch.utils.data.DataLoader,
     image_loss_fn: nn.Module,
     grad_loss_fn: nn.Module,
+    bend_loss_fn: Optional[nn.Module],
     loss_weights: Sequence[float],
     device: str = 'cuda',
     fast: bool = False,
     boundary_loss_fn: Optional[nn.Module] = None,
     boundary_loss_weight: float = 0.0,
+    bend_loss_weight: float = 0.0,
     loss_mask_mode: str = 'manual',
     feature_edge_loss_weight: float = 0.0,
     feature_edge_indices: tuple = (0, 1),
+    pyramid_weight: float = 0.5,
+    pyramid_image_weight: float = 0.0,
+    pyramid_image_weights: Sequence[float] = (),
+    residual_flow_reg_weight: float = 0.0,
 ):
     """
     Run Comprehensive Testing. 
@@ -1506,19 +1691,24 @@ def test_evaluate(
             start_time = time.time()
             if device == 'cuda': torch.cuda.synchronize()
             use_feature_edge_loss = feature_edge_loss_weight > 0 and hasattr(model, '_feature_edge_loss')
-            if use_feature_edge_loss:
-                out = model(
-                    source,
-                    target,
-                    return_warped_source=True,
-                    return_field_type='displacement',
-                    return_feature_edge_loss=True,
-                    feature_edge_indices=feature_edge_indices,
-                )
-            else:
-                out = model(source, target, return_warped_source=True, return_field_type='displacement')
-            displacement, warped_source = out[0], out[1]
-            feature_edge_loss = out[2] if use_feature_edge_loss and len(out) > 2 else displacement.new_tensor(0.0)
+            use_residual_flow_pyramid = getattr(model, 'use_residual_flow_pyramid', False)
+            request_pyramid_outputs = use_residual_flow_pyramid and (pyramid_weight > 0 or pyramid_image_weight > 0 or residual_flow_reg_weight > 0)
+            out = model(
+                source,
+                target,
+                return_warped_source=True,
+                return_field_type='displacement',
+                return_coarse_flows=request_pyramid_outputs,
+                return_residual_flows=use_residual_flow_pyramid and request_pyramid_outputs,
+                return_feature_edge_loss=use_feature_edge_loss,
+                feature_edge_indices=feature_edge_indices,
+            )
+            displacement, warped_source, coarse_flows, residual_flows, feature_edge_loss = unpack_model_outputs(
+                out,
+                expect_coarse_flows=request_pyramid_outputs,
+                expect_residual_flows=use_residual_flow_pyramid and request_pyramid_outputs,
+                expect_feature_edge_loss=use_feature_edge_loss,
+            )
             if device == 'cuda': torch.cuda.synchronize()
             end_time = time.time()
             total_time += ((end_time - start_time) / source.shape[0])
@@ -1537,7 +1727,35 @@ def test_evaluate(
             )
             img_loss = compute_image_loss(image_loss_fn, target, warped_source, mask=loss_mask)
             grad_loss = grad_loss_fn(displacement)
+            bend_loss = displacement.new_tensor(0.0)
+            if bend_loss_fn is not None and bend_loss_weight > 0:
+                bend_loss = bend_loss_fn(displacement)
             loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
+            if len(coarse_flows) > 0:
+                deep_sup_loss = 0.0
+                for c_flow in coarse_flows:
+                    deep_sup_loss += grad_loss_fn(c_flow.float()).mean()
+                deep_sup_loss = deep_sup_loss / len(coarse_flows)
+                loss = loss + loss_weights[1] * pyramid_weight * deep_sup_loss
+            pyramid_img_loss, residual_flow_reg_loss = compute_pyramid_auxiliary_losses(
+                model,
+                batch,
+                source,
+                target,
+                coarse_flows,
+                residual_flows,
+                image_loss_fn,
+                grad_loss_fn,
+                device=device,
+                loss_mask_mode=loss_mask_mode,
+                pyramid_image_weight=pyramid_image_weight,
+                pyramid_image_weights=pyramid_image_weights,
+                residual_flow_reg_weight=residual_flow_reg_weight,
+            )
+            if pyramid_image_weight > 0:
+                loss = loss + pyramid_image_weight * pyramid_img_loss
+            if bend_loss_weight > 0:
+                loss = loss + bend_loss_weight * bend_loss
             boundary_loss = displacement.new_tensor(0.0)
             if boundary_loss_fn is not None and boundary_loss_weight > 0:
                 boundary_loss = boundary_loss_fn(
@@ -1548,6 +1766,8 @@ def test_evaluate(
                 loss = loss + boundary_loss_weight * boundary_loss
             if feature_edge_loss_weight > 0:
                 loss = loss + feature_edge_loss_weight * feature_edge_loss.float()
+            if residual_flow_reg_weight > 0:
+                loss = loss + residual_flow_reg_weight * residual_flow_reg_loss
             total_loss += loss.item()
             total_boundary_loss += boundary_loss.item()
             num_batches += 1
@@ -1744,6 +1964,7 @@ def main():
     parser.add_argument('--warmup-epochs', type=int, default=10, help='Number of epochs for learning rate warmup')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--lambda', type=float, dest='lambda_param', default=0.01, help='Regularization weight (0.01 for smooth, 1.0 for rigid)')
+    parser.add_argument('--bend-weight', type=float, default=0.0, help='Weight for second-order bending energy regularization on the final displacement field')
     parser.add_argument('--gpu', type=str, default='0', help='GPU ID')
     parser.add_argument('--save-every', type=int, default=10, help='Checkpoint every N epochs')
     parser.add_argument('--image-loss', type=str, choices=['mse', 'ncc', 'mi', 'local_mi', 'mind', 'mi_mind'], default='ncc', help='Image similarity loss')
@@ -1765,12 +1986,19 @@ def main():
     )
     parser.add_argument('--integration-steps', type=int, default=0, help='number of integration steps for diffeomorphic registration')
     parser.add_argument('--pyramid-weight', type=float, default=0.5, help='Weight for intermediate pyramid deep supervision loss')
+    parser.add_argument('--use-residual-flow-pyramid', action='store_true', help='Use lightweight coarse-to-fine residual flow accumulation without warping skip features')
+    parser.add_argument('--residual-flow-limit', type=float, default=4.0, help='Per-stage magnitude cap for residual flow heads when residual flow pyramid is enabled')
+    parser.add_argument('--pyramid-image-weight', type=float, default=0.0, help='Weight for multi-scale image supervision on intermediate pyramid displacements')
+    parser.add_argument('--pyramid-image-weights', type=str, default='0.2,0.35,0.5', help='Comma-separated relative weights for intermediate pyramid image supervision from coarse to fine')
+    parser.add_argument('--residual-flow-reg-weight', type=float, default=0.0, help='Weight for gradient regularization on per-stage residual flow heads')
     parser.add_argument('--use-pdaps', action='store_true', help='Use Pyramid-guided Deformation-Aware Progressive Skip')
     parser.add_argument('--use-daps', action='store_true', help='Use original DAPS')
     parser.add_argument('--use-dsin', action='store_true', help='Use DSIN')
     parser.add_argument('--use-cmim', action='store_true', help='Use CMIM')
     parser.add_argument('--use-cross-mamba', action='store_true', help='Use Cross-Mamba at deep decoder scales')
     parser.add_argument('--cross-mamba-scales', type=str, default='1/16,1/8', help='Comma-separated deep scales for Cross-Mamba, e.g. 1/16 or 1/16,1/8,1/4,1/2')
+    parser.add_argument('--cross-mamba-offset-limit', type=float, default=0.0, help='Feature-space resampling offset cap inside Cross-Mamba; 0 disables offset limiting/resampling regularization for cleaner ablations')
+    parser.add_argument('--cross-mamba-offset-smooth-kernel', type=int, default=1, help='Odd average-pooling kernel for smoothing Cross-Mamba offsets; 1 disables smoothing')
     parser.add_argument('--use-wcv', action='store_true', help='Use window cost volume on deep skip features')
     parser.add_argument('--use-swcv', action='store_true', help='Use structure-aware window cost volume on deep skip features')
     parser.add_argument('--use-gcv', action='store_true', help='Use global cost volume on deep features')
@@ -1850,6 +2078,8 @@ def main():
             use_cmim=args.use_cmim,
             use_cross_mamba=args.use_cross_mamba,
             cross_mamba_scales=getattr(args, 'cross_mamba_scales', '1/16,1/8'),
+            cross_mamba_offset_limit=args.cross_mamba_offset_limit,
+            cross_mamba_offset_smooth_kernel=args.cross_mamba_offset_smooth_kernel,
             use_wcv=(args.use_wcv or args.use_wmca),
             use_swcv=args.use_swcv,
             use_gcv=args.use_gcv,
@@ -1862,6 +2092,8 @@ def main():
             fusion_method=args.fusion_method,
             window_size=args.window_size,
             pdaps_flow_limit=args.pdaps_flow_limit,
+            use_residual_flow_pyramid=args.use_residual_flow_pyramid,
+            residual_flow_limit=args.residual_flow_limit,
             use_boundary_branch=args.use_boundary_branch,
             boundary_branch_scales=args.boundary_branch_scales,
             boundary_branch_strength=args.boundary_branch_strength,
@@ -1899,6 +2131,7 @@ def main():
         image_loss_fn = ne.nn.modules.NCC(window_size=args.ncc_win, eps=1e-3).to(device)
 
     grad_loss_fn = ne.nn.modules.SpatialGradient('l2')
+    bend_loss_fn = vxm.nn.losses.BendingEnergyLoss().to(device) if args.bend_weight > 0 else None
     boundary_loss_fn = None
     if args.use_boundary_loss:
         boundary_loss_fn = vxm.nn.losses.BoundaryConsistencyLoss(
@@ -1908,6 +2141,7 @@ def main():
         ).to(device)
     loss_weights = [1.0, args.lambda_param]
     feature_edge_indices = parse_feature_edge_indices(args.feature_edge_scales)
+    pyramid_image_weights = parse_pyramid_image_weights(args.pyramid_image_weights)
     active_feature_edge_loss_weight = args.feature_edge_loss_weight if args.use_feature_edge_loss else 0.0
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
@@ -2011,8 +2245,16 @@ def main():
         f.write(f"MI Weight: {args.mi_weight}\n")
         f.write(f"MIND Weight: {args.mind_weight}\n")
         f.write(f"Lambda: {args.lambda_param}\n")
+        f.write(f"Bend Weight: {args.bend_weight}\n")
+        f.write(f"Use Residual Flow Pyramid: {args.use_residual_flow_pyramid}\n")
+        f.write(f"Residual Flow Limit: {args.residual_flow_limit}\n")
+        f.write(f"Pyramid Image Weight: {args.pyramid_image_weight}\n")
+        f.write(f"Pyramid Image Weights: {args.pyramid_image_weights}\n")
+        f.write(f"Residual Flow Reg Weight: {args.residual_flow_reg_weight}\n")
         f.write(f"Feature Edge Loss Weight: {active_feature_edge_loss_weight}\n")
         f.write(f"Feature Edge Scales: {args.feature_edge_scales}\n")
+        f.write(f"Cross-Mamba Offset Limit: {args.cross_mamba_offset_limit}\n")
+        f.write(f"Cross-Mamba Offset Smooth Kernel: {args.cross_mamba_offset_smooth_kernel}\n")
         f.write(f"LR: {args.lr}\n")
         f.write(f"Integration Steps: {args.integration_steps}\n")
         f.write(f"Decouple Layers: {args.decouple_layers}\n")
@@ -2057,6 +2299,7 @@ def main():
             optimizer=optimizer,
             image_loss_fn=image_loss_fn,
             grad_loss_fn=grad_loss_fn,
+            bend_loss_fn=bend_loss_fn,
             loss_weights=loss_weights,
             steps_per_epoch=len(train_loader),
             pyramid_weight=args.pyramid_weight,
@@ -2064,9 +2307,13 @@ def main():
             device=device,
             boundary_loss_fn=boundary_loss_fn,
             boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
+            bend_loss_weight=args.bend_weight,
             loss_mask_mode=args.loss_mask_mode,
             feature_edge_loss_weight=active_feature_edge_loss_weight,
             feature_edge_indices=feature_edge_indices,
+            pyramid_image_weight=args.pyramid_image_weight,
+            pyramid_image_weights=pyramid_image_weights,
+            residual_flow_reg_weight=args.residual_flow_reg_weight,
         )
 
         # -----------------------------
@@ -2084,14 +2331,20 @@ def main():
                 dataloader=val_loader,
                 image_loss_fn=image_loss_fn,
                 grad_loss_fn=grad_loss_fn,
+                bend_loss_fn=bend_loss_fn,
                 loss_weights=loss_weights,
                 device=device,
                 fast=True,
                 boundary_loss_fn=boundary_loss_fn,
                 boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
+                bend_loss_weight=args.bend_weight,
                 loss_mask_mode=args.loss_mask_mode,
                 feature_edge_loss_weight=active_feature_edge_loss_weight,
                 feature_edge_indices=feature_edge_indices,
+                pyramid_weight=args.pyramid_weight,
+                pyramid_image_weight=args.pyramid_image_weight,
+                pyramid_image_weights=pyramid_image_weights,
+                residual_flow_reg_weight=args.residual_flow_reg_weight,
             )
             
             print(f'Epoch {epoch + 1} | TrainTotal: {avg_loss:.4f} (Img: {last_img_loss:.4f}, Grad: {last_grad_loss:.6f}) | GradNorm: {avg_grad_norm:.6f}, UpdateRatio: {update_ratio:.2%}')
@@ -2127,14 +2380,20 @@ def main():
                 dataloader=test_loader,
                 image_loss_fn=image_loss_fn,
                 grad_loss_fn=grad_loss_fn,
+                bend_loss_fn=bend_loss_fn,
                 loss_weights=loss_weights,
                 device=device,
                 fast=fast_eval, # HD95 only calculated if fast=False
                 boundary_loss_fn=boundary_loss_fn,
                 boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
+                bend_loss_weight=args.bend_weight,
                 loss_mask_mode=args.loss_mask_mode,
                 feature_edge_loss_weight=active_feature_edge_loss_weight,
                 feature_edge_indices=feature_edge_indices,
+                pyramid_weight=args.pyramid_weight,
+                pyramid_image_weight=args.pyramid_image_weight,
+                pyramid_image_weights=pyramid_image_weights,
+                residual_flow_reg_weight=args.residual_flow_reg_weight,
             )
             
             if test_dice > best_test_dice:
@@ -2148,14 +2407,20 @@ def main():
                         dataloader=test_loader,
                         image_loss_fn=image_loss_fn,
                         grad_loss_fn=grad_loss_fn,
+                        bend_loss_fn=bend_loss_fn,
                         loss_weights=loss_weights,
                         device=device,
                         fast=False, # Now run full
                         boundary_loss_fn=boundary_loss_fn,
                         boundary_loss_weight=(args.boundary_loss_weight if args.use_boundary_loss else 0.0),
+                        bend_loss_weight=args.bend_weight,
                         loss_mask_mode=args.loss_mask_mode,
                         feature_edge_loss_weight=active_feature_edge_loss_weight,
                         feature_edge_indices=feature_edge_indices,
+                        pyramid_weight=args.pyramid_weight,
+                        pyramid_image_weight=args.pyramid_image_weight,
+                        pyramid_image_weights=pyramid_image_weights,
+                        residual_flow_reg_weight=args.residual_flow_reg_weight,
                     )
 
             test_label_metrics_str = ""
