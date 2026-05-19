@@ -518,6 +518,7 @@ def validate(
     image_loss_fn: nn.Module = None,
     grad_loss_fn: nn.Module = None,
     loss_weights: list = None,
+    image_loss_fn_coarse: nn.Module = None,
     boundary_loss_fn: nn.Module = None,
     boundary_loss_weight: float = 0.0,
     boundary_ring_inner_kernel: int = 3,
@@ -607,6 +608,7 @@ def validate(
                     fg_mask,
                     coarse_flows,
                     residual_flows,
+                    image_loss_fn_coarse,
                     grad_loss_fn,
                     loss_weights,
                     use_mask,
@@ -809,6 +811,7 @@ def compute_oasis_pyramid_losses(
     fg_mask: torch.Tensor,
     coarse_flows: list,
     residual_flows: list,
+    image_loss_fn_coarse: nn.Module,
     grad_loss_fn: nn.Module,
     loss_weights: list,
     use_mask: bool,
@@ -862,9 +865,15 @@ def compute_oasis_pyramid_losses(
                         c_img_loss = squared_diff.mean()
                 else:
                     if use_mask and mask_down is not None:
-                        c_img_loss = global_ncc(y_down * mask_down, warped_x_down * mask_down)
+                        if image_loss_fn_coarse is not None:
+                            c_img_loss = -image_loss_fn_coarse(y_down * mask_down, warped_x_down * mask_down).mean()
+                        else:
+                            c_img_loss = global_ncc(y_down * mask_down, warped_x_down * mask_down)
                     else:
-                        c_img_loss = global_ncc(y_down, warped_x_down)
+                        if image_loss_fn_coarse is not None:
+                            c_img_loss = -image_loss_fn_coarse(y_down, warped_x_down).mean()
+                        else:
+                            c_img_loss = global_ncc(y_down, warped_x_down)
 
                 pyramid_img_loss = pyramid_img_loss + scale_weight * c_img_loss
 
@@ -997,6 +1006,7 @@ def train_epoch(
             fg_mask,
             coarse_flows,
             residual_flows,
+            image_loss_fn_coarse,
             grad_loss_fn,
             loss_weights,
             use_mask,
@@ -1079,6 +1089,7 @@ def main():
     parser.add_argument('--residual-flow-limit', type=float, default=4.0, help='Per-stage magnitude cap for residual flow heads when residual flow pyramid is enabled')
     parser.add_argument('--pyramid-image-weight', type=float, default=0.0, help='Weight for multi-scale image supervision on intermediate pyramid displacements')
     parser.add_argument('--pyramid-image-weights', type=str, default='0.2,0.35,0.5', help='Comma-separated relative weights for intermediate pyramid image supervision from coarse to fine')
+    parser.add_argument('--pyramid-image-start-epoch', type=int, default=1, help='Enable pyramid image supervision starting from this 1-based epoch')
     parser.add_argument('--residual-flow-reg-weight', type=float, default=0.0, help='Weight for gradient regularization on per-stage residual flow heads')
     parser.add_argument('--use-pdaps', action='store_true', help='Use Pyramid-guided Deformation-Aware Progressive Skip')
     parser.add_argument('--pdaps-flow-limit', type=float, default=20.0, help='Maximum physical flow limit for P-DAPS. E.g., 20.0 for Brain, 30.0+ for Abdomen CT/MRI.')
@@ -1249,6 +1260,7 @@ def main():
         f.write(f"Lambda: {args.lambda_param}\n")
         f.write(f"Pyramid Weight: {args.pyramid_weight}\n")
         f.write(f"Pyramid Image Weight: {args.pyramid_image_weight}\n")
+        f.write(f"Pyramid Image Start Epoch: {args.pyramid_image_start_epoch}\n")
         f.write(f"Pyramid Image Weights: {args.pyramid_image_weights}\n")
         f.write(f"Feature Edge Loss Weight: {base_feature_edge_loss_weight}\n")
         f.write(f"Feature Edge Start Epoch: {args.feature_edge_start_epoch}\n")
@@ -1287,6 +1299,8 @@ def main():
         active_boundary_loss_weight = args.boundary_loss_weight if boundary_loss_active else 0.0
         feature_edge_active = args.use_feature_edge_loss and (epoch_num >= args.feature_edge_start_epoch)
         active_feature_edge_loss_weight = base_feature_edge_loss_weight if feature_edge_active else 0.0
+        pyramid_image_active = epoch_num >= args.pyramid_image_start_epoch
+        active_pyramid_image_weight = args.pyramid_image_weight if pyramid_image_active else 0.0
         
         avg_loss, train_img_loss, train_grad_loss, train_feature_edge_loss = train_epoch(
             model=model,
@@ -1308,7 +1322,7 @@ def main():
             boundary_ring_outer_kernel=args.boundary_ring_outer_kernel,
             feature_edge_loss_weight=active_feature_edge_loss_weight,
             feature_edge_indices=feature_edge_indices,
-            pyramid_image_weight=args.pyramid_image_weight,
+            pyramid_image_weight=active_pyramid_image_weight,
             pyramid_image_weights=pyramid_image_weights,
             residual_flow_reg_weight=args.residual_flow_reg_weight,
         )
@@ -1330,11 +1344,12 @@ def main():
             feature_edge_loss_weight=active_feature_edge_loss_weight,
             feature_edge_indices=feature_edge_indices,
             pyramid_weight=args.pyramid_weight,
-            pyramid_image_weight=args.pyramid_image_weight,
+            pyramid_image_weight=active_pyramid_image_weight,
             pyramid_image_weights=pyramid_image_weights,
             residual_flow_reg_weight=args.residual_flow_reg_weight,
             use_mask=args.use_mask,
             loss_type=args.loss.lower(),
+            image_loss_fn_coarse=image_loss_fn_coarse,
         )
         
         # Decide if we need to compute heavy extra metrics (HD95, Jac, Mag)
