@@ -158,15 +158,22 @@ def save_qualitative_results(
 ):
     """Save mid-slice images of samples."""
 
-    def _extract_error_guided_stage_slices(error_guided_maps, z_idx):
+    def _extract_error_guided_stage_slices(error_guided_maps, z_idx, reference_depth):
         stage_slices = []
         for item in error_guided_maps:
             error_map = item.get('error_map')
             gate_map = item.get('gate_map')
             if error_map is None or gate_map is None:
                 continue
-            error_slice = np.rot90(error_map[0, 0, :, :, z_idx].detach().cpu().numpy(), -1)
-            gate_slice = np.rot90(gate_map[0, 0, :, :, z_idx].detach().cpu().numpy(), -1)
+            map_depth = int(error_map.shape[4])
+            if map_depth <= 1 or reference_depth <= 1:
+                mapped_z_idx = 0
+            else:
+                mapped_z_idx = int(round(z_idx * (map_depth - 1) / (reference_depth - 1)))
+            mapped_z_idx = max(0, min(mapped_z_idx, map_depth - 1))
+
+            error_slice = np.rot90(error_map[0, 0, :, :, mapped_z_idx].detach().cpu().numpy(), -1)
+            gate_slice = np.rot90(gate_map[0, 0, :, :, mapped_z_idx].detach().cpu().numpy(), -1)
             stage_slices.append({
                 'stage_idx': item.get('stage_idx', -1),
                 'error_slice': error_slice,
@@ -254,7 +261,7 @@ def save_qualitative_results(
         warped_lbl_slice = get_slice(warped_label, slice_idx, is_label=True)
         
         has_labels = (src_lbl_slice is not None) and (tgt_lbl_slice is not None)
-        error_guided_stage_slices = _extract_error_guided_stage_slices(error_guided_maps, slice_idx)
+        error_guided_stage_slices = _extract_error_guided_stage_slices(error_guided_maps, slice_idx, source.shape[4])
         
         rows = 5 if len(error_guided_stage_slices) > 0 else 4
         cols = 4

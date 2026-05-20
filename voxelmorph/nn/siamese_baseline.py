@@ -674,7 +674,14 @@ class SiameseUNetBaseline(nn.Module):
                 warp_displacement = flow_up
             warped_source = self.spatial_transform(source_feature_float, warp_displacement.float())
 
-        error_map = torch.mean(torch.abs(warped_source - target_feature_float), dim=1, keepdim=True).detach()
+        # Max-pooling across channels instead of mean to prevent structurally stark differences 
+        # from being diluted by inactive background channels.
+        error_map_raw = torch.abs(warped_source - target_feature_float)
+        error_map_max, _ = torch.max(error_map_raw, dim=1, keepdim=True)
+        error_map_mean = torch.mean(error_map_raw, dim=1, keepdim=True)
+        # Blend max and mean to retain structural outline while capturing highest response peaks
+        error_map = (0.7 * error_map_max + 0.3 * error_map_mean).detach()
+        
         gate_logits = gate_module(error_map)
         gate = 0.5 + torch.sigmoid(gate_logits)
         return gate.to(dtype=source_feature.dtype), error_map.to(dtype=source_feature.dtype)
