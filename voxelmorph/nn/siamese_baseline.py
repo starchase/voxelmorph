@@ -674,13 +674,23 @@ class SiameseUNetBaseline(nn.Module):
                 warp_displacement = flow_up
             warped_source = self.spatial_transform(source_feature_float, warp_displacement.float())
 
-        # Max-pooling across channels instead of mean to prevent structurally stark differences 
-        # from being diluted by inactive background channels.
-        error_map_raw = torch.abs(warped_source - target_feature_float)
-        error_map_max, _ = torch.max(error_map_raw, dim=1, keepdim=True)
-        error_map_mean = torch.mean(error_map_raw, dim=1, keepdim=True)
-        # Blend max and mean to retain structural outline while capturing highest response peaks
-        error_map = (0.7 * error_map_max + 0.3 * error_map_mean).detach()
+# CRITICAL FIX: Direct absolute difference (torch.abs) fails for cross-modal Siamese features 
+        # (CT/MR have different intensity distributions, so aligned features don't numerically match).
+        # We compute Pearson Correlation across the channel dimension and take 1 - abs(NCC) 
+        # to measure true structural misalignment invariant to modality intensity gaps.
+        s_mean = warped_source.mean(dim=1, keepdim=True)
+        t_mean = target_feature_float.mean(dim=1, keepdim=True)
+        s_dev = warped_source - s_mean
+        t_dev = target_feature_float - t_mean
+        
+        covar = torch.sum(s_dev * t_dev, dim=1, keepdim=True)
+        s_var = torch.sum(s_dev * s_dev, dim=1, keepdim=True)
+        t_var = torch.sum(t_dev * t_dev, dim=1, keepdim=True)
+        
+        ncc = covar / (torch.sqrt(s_var * t_var) + 1e-5)
+        # abs(ncc) handles inverse polarity (e.g. CT bright bone vs MR dark bone).
+        # 1.0 - abs(ncc) represents structural discrepancy (0 when perfectly aligned/inversely-aligned, 1 when misaligned)
+        error_map = (1.0 - torch.abs(ncc)).detach()
         
         gate_logits = gate_module(error_map)
         gate = 0.5 + torch.sigmoid(gate_logits)
