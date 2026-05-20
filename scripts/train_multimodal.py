@@ -259,6 +259,23 @@ def save_qualitative_results(
     boundary_smooth_kernel=3,
 ):
     """Save mid-slice images of samples."""
+
+    def _extract_error_guided_stage_slices(error_guided_maps, z_idx):
+        stage_slices = []
+        for item in error_guided_maps:
+            error_map = item.get('error_map')
+            gate_map = item.get('gate_map')
+            if error_map is None or gate_map is None:
+                continue
+            error_slice = np.rot90(error_map[0, 0, :, :, z_idx].detach().cpu().numpy())
+            gate_slice = np.rot90(gate_map[0, 0, :, :, z_idx].detach().cpu().numpy())
+            stage_slices.append({
+                'stage_idx': item.get('stage_idx', -1),
+                'error_slice': error_slice,
+                'gate_slice': gate_slice,
+            })
+        stage_slices.sort(key=lambda x: x['stage_idx'])
+        return stage_slices
     
     samples_to_plot = []
     
@@ -295,6 +312,7 @@ def save_qualitative_results(
         model.eval()
         with torch.no_grad():
             displacement, warped_source = model(source, target, return_warped_source=True, return_field_type='displacement')
+            error_guided_maps = list(getattr(model, 'latest_error_guided_residual_maps', []))
             boundary_extractor = vxm.nn.modules.FixedGradientMagnitude3D(
                 operator=boundary_kernel,
                 smooth_kernel_size=boundary_smooth_kernel,
@@ -412,9 +430,10 @@ def save_qualitative_results(
         
         # Plot - Dynamic Rows setup
         has_labels = (src_lbl_slice is not None) and (tgt_lbl_slice is not None)
+        error_guided_stage_slices = _extract_error_guided_stage_slices(error_guided_maps, slice_idx)
         
         # Re-organized Layout: 3 Rows x 4 Cols (12 plots total) to fit Jacobian
-        rows = 4
+        rows = 5 if len(error_guided_stage_slices) > 0 else 4
         cols = 4
         fig, axes = plt.subplots(rows, cols, figsize=(20, 20))
         
@@ -778,6 +797,25 @@ def save_qualitative_results(
         axes[3, 3].imshow(foreground_mask_slice, cmap='autumn', alpha=0.45, vmin=0.0, vmax=1.0)
         axes[3, 3].set_title('Foreground Mask')
         axes[3, 3].axis('off')
+
+        if len(error_guided_stage_slices) > 0:
+            for plot_idx in range(4):
+                axes[4, plot_idx].axis('off')
+
+            for stage_pos, stage_item in enumerate(error_guided_stage_slices[:2]):
+                col_offset = stage_pos * 2
+                error_slice = stage_item['error_slice']
+                gate_slice = stage_item['gate_slice']
+                stage_idx = stage_item['stage_idx']
+
+                error_vmax = max(float(np.max(error_slice)), 1e-6)
+                axes[4, col_offset].imshow(error_slice, cmap='magma', vmin=0.0, vmax=error_vmax)
+                axes[4, col_offset].set_title(f'Err Map (Stage {stage_idx})')
+                axes[4, col_offset].axis('off')
+
+                axes[4, col_offset + 1].imshow(gate_slice, cmap='viridis', vmin=0.5, vmax=1.5)
+                axes[4, col_offset + 1].set_title(f'Gate Map (Stage {stage_idx})')
+                axes[4, col_offset + 1].axis('off')
 
         plt.suptitle(f'Epoch {epoch} - Sample {name_tag} (Slice Z={slice_idx})', fontsize=16)
         
@@ -2036,6 +2074,8 @@ def main():
 
     if args.use_cmim and args.use_cross_mamba:
         parser.error('--use-cmim and --use-cross-mamba are mutually exclusive interaction modules.')
+    if args.use_error_guided_residual and not args.use_residual_flow_pyramid:
+        parser.error('--use-error-guided-residual requires --use-residual-flow-pyramid.')
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f'Using device: {device}')
@@ -2095,7 +2135,7 @@ def main():
             window_size=args.window_size,
             pdaps_flow_limit=args.pdaps_flow_limit,
             use_residual_flow_pyramid=args.use_residual_flow_pyramid,
-    use_error_guided_residual=args.use_error_guided_residual,
+                use_error_guided_residual=args.use_error_guided_residual,
             residual_flow_limit=args.residual_flow_limit,
             use_boundary_branch=args.use_boundary_branch,
             boundary_branch_scales=args.boundary_branch_scales,

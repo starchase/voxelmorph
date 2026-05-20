@@ -132,6 +132,7 @@ def build_registration_model(args, device):
             window_size=getattr(args, 'window_size', 9),
             pdaps_flow_limit=getattr(args, 'pdaps_flow_limit', 20.0),
             use_residual_flow_pyramid=getattr(args, 'use_residual_flow_pyramid', False),
+            use_error_guided_residual=getattr(args, 'use_error_guided_residual', False),
             residual_flow_limit=getattr(args, 'residual_flow_limit', 4.0),
             use_boundary_branch=getattr(args, 'use_boundary_branch', False),
             boundary_branch_scales=getattr(args, 'boundary_branch_scales', 'deep'),
@@ -156,6 +157,23 @@ def save_qualitative_results(
     boundary_ring_outer_kernel=7,
 ):
     """Save mid-slice images of samples."""
+
+    def _extract_error_guided_stage_slices(error_guided_maps, z_idx):
+        stage_slices = []
+        for item in error_guided_maps:
+            error_map = item.get('error_map')
+            gate_map = item.get('gate_map')
+            if error_map is None or gate_map is None:
+                continue
+            error_slice = np.rot90(error_map[0, 0, :, :, z_idx].detach().cpu().numpy(), -1)
+            gate_slice = np.rot90(gate_map[0, 0, :, :, z_idx].detach().cpu().numpy(), -1)
+            stage_slices.append({
+                'stage_idx': item.get('stage_idx', -1),
+                'error_slice': error_slice,
+                'gate_slice': gate_slice,
+            })
+        stage_slices.sort(key=lambda x: x['stage_idx'])
+        return stage_slices
     
     samples_to_plot = []
     
@@ -177,6 +195,7 @@ def save_qualitative_results(
         with torch.no_grad():
             out = model(source, target, return_warped_source=True, return_field_type='displacement')
             displacement, warped_source = out[0], out[1]
+            error_guided_maps = list(getattr(model, 'latest_error_guided_residual_maps', []))
             boundary_extractor = vxm.nn.modules.FixedGradientMagnitude3D(
                 operator=boundary_kernel,
                 smooth_kernel_size=boundary_smooth_kernel,
@@ -235,8 +254,9 @@ def save_qualitative_results(
         warped_lbl_slice = get_slice(warped_label, slice_idx, is_label=True)
         
         has_labels = (src_lbl_slice is not None) and (tgt_lbl_slice is not None)
+        error_guided_stage_slices = _extract_error_guided_stage_slices(error_guided_maps, slice_idx)
         
-        rows = 4
+        rows = 5 if len(error_guided_stage_slices) > 0 else 4
         cols = 4
         fig, axes = plt.subplots(rows, cols, figsize=(20, 20))
         
@@ -474,6 +494,25 @@ def save_qualitative_results(
         axes[3, 3].imshow(ring_mask_slice, cmap='autumn', alpha=0.45, vmin=0.0, vmax=1.0)
         axes[3, 3].set_title('Boundary Ring Mask')
         axes[3, 3].axis('off')
+
+        if len(error_guided_stage_slices) > 0:
+            for plot_idx in range(4):
+                axes[4, plot_idx].axis('off')
+
+            for stage_pos, stage_item in enumerate(error_guided_stage_slices[:2]):
+                col_offset = stage_pos * 2
+                error_slice = stage_item['error_slice']
+                gate_slice = stage_item['gate_slice']
+                stage_idx = stage_item['stage_idx']
+
+                error_vmax = max(float(np.max(error_slice)), 1e-6)
+                axes[4, col_offset].imshow(error_slice, cmap='magma', vmin=0.0, vmax=error_vmax)
+                axes[4, col_offset].set_title(f'Err Map (Stage {stage_idx})')
+                axes[4, col_offset].axis('off')
+
+                axes[4, col_offset + 1].imshow(gate_slice, cmap='viridis', vmin=0.5, vmax=1.5)
+                axes[4, col_offset + 1].set_title(f'Gate Map (Stage {stage_idx})')
+                axes[4, col_offset + 1].axis('off')
 
         plt.suptitle(f'Epoch {epoch} - Sample {name_tag} (Slice Z={slice_idx})', fontsize=16)
         
@@ -1148,6 +1187,8 @@ def main():
         parser.error('--use-daps and --use-pdaps are mutually exclusive. Use --use-pdaps for the current pyramid design.')
     if args.use_cmim and args.use_cross_mamba:
         parser.error('--use-cmim and --use-cross-mamba are mutually exclusive interaction modules.')
+    if args.use_error_guided_residual and not args.use_residual_flow_pyramid:
+        parser.error('--use-error-guided-residual requires --use-residual-flow-pyramid.')
     if args.boundary_ring_inner_kernel < 1 or args.boundary_ring_outer_kernel < 1:
         parser.error('--boundary-ring-inner-kernel and --boundary-ring-outer-kernel must be positive integers.')
     if args.boundary_ring_outer_kernel < args.boundary_ring_inner_kernel:

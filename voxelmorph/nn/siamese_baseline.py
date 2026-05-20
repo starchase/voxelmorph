@@ -407,6 +407,8 @@ class SiameseUNetBaseline(nn.Module):
 
         if self.use_pdaps and self.use_residual_flow_pyramid:
             raise ValueError('use_pdaps and use_residual_flow_pyramid cannot be enabled at the same time')
+        if self.use_error_guided_residual and not self.use_residual_flow_pyramid:
+            raise ValueError('use_error_guided_residual requires use_residual_flow_pyramid to be enabled')
         
         # --- [Architectural Refactoring] ---
         # Note: P-DAPS natively encapsulates coarse-to-fine deformation (previously isolated as 'pyramid').
@@ -555,16 +557,27 @@ class SiameseUNetBaseline(nn.Module):
 
         if self.use_residual_flow_pyramid:
             self.residual_flow_heads = nn.ModuleList()
-            for i, nf in enumerate(dec_nf):
-                skip_idx = len(enc_nf) - 2 - i
-                if skip_idx >= 0 and getattr(self, 'use_error_guided_residual', False):
-                    head_in_ch = nf + enc_nf[skip_idx] * 3
-                else:
-                    head_in_ch = nf
-                flow_head = Conv(head_in_ch, ndim, kernel_size=3, padding=1)
+            for nf in dec_nf:
+                flow_head = Conv(nf, ndim, kernel_size=3, padding=1)
                 flow_head.weight.data.normal_(0, 1e-6)
                 flow_head.bias.data.zero_()
                 self.residual_flow_heads.append(flow_head)
+
+        self.error_guided_residual_gates = nn.ModuleDict()
+        self.error_guided_residual_stage_indices = set()
+        self.latest_error_guided_residual_maps = []
+        if self.use_error_guided_residual:
+            gate_stage_count = max(0, min(2, len(dec_nf) - 1))
+            self.error_guided_residual_stage_indices = set(range(gate_stage_count))
+            for stage_idx in self.error_guided_residual_stage_indices:
+                gate = nn.Sequential(
+                    Conv(1, 8, kernel_size=3, padding=1),
+                    nn.LeakyReLU(0.2),
+                    Conv(8, 1, kernel_size=1),
+                )
+                gate[-1].weight.data.zero_()
+                gate[-1].bias.data.zero_()
+                self.error_guided_residual_gates[str(stage_idx)] = gate
 
         # --- [P-DAPS Coarse-to-fine Flows] ---
         if self.use_pdaps:
@@ -641,6 +654,31 @@ class SiameseUNetBaseline(nn.Module):
             return feature_edge_loss
         return feature_edge_loss / valid_scales
 
+    def _compute_error_guided_residual_gate(self, stage_idx, source_feature, target_feature, accumulated_flow):
+        stage_key = str(stage_idx)
+        gate_module = self.error_guided_residual_gates[stage_key] if stage_key in self.error_guided_residual_gates else None
+        if gate_module is None or source_feature is None or target_feature is None:
+            return None, None
+
+        source_feature_float = source_feature.float()
+        target_feature_float = target_feature.float()
+        warped_source = source_feature_float
+
+        if accumulated_flow is not None:
+            mode = 'trilinear' if self.ndim == 3 else 'bilinear'
+            flow_up = F.interpolate(accumulated_flow, size=source_feature.shape[2:], mode=mode, align_corners=False)
+            flow_up = flow_up * 2.0
+            if self.integrate is not None:
+                warp_displacement = self.integrate(flow_up)
+            else:
+                warp_displacement = flow_up
+            warped_source = self.spatial_transform(source_feature_float, warp_displacement.float())
+
+        error_map = torch.mean(torch.abs(warped_source - target_feature_float), dim=1, keepdim=True).detach()
+        gate_logits = gate_module(error_map)
+        gate = 0.5 + torch.sigmoid(gate_logits)
+        return gate.to(dtype=source_feature.dtype), error_map.to(dtype=source_feature.dtype)
+
     def _parse_cross_mamba_scales(self, cross_mamba_scales):
         if cross_mamba_scales is None:
             return {'1/16', '1/8'}
@@ -692,6 +730,7 @@ class SiameseUNetBaseline(nn.Module):
         residual_flows = []
         pyramid_acc_flow = None
         residual_acc_flow = None
+        self.latest_error_guided_residual_maps = []
         
         # 2. Decoding (Standard U-Net Upsampling)
         # Start from the bottom-most features (1/16 scale)
@@ -802,27 +841,23 @@ class SiameseUNetBaseline(nn.Module):
 
             if self.use_residual_flow_pyramid:
                 sub_flow_limit = torch.as_tensor(self.residual_flow_limit, dtype=x.dtype, device=x.device).clamp(min=1e-3)
-                
-                if getattr(self, 'use_error_guided_residual', False) and skip_idx >= 0:
-                    if residual_acc_flow is not None:
-                        mode = 'trilinear' if self.ndim == 3 else 'bilinear'
-                        flow_up = F.interpolate(residual_acc_flow, size=s_skip_raw.shape[2:], mode=mode, align_corners=False)
-                        flow_up = flow_up * 2.0
-                        if self.integrate is not None:
-                            disp_up = self.integrate(flow_up)
-                        else:
-                            disp_up = flow_up
-                        s_skip_warped_for_head = self.spatial_transform(s_skip_raw, disp_up)
-                    else:
-                        s_skip_warped_for_head = s_skip_raw
-                        
-                    diff = torch.abs(s_skip_warped_for_head - t_skip_raw)
-                    head_input = torch.cat([x, s_skip_warped_for_head, t_skip_raw, diff], dim=1)
-                else:
-                    head_input = x
-                
-                raw_residual_flow = self.residual_flow_heads[i](head_input)
+                residual_gate = None
+                error_map = None
+                if self.use_error_guided_residual and i in self.error_guided_residual_stage_indices:
+                    residual_gate, error_map = self._compute_error_guided_residual_gate(i, s_skip_raw, t_skip_raw, residual_acc_flow)
+
+                raw_residual_flow = self.residual_flow_heads[i](x)
                 residual_flow = sub_flow_limit * torch.tanh(raw_residual_flow / sub_flow_limit)
+                if residual_gate is not None:
+                    if residual_gate.shape[2:] != residual_flow.shape[2:]:
+                        residual_gate = F.interpolate(residual_gate, size=residual_flow.shape[2:], mode=mode, align_corners=False)
+                    residual_flow = residual_flow * residual_gate
+                    self.latest_error_guided_residual_maps.append({
+                        'stage_idx': i,
+                        'skip_idx': skip_idx,
+                        'error_map': error_map.detach(),
+                        'gate_map': residual_gate.detach(),
+                    })
                 residual_flows.append(residual_flow)
 
                 if residual_acc_flow is None:

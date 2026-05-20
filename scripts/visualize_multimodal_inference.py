@@ -162,6 +162,7 @@ DEFAULT_ARGS: Dict[str, Any] = {
     'window_size': 9,
     'pdaps_flow_limit': 20.0,
     'use_residual_flow_pyramid': False,
+    'use_error_guided_residual': False,
     'residual_flow_limit': 4.0,
     'use_boundary_branch': False,
     'boundary_branch_scales': 'deep',
@@ -197,6 +198,7 @@ def infer_model_settings(args_dict: Dict[str, Any], state_dict: Dict[str, torch.
     inferred['use_daps'] = inferred.get('use_daps', False) or any(k.startswith('daps_plr_blocks.') for k in keys)
     inferred['use_pdaps'] = inferred.get('use_pdaps', False) or any(k.startswith('pyramid_flows.') for k in keys)
     inferred['use_residual_flow_pyramid'] = inferred.get('use_residual_flow_pyramid', False) or any(k.startswith('residual_flow_heads.') for k in keys)
+    inferred['use_error_guided_residual'] = inferred.get('use_error_guided_residual', False) or any(k.startswith('error_guided_residual_gates.') for k in keys)
     inferred['use_dsin'] = inferred.get('use_dsin', False) or any('dsin' in k.lower() for k in keys)
     inferred['use_cmim'] = inferred.get('use_cmim', False) or any(k.startswith('cmim_blocks.') for k in keys)
     inferred['use_cross_mamba'] = inferred.get('use_cross_mamba', False) or any(k.startswith('cross_mamba_blocks.') for k in keys)
@@ -286,6 +288,7 @@ def build_model(args_dict: Dict[str, Any], inshape: tuple[int, int, int], device
             window_size=args_dict['window_size'],
             pdaps_flow_limit=args_dict['pdaps_flow_limit'],
             use_residual_flow_pyramid=args_dict['use_residual_flow_pyramid'],
+            use_error_guided_residual=args_dict['use_error_guided_residual'],
             residual_flow_limit=args_dict['residual_flow_limit'],
             use_boundary_branch=args_dict['use_boundary_branch'],
             boundary_branch_scales=args_dict['boundary_branch_scales'],
