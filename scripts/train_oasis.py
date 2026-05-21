@@ -128,6 +128,7 @@ def build_registration_model(args, device):
             mamba_enc_shallow_multi=getattr(args, 'mamba_enc_shallow_multi', False),
             mamba_dec_shallow_multi=getattr(args, 'mamba_dec_shallow_multi', False),
             mamba_quarter_scale=getattr(args, 'mamba_quarter_scale', False),
+            mamba_dec_quarter_scale=getattr(args, 'mamba_dec_quarter_scale', False),
             mamba_parallel_block=getattr(args, 'mamba_parallel_block', False),
             window_size=getattr(args, 'window_size', 9),
             pdaps_flow_limit=getattr(args, 'pdaps_flow_limit', 20.0),
@@ -1170,6 +1171,7 @@ def main():
     parser.add_argument('--mamba-enc-shallow-multi', action='store_true', help='Enable multi-axis (d,h,w) scanning for the encoder 1/8-scale Mamba block.')
     parser.add_argument('--mamba-dec-shallow-multi', action='store_true', help='Enable multi-axis (d,h,w) scanning for the decoder 1/8-scale Mamba block.')
     parser.add_argument('--mamba-quarter-scale', action='store_true', help='Enable Mamba scanning (single-axis) at 1/4 scale (i=1) to improve fine structural alignment.')
+    parser.add_argument('--mamba-dec-quarter-scale', action='store_true', help='Enable decoder Mamba scanning (single-axis) at 1/4 scale (i=1) to improve fine structural alignment.')
     parser.add_argument('--mamba-parallel-block', action='store_true', help='Use Parallel Local(CNN)-Global(Mamba) Block instead of serial Mamba to protect local edges.')
     parser.add_argument('--model-config', type=str, default='dual_stream', choices=['dual_stream', 'voxelmorph_baseline'], help='Choose between the current dual-stream Siamese setup and the standard Voxelmorph baseline')
     parser.add_argument('--decouple-layers', type=int, default=2, help='Number of shallow decoupled encoder layers used in dual-stream mode')
