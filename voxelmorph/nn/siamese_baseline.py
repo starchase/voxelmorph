@@ -864,11 +864,13 @@ class SiameseUNetBaseline(nn.Module):
                     residual_gate, error_map = self._compute_error_guided_residual_gate(i, s_skip_raw, t_skip_raw, residual_acc_flow)
 
                 raw_residual_flow = self.residual_flow_heads[i](x)
-                residual_flow = sub_flow_limit * torch.tanh(raw_residual_flow / sub_flow_limit)
                 if residual_gate is not None:
-                    if residual_gate.shape[2:] != residual_flow.shape[2:]:
-                        residual_gate = F.interpolate(residual_gate, size=residual_flow.shape[2:], mode=mode, align_corners=False)
-                    residual_flow = residual_flow * residual_gate
+                    if residual_gate.shape[2:] != raw_residual_flow.shape[2:]:
+                        residual_gate = F.interpolate(residual_gate, size=raw_residual_flow.shape[2:], mode=mode, align_corners=False)
+                    raw_residual_flow = raw_residual_flow * residual_gate
+                residual_flow = sub_flow_limit * torch.tanh(raw_residual_flow / sub_flow_limit)
+                
+                if residual_gate is not None:
                     self.latest_error_guided_residual_maps.append({
                         'stage_idx': i,
                         'skip_idx': skip_idx,
