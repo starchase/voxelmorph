@@ -2033,6 +2033,7 @@ def main():
     parser.add_argument('--pyramid-weight', type=float, default=0.5, help='Weight for intermediate pyramid deep supervision loss')
     parser.add_argument('--use-residual-flow-pyramid', action='store_true', help='Use lightweight coarse-to-fine residual flow accumulation without warping skip features')
     parser.add_argument('--use-error-guided-residual', action='store_true', help='Enhance residual flow pyramid with Structure-aware & Error-guided side branch')
+    parser.add_argument("--error-guided-metric", type=str, default="feature_ncc", choices=["feature_ncc", "mind"], help="Metric to compute error maps for guidance")
     parser.add_argument('--residual-flow-limit', type=float, default=4.0, help='Per-stage magnitude cap for residual flow heads when residual flow pyramid is enabled')
     parser.add_argument('--pyramid-image-weight', type=float, default=0.0, help='Weight for multi-scale image supervision on intermediate pyramid displacements')
     parser.add_argument('--pyramid-image-weights', type=str, default='0.2,0.35,0.5', help='Comma-separated relative weights for intermediate pyramid image supervision from coarse to fine')
@@ -2143,6 +2144,7 @@ def main():
             pdaps_flow_limit=args.pdaps_flow_limit,
             use_residual_flow_pyramid=args.use_residual_flow_pyramid,
                 use_error_guided_residual=args.use_error_guided_residual,
+                error_guided_metric=args.error_guided_metric,
             residual_flow_limit=args.residual_flow_limit,
             use_boundary_branch=args.use_boundary_branch,
             boundary_branch_scales=args.boundary_branch_scales,

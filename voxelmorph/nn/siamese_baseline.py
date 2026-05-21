@@ -372,7 +372,7 @@ class SiameseUNetBaseline(nn.Module):
     """
     def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False, use_pdaps=False, use_dsin=False, use_cmim=False, use_cross_mamba=False, use_wcv=False,
                  cross_mamba_scales='1/16,1/8',
-                 use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, mamba_enc_shallow_multi=None, mamba_dec_shallow_multi=None, mamba_quarter_scale=False, mamba_parallel_block=False, fusion_method='compress_concat', window_size=9, pdaps_flow_limit=20.0, use_residual_flow_pyramid=False, residual_flow_limit=4.0, use_error_guided_residual=False, cross_mamba_offset_limit=0.0, cross_mamba_offset_smooth_kernel=1, use_boundary_branch=False,
+                 use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, mamba_enc_shallow_multi=None, mamba_dec_shallow_multi=None, mamba_quarter_scale=False, mamba_parallel_block=False, fusion_method='compress_concat', window_size=9, pdaps_flow_limit=20.0, use_residual_flow_pyramid=False, residual_flow_limit=4.0, use_error_guided_residual=False, error_guided_metric='feature_ncc', cross_mamba_offset_limit=0.0, cross_mamba_offset_smooth_kernel=1, use_boundary_branch=False,
                  boundary_branch_scales='deep', boundary_branch_strength=0.5, boundary_kernel='sobel', boundary_smooth_kernel=3):
         super().__init__()
         self.inshape = inshape
@@ -383,6 +383,11 @@ class SiameseUNetBaseline(nn.Module):
         self.use_pdaps = use_pdaps
         self.use_residual_flow_pyramid = use_residual_flow_pyramid
         self.use_error_guided_residual = use_error_guided_residual
+        self.error_guided_metric = error_guided_metric
+        
+        if self.use_error_guided_residual and self.error_guided_metric == 'mind':
+            from .losses import MINDLoss
+            self.mind_extractor = MINDLoss()
         self.residual_flow_limit = residual_flow_limit
         self.use_dsin = use_dsin
         self.use_cmim = use_cmim
@@ -719,6 +724,10 @@ class SiameseUNetBaseline(nn.Module):
         # --- [Ablation 1 Hook: FDA will go here] ---
         source_input = source
         target_input = target
+        
+        if getattr(self, 'use_error_guided_residual', False) and getattr(self, 'error_guided_metric', 'feature_ncc') == 'mind':
+            self._mind_source = self.mind_extractor._mind_ssc(source_input)
+            self._mind_target = self.mind_extractor._mind_ssc(target_input)
         
         # 1. Feature Extraction (Decoupled/Shared)
         feat_s, feat_t = self.encoder(source_input, target_input)
