@@ -2059,6 +2059,7 @@ def main():
     parser.add_argument('--mamba-enc-shallow-multi', action='store_true', help='Enable multi-axis scanning for the encoder 1/8-scale Mamba block')
     parser.add_argument('--mamba-dec-shallow-multi', action='store_true', help='Enable multi-axis scanning for the decoder 1/8-scale Mamba block')
     parser.add_argument('--mamba-quarter-scale', action='store_true', help='Enable Mamba scanning (single-axis) at 1/4 scale (i=1) to improve fine structural alignment.')
+    parser.add_argument('--mamba-dec-quarter-scale', action='store_true', help='Enable decoder Mamba scanning (single-axis) at 1/4 scale (i=1) to improve fine structural alignment.')
     parser.add_argument('--mamba-parallel-block', action='store_true', help='Use Parallel Local(CNN)-Global(Mamba) Block instead of serial Mamba to protect local edges.')
     parser.add_argument('--window-size', type=int, default=9, help='Window size for WCV and S-WCV')
     parser.add_argument('--pdaps-flow-limit', type=float, default=20.0, help='Maximum physical flow limit for P-DAPS')
@@ -2138,6 +2139,7 @@ def main():
             mamba_enc_shallow_multi=args.mamba_enc_shallow_multi,
             mamba_dec_shallow_multi=args.mamba_dec_shallow_multi,
             mamba_quarter_scale=args.mamba_quarter_scale,
+            mamba_dec_quarter_scale=args.mamba_dec_quarter_scale,
             mamba_parallel_block=args.mamba_parallel_block,
             fusion_method=args.fusion_method,
             window_size=args.window_size,
