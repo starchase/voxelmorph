@@ -45,6 +45,40 @@ class ResidualMambaBlock(nn.Module):
             x = block(x)
         return x
 
+
+class StructureErrorMambaRefiner(nn.Module):
+    """Low-resolution residual velocity refiner driven by structural error maps."""
+
+    def __init__(self, ndim, in_channels, hidden_channels=16, scan_axes=('d',), flow_limit=1.0):
+        super().__init__()
+        Conv = getattr(nn, f'Conv{ndim}d')
+        Norm = getattr(nn, f'InstanceNorm{ndim}d')
+        self.flow_limit = float(flow_limit)
+        self.stem = nn.Sequential(
+            Conv(in_channels, hidden_channels, kernel_size=3, padding=1),
+            Norm(hidden_channels),
+            nn.LeakyReLU(0.2),
+        )
+        self.context = ResidualMambaBlock(hidden_channels, num_blocks=1, scan_axes=scan_axes, gamma_init=0.1)
+        self.local = nn.Sequential(
+            Conv(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            Norm(hidden_channels),
+            nn.LeakyReLU(0.2),
+        )
+        self.delta = Conv(hidden_channels, ndim, kernel_size=3, padding=1)
+        self.delta.weight.data.normal_(0, 1e-6)
+        self.delta.bias.data.zero_()
+
+    def forward(self, x):
+        features = self.stem(x)
+        features = self.context(features)
+        features = self.local(features)
+        delta = self.delta(features)
+        if self.flow_limit > 0:
+            limit = torch.as_tensor(self.flow_limit, dtype=delta.dtype, device=delta.device).clamp(min=1e-3)
+            delta = limit * torch.tanh(delta / limit)
+        return delta
+
 class SharedEncoder(nn.Module):
     """
     Shared dual-stream encoder for Siamese Network.
@@ -373,7 +407,8 @@ class SiameseUNetBaseline(nn.Module):
     def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False, use_pdaps=False, use_dsin=False, use_cmim=False, use_cross_mamba=False, use_wcv=False,
                  cross_mamba_scales='1/16,1/8',
                  use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, mamba_enc_shallow_multi=None, mamba_dec_shallow_multi=None, mamba_quarter_scale=False, mamba_dec_quarter_scale=False,  mamba_parallel_block=False, fusion_method='compress_concat', window_size=9, pdaps_flow_limit=20.0, use_residual_flow_pyramid=False, residual_flow_limit=4.0, use_error_guided_residual=False, error_guided_metric='feature_ncc',cross_mamba_offset_limit=0.0, cross_mamba_offset_smooth_kernel=1, use_boundary_branch=False,
-                 boundary_branch_scales='deep', boundary_branch_strength=0.5, boundary_kernel='sobel', boundary_smooth_kernel=3):
+                 boundary_branch_scales='deep', boundary_branch_strength=0.5, boundary_kernel='sobel', boundary_smooth_kernel=3,
+                 use_sdmr=False, sdmr_use_mind=True, sdmr_scale=0.125, sdmr_hidden_channels=16, sdmr_flow_limit=1.0, sdmr_alpha=0.5):
         super().__init__()
         self.inshape = inshape
         self.ndim = ndim
@@ -384,8 +419,12 @@ class SiameseUNetBaseline(nn.Module):
         self.use_residual_flow_pyramid = use_residual_flow_pyramid
         self.use_error_guided_residual = use_error_guided_residual
         self.error_guided_metric = error_guided_metric
+        self.use_sdmr = use_sdmr
+        self.sdmr_use_mind = sdmr_use_mind
+        self.sdmr_scale = float(sdmr_scale)
+        self.sdmr_alpha = float(sdmr_alpha)
         
-        if self.use_error_guided_residual and self.error_guided_metric == 'mind':
+        if (self.use_error_guided_residual and self.error_guided_metric == 'mind') or (self.use_sdmr and self.sdmr_use_mind):
             from .losses import MINDLoss
             self.mind_extractor = MINDLoss()
         self.residual_flow_limit = residual_flow_limit
@@ -604,6 +643,23 @@ class SiameseUNetBaseline(nn.Module):
             # 改为 nn.Parameter(requires_grad=False)，修复在自动探索大形变时因 NCC 目标直接导致位移限度无限扩展而撕裂网络的问题
             self.pdaps_flow_limits = nn.Parameter(torch.tensor(pdaps_limits, dtype=torch.float32), requires_grad=False)
 
+        if self.use_sdmr:
+            if not (0 < self.sdmr_scale <= 1.0):
+                raise ValueError(f'sdmr_scale must be in (0, 1], got {self.sdmr_scale}')
+            sdmr_in_channels = ndim + 4 + (1 if self.sdmr_use_mind else 0)
+            self.sdmr_boundary_extractor = FixedGradientMagnitude3D(
+                operator=boundary_kernel,
+                smooth_kernel_size=boundary_smooth_kernel,
+                normalize=True,
+            )
+            self.sdmr_refiner = StructureErrorMambaRefiner(
+                ndim=ndim,
+                in_channels=sdmr_in_channels,
+                hidden_channels=sdmr_hidden_channels,
+                scan_axes=('d',),
+                flow_limit=sdmr_flow_limit,
+            )
+
         # 4. Spatial Transformer
         self.spatial_transform = SpatialTransformer()
         if self.int_steps > 0:
@@ -627,6 +683,48 @@ class SiameseUNetBaseline(nn.Module):
             ]).view(1, self.ndim, *([1] * self.ndim))
             displacement = displacement * scale
         return displacement
+
+    def _resize_flow(self, flow, target_shape):
+        mode = 'trilinear' if self.ndim == 3 else 'bilinear'
+        source_shape = flow.shape[2:]
+        if source_shape == target_shape:
+            return flow
+        resized = F.interpolate(flow, size=target_shape, mode=mode, align_corners=False)
+        scale = flow.new_tensor([
+            target_shape[axis] / source_shape[axis]
+            for axis in range(self.ndim)
+        ]).view(1, self.ndim, *([1] * self.ndim))
+        return resized * scale
+
+    def _sdmr_low_shape(self, spatial_shape):
+        return tuple(max(2, int(round(dim * self.sdmr_scale))) for dim in spatial_shape)
+
+    def _compute_sdmr_delta_velocity(self, source, target, velocity, displacement):
+        mode = 'trilinear' if self.ndim == 3 else 'bilinear'
+        full_shape = velocity.shape[2:]
+        low_shape = self._sdmr_low_shape(full_shape)
+
+        with torch.no_grad():
+            warped_source = self.spatial_transform(source.float(), displacement.float())
+            source_low = F.interpolate(source.float(), size=low_shape, mode=mode, align_corners=False)
+            target_low = F.interpolate(target.float(), size=low_shape, mode=mode, align_corners=False)
+            warped_low = F.interpolate(warped_source, size=low_shape, mode=mode, align_corners=False)
+            intensity_error = torch.abs(warped_low - target_low)
+            edge_error = torch.abs(
+                self.sdmr_boundary_extractor(warped_low) - self.sdmr_boundary_extractor(target_low)
+            )
+            error_inputs = [warped_low, target_low, intensity_error, edge_error]
+            if self.sdmr_use_mind:
+                mind_warped = self.mind_extractor._mind_ssc(warped_low)
+                mind_target = self.mind_extractor._mind_ssc(target_low)
+                mind_error = torch.abs(mind_warped - mind_target).mean(dim=1, keepdim=True)
+                error_inputs.append(mind_error)
+
+        velocity_low = self._resize_flow(velocity.float(), low_shape)
+        refiner_input = torch.cat([velocity_low] + [item.to(dtype=velocity_low.dtype) for item in error_inputs], dim=1)
+        delta_low = self.sdmr_refiner(refiner_input)
+        delta_full = self._resize_flow(delta_low, full_shape)
+        return delta_full.to(dtype=velocity.dtype)
 
     def _feature_gradient_magnitude(self, feature):
         gradients = []
@@ -949,6 +1047,14 @@ class SiameseUNetBaseline(nn.Module):
             displacement = self.integrate(velocity)
         else:
             displacement = velocity
+
+        if self.use_sdmr:
+            delta_velocity = self._compute_sdmr_delta_velocity(source, target, velocity, displacement)
+            velocity = velocity + self.sdmr_alpha * delta_velocity
+            if self.integrate is not None:
+                displacement = self.integrate(velocity)
+            else:
+                displacement = velocity
             
         outputs = []
         if return_field_type == 'displacement':

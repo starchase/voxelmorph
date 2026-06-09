@@ -470,3 +470,105 @@ class BoundaryConsistencyLoss(nn.Module):
             return diff.sum() / mask.sum().clamp_min(self.eps)
 
         return self._masked_ncc(pred_edges, target_edges, mask=mask)
+
+
+class SelfSupervisedAnatomicalStructureConsistencyLoss(nn.Module):
+    """
+    Label-free anatomical structure consistency for deformable registration.
+
+    The loss compares structure descriptors extracted from the warped moving
+    image and fixed image. It uses multi-scale gradient-magnitude consistency
+    as the default signal, with an optional low-resolution MIND-SSC term for
+    multimodal registration.
+    """
+
+    def __init__(
+        self,
+        scales=(1.0, 0.5, 0.25),
+        boundary_weight: float = 1.0,
+        mind_weight: float = 0.0,
+        mind_scale: float = 0.25,
+        operator: str = 'sobel',
+        smooth_kernel_size: int = 3,
+        normalize_edges: bool = True,
+        mind_radius: int = 2,
+        mind_dilation: int = 2,
+        mind_eps: float = 1e-8,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+
+        clean_scales = []
+        for scale in scales:
+            scale = float(scale)
+            if scale <= 0 or scale > 1:
+                raise ValueError(f'SASC scales must be in (0, 1], got {scale}')
+            clean_scales.append(scale)
+        if not clean_scales:
+            raise ValueError('SASC requires at least one scale.')
+
+        self.scales = tuple(clean_scales)
+        self.boundary_weight = float(boundary_weight)
+        self.mind_weight = float(mind_weight)
+        self.mind_scale = float(mind_scale)
+        self.eps = eps
+        self.edge_extractor = FixedGradientMagnitude3D(
+            operator=operator,
+            smooth_kernel_size=smooth_kernel_size,
+            normalize=normalize_edges,
+            eps=eps,
+        )
+        self.mind_loss = MINDLoss(
+            radius=mind_radius,
+            dilation=mind_dilation,
+            eps=mind_eps,
+        ) if self.mind_weight > 0 else None
+
+    def _resize(self, tensor: torch.Tensor, scale: float, mode: str = 'trilinear') -> torch.Tensor:
+        if scale == 1.0:
+            return tensor
+        size = [max(1, int(round(dim * scale))) for dim in tensor.shape[2:]]
+        if mode == 'nearest':
+            return F.interpolate(tensor, size=size, mode=mode)
+        return F.interpolate(tensor, size=size, mode=mode, align_corners=False)
+
+    def _prepare_mask(self, mask: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+        if mask.shape[2:] != reference.shape[2:]:
+            mask = F.interpolate(mask.float(), size=reference.shape[2:], mode='nearest')
+        if mask.shape[1] == 1 and reference.shape[1] != 1:
+            mask = mask.expand(-1, reference.shape[1], -1, -1, -1)
+        return mask.to(device=reference.device, dtype=reference.dtype)
+
+    def _masked_l1(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        diff = torch.abs(pred - target)
+        if mask is None:
+            return diff.mean()
+        mask = self._prepare_mask(mask, diff)
+        return (diff * mask).sum() / mask.sum().clamp_min(self.eps)
+
+    def forward(self, prediction: torch.Tensor, target: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        prediction = prediction.float()
+        target = target.float()
+
+        boundary_terms = []
+        mind_terms = []
+
+        for scale in self.scales:
+            pred_s = self._resize(prediction, scale)
+            target_s = self._resize(target, scale)
+            mask_s = self._resize(mask.float(), scale, mode='nearest') if mask is not None else None
+
+            if self.boundary_weight > 0:
+                pred_edges = self.edge_extractor(pred_s)
+                target_edges = self.edge_extractor(target_s)
+                boundary_terms.append(self._masked_l1(pred_edges, target_edges, mask_s))
+
+            if self.mind_loss is not None and scale <= self.mind_scale + 1e-8:
+                mind_terms.append(self.mind_loss(pred_s, target_s, mask=mask_s))
+
+        loss = prediction.new_tensor(0.0)
+        if boundary_terms:
+            loss = loss + self.boundary_weight * torch.stack(boundary_terms).mean()
+        if mind_terms:
+            loss = loss + self.mind_weight * torch.stack(mind_terms).mean()
+        return loss
