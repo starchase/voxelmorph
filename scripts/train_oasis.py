@@ -88,7 +88,7 @@ def build_registration_model(args, device):
 
     if args.model_config == 'voxelmorph_baseline':
         ignored_flags = []
-        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv', 'use_boundary_branch', 'use_sdmr'):
+        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv', 'use_boundary_branch', 'use_frequency_modulation', 'use_sdmr'):
             if getattr(args, flag):
                 ignored_flags.append(f'--{flag.replace("_", "-")}')
         if ignored_flags:
@@ -141,6 +141,9 @@ def build_registration_model(args, device):
             boundary_branch_strength=getattr(args, 'boundary_branch_strength', 0.5),
             boundary_kernel=getattr(args, 'boundary_kernel', 'sobel'),
             boundary_smooth_kernel=getattr(args, 'boundary_smooth_kernel', 3),
+            use_frequency_modulation=getattr(args, 'use_frequency_modulation', False),
+            frequency_modulation_scales=getattr(args, 'frequency_modulation_scales', '1/8,1/4'),
+            frequency_low_ratio=getattr(args, 'frequency_low_ratio', 0.25),
             use_sdmr=getattr(args, 'use_sdmr', False),
             sdmr_use_mind=getattr(args, 'sdmr_use_mind', False),
             sdmr_scale=getattr(args, 'sdmr_scale', 0.125),
@@ -577,8 +580,6 @@ def validate(
     boundary_loss_weight: float = 0.0,
     boundary_ring_inner_kernel: int = 3,
     boundary_ring_outer_kernel: int = 7,
-    sasc_loss_fn: nn.Module = None,
-    sasc_loss_weight: float = 0.0,
     feature_edge_loss_weight: float = 0.0,
     feature_edge_indices: tuple = (0, 1),
     pyramid_weight: float = 0.5,
@@ -642,7 +643,6 @@ def validate(
                 fg_mask = torch.ones_like(target_float)
 
             boundary_loss = displacement.new_tensor(0.0)
-            sasc_loss = displacement.new_tensor(0.0)
             if image_loss_fn is not None and grad_loss_fn is not None and loss_weights is not None:
                 if loss_type == 'mse':
                     squared_diff = (target_float - warped_float) ** 2
@@ -684,10 +684,6 @@ def validate(
                 if boundary_loss_fn is not None and boundary_loss_weight > 0:
                     boundary_loss = boundary_loss_fn(warped_float, target_float, mask=boundary_ring_mask)
                     loss = loss + boundary_loss_weight * boundary_loss
-
-                if sasc_loss_fn is not None and sasc_loss_weight > 0:
-                    sasc_loss = sasc_loss_fn(warped_float, target_float, mask=base_fg_mask)
-                    loss = loss + sasc_loss_weight * sasc_loss
 
                 if feature_edge_loss_weight > 0:
                     loss = loss + feature_edge_loss_weight * feature_edge_loss.float()
@@ -808,20 +804,6 @@ def parse_pyramid_image_weights(weights: str) -> tuple:
         if not token:
             continue
         values.append(float(token))
-    return tuple(values)
-
-
-def parse_sasc_scales(scales: str) -> tuple:
-    values = []
-    for token in scales.split(','):
-        token = token.strip()
-        if not token:
-            continue
-        if '/' in token:
-            numerator, denominator = token.split('/', 1)
-            values.append(float(numerator) / float(denominator))
-        else:
-            values.append(float(token))
     return tuple(values)
 
 
@@ -982,8 +964,6 @@ def train_epoch(
     boundary_loss_weight: float = 0.0,
     boundary_ring_inner_kernel: int = 3,
     boundary_ring_outer_kernel: int = 7,
-    sasc_loss_fn: nn.Module = None,
-    sasc_loss_weight: float = 0.0,
     feature_edge_loss_weight: float = 0.0,
     feature_edge_indices: tuple = (0, 1),
     pyramid_image_weight: float = 0.0,
@@ -994,7 +974,6 @@ def train_epoch(
     total_loss = 0.0
     total_img_loss = 0.0
     total_grad_loss = 0.0
-    total_sasc_loss = 0.0
     total_feature_edge_loss = 0.0
     valid_batches = 0
 
@@ -1034,7 +1013,7 @@ def train_epoch(
         target_float = y.float()
         warped_float = warped_source.float()
         
-        # Label-free foreground mask used by optional image and SASC losses.
+        # Label-free foreground mask used by optional image losses.
         base_fg_mask = build_foreground_mask(target_float)
         boundary_ring_mask = build_boundary_ring_mask(
             base_fg_mask,
@@ -1065,10 +1044,6 @@ def train_epoch(
         boundary_loss = displacement.new_tensor(0.0)
         if boundary_loss_fn is not None and boundary_loss_weight > 0:
             boundary_loss = boundary_loss_fn(warped_float, target_float, mask=boundary_ring_mask)
-        sasc_loss = displacement.new_tensor(0.0)
-        if sasc_loss_fn is not None and sasc_loss_weight > 0:
-            sasc_loss = sasc_loss_fn(warped_float, target_float, mask=base_fg_mask)
-        
         deep_sup_loss, pyramid_img_loss, residual_flow_reg_loss = compute_oasis_pyramid_losses(
             model,
             x.float(),
@@ -1092,8 +1067,6 @@ def train_epoch(
         loss = loss_weights[0] * img_loss + loss_weights[1] * grad_loss
         if boundary_loss_weight > 0:
             loss = loss + boundary_loss_weight * boundary_loss
-        if sasc_loss_weight > 0:
-            loss = loss + sasc_loss_weight * sasc_loss
         if feature_edge_loss_weight > 0:
             loss = loss + feature_edge_loss_weight * feature_edge_loss.float()
         if deep_sup_loss.requires_grad or deep_sup_loss.item() != 0:
@@ -1107,7 +1080,7 @@ def train_epoch(
         if not torch.isfinite(loss):
             print(
                 f"[WARN] Non-finite loss at batch {batch_idx}: "
-                f"img_loss={img_loss.item()}, grad_loss={grad_loss.item()}, boundary_loss={boundary_loss.item()}, sasc_loss={sasc_loss.item()}, feature_edge_loss={feature_edge_loss.item()}, total={loss.item()}"
+                f"img_loss={img_loss.item()}, grad_loss={grad_loss.item()}, boundary_loss={boundary_loss.item()}, feature_edge_loss={feature_edge_loss.item()}, total={loss.item()}"
             )
             # 彻底释放包含 NaN/Inf 计算图的所有局部变量，防止在遇到 NaN 直接 continue 时显存泄漏引发后续 OOM
             optimizer.zero_grad(set_to_none=True)
@@ -1132,17 +1105,15 @@ def train_epoch(
         total_loss += loss.item()
         total_img_loss += img_loss.item()
         total_grad_loss += grad_loss.item()
-        total_sasc_loss += sasc_loss.item()
         total_feature_edge_loss += feature_edge_loss.float().item()
         valid_batches += 1
 
     if valid_batches == 0:
-            return float('nan'), float('nan'), float('nan'), float('nan'), float('nan')
+            return float('nan'), float('nan'), float('nan'), float('nan')
     return (
         total_loss / valid_batches,
         total_img_loss / valid_batches,
         total_grad_loss / valid_batches,
-        total_sasc_loss / valid_batches,
         total_feature_edge_loss / valid_batches,
     )
 
@@ -1192,14 +1163,9 @@ def main():
     parser.add_argument('--boundary-smooth-kernel', type=int, default=3, help='Odd smoothing kernel size applied before boundary extraction')
     parser.add_argument('--boundary-ring-inner-kernel', type=int, default=3, help='Inner erosion kernel size for the foreground boundary ring mask')
     parser.add_argument('--boundary-ring-outer-kernel', type=int, default=7, help='Outer dilation kernel size for the foreground boundary ring mask')
-    parser.add_argument('--use-sasc', action='store_true', help='Enable Self-supervised Anatomical Structure Consistency auxiliary loss')
-    parser.add_argument('--sasc-weight', type=float, default=0.02, help='Total weight for SASC auxiliary loss')
-    parser.add_argument('--sasc-start-epoch', type=int, default=20, help='Start SASC from this 1-based epoch')
-    parser.add_argument('--sasc-ramp-epochs', type=int, default=10, help='Linearly ramp SASC weight over this many epochs after start; 0 disables ramp')
-    parser.add_argument('--sasc-scales', type=str, default='1,1/2,1/4', help='Comma-separated SASC structure scales, e.g. 1,1/2,1/4')
-    parser.add_argument('--sasc-boundary-weight', type=float, default=1.0, help='Internal boundary term weight inside SASC')
-    parser.add_argument('--sasc-mind-weight', type=float, default=0.0, help='Internal MIND term weight inside SASC; usually 0 for single-modal OASIS')
-    parser.add_argument('--sasc-mind-scale', type=float, default=0.25, help='Only compute SASC MIND at scales <= this value')
+    parser.add_argument('--use-frequency-modulation', action='store_true', help='Enable spatial-frequency position modulation in decoder features')
+    parser.add_argument('--frequency-modulation-scales', type=str, default='1/8,1/4', help='Comma-separated decoder scales for frequency modulation')
+    parser.add_argument('--frequency-low-ratio', type=float, default=0.25, help='Radial cutoff ratio for low-frequency feature components')
     parser.add_argument('--use-sdmr', action='store_true', help='Enable Structure-error-guided Diffeomorphic Mamba Refinement on the predicted velocity field')
     parser.add_argument('--sdmr-use-mind', action='store_true', help='Include low-resolution MIND residual maps in SDMR inputs')
     parser.add_argument('--sdmr-scale', type=float, default=0.125, help='Low-resolution scale used by SDMR refiner, e.g. 0.125 or 0.25')
@@ -1249,14 +1215,10 @@ def main():
         parser.error('--boundary-ring-outer-kernel must be greater than or equal to --boundary-ring-inner-kernel.')
     if args.feature_edge_start_epoch < 1:
         parser.error('--feature-edge-start-epoch must be a positive integer.')
-    if args.sasc_start_epoch < 1:
-        parser.error('--sasc-start-epoch must be a positive integer.')
     if args.start_epoch < 1 or args.start_epoch > args.epochs:
         parser.error('--start-epoch must be between 1 and --epochs.')
-    if args.sasc_ramp_epochs < 0:
-        parser.error('--sasc-ramp-epochs must be non-negative.')
-    if args.use_sasc and args.sasc_weight < 0:
-        parser.error('--sasc-weight must be non-negative.')
+    if args.use_frequency_modulation and not (0 < args.frequency_low_ratio < 1):
+        parser.error('--frequency-low-ratio must be in (0, 1).')
     if args.use_sdmr and not (0 < args.sdmr_scale <= 1.0):
         parser.error('--sdmr-scale must be in (0, 1].')
     if args.use_sdmr and args.sdmr_hidden_channels < 1:
@@ -1285,8 +1247,12 @@ def main():
     if args.resume:
         checkpoint = torch.load(args.resume, map_location=device)
         state_dict = checkpoint.get('model_state_dict', checkpoint) if isinstance(checkpoint, dict) else checkpoint
-        model.load_state_dict(state_dict)
+        incompatible = model.load_state_dict(state_dict, strict=False)
         print(f'Loaded model weights from: {args.resume}')
+        if incompatible.missing_keys:
+            print(f'Initialized new checkpoint-missing parameters: {incompatible.missing_keys}')
+        if incompatible.unexpected_keys:
+            print(f'Ignored unexpected checkpoint parameters: {incompatible.unexpected_keys}')
     print(f'Model config: {args.model_config}')
 
     # 统计并打印参数量
@@ -1312,20 +1278,6 @@ def main():
             operator=args.boundary_kernel,
             metric=args.boundary_loss_metric,
             smooth_kernel_size=args.boundary_smooth_kernel,
-        ).to(device)
-    sasc_loss_fn = None
-    sasc_scales = parse_sasc_scales(args.sasc_scales)
-    if args.use_sasc:
-        sasc_loss_fn = vxm.nn.losses.SelfSupervisedAnatomicalStructureConsistencyLoss(
-            scales=sasc_scales,
-            boundary_weight=args.sasc_boundary_weight,
-            mind_weight=args.sasc_mind_weight,
-            mind_scale=args.sasc_mind_scale,
-            operator=args.boundary_kernel,
-            smooth_kernel_size=args.boundary_smooth_kernel,
-            mind_radius=2,
-            mind_dilation=2,
-            mind_eps=1e-8,
         ).to(device)
     loss_weights = [1.0, args.lambda_param]
     feature_edge_indices = parse_feature_edge_indices(args.feature_edge_scales)
@@ -1402,14 +1354,9 @@ def main():
         f.write(f"Feature Edge Loss Weight: {base_feature_edge_loss_weight}\n")
         f.write(f"Feature Edge Start Epoch: {args.feature_edge_start_epoch}\n")
         f.write(f"Feature Edge Scales: {args.feature_edge_scales}\n")
-        f.write(f"Use SASC: {args.use_sasc}\n")
-        f.write(f"SASC Weight: {args.sasc_weight}\n")
-        f.write(f"SASC Start Epoch: {args.sasc_start_epoch}\n")
-        f.write(f"SASC Ramp Epochs: {args.sasc_ramp_epochs}\n")
-        f.write(f"SASC Scales: {args.sasc_scales}\n")
-        f.write(f"SASC Boundary Weight: {args.sasc_boundary_weight}\n")
-        f.write(f"SASC MIND Weight: {args.sasc_mind_weight}\n")
-        f.write(f"SASC MIND Scale: {args.sasc_mind_scale}\n")
+        f.write(f"Use Frequency Modulation: {args.use_frequency_modulation}\n")
+        f.write(f"Frequency Modulation Scales: {args.frequency_modulation_scales}\n")
+        f.write(f"Frequency Low Ratio: {args.frequency_low_ratio}\n")
         f.write(f"Use Residual Flow Pyramid: {args.use_residual_flow_pyramid}\n")
         f.write(f"Use Error-Guided Residual: {args.use_error_guided_residual}\n")
         f.write(f"Residual Flow Limit: {args.residual_flow_limit}\n")
@@ -1429,7 +1376,7 @@ def main():
     # Initialize Logger
     with open(log_file, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(['epoch', 'train_loss', 'train_img_loss', 'train_grad_loss', 'train_sasc_loss', 'train_feature_edge_loss', 'val_dsc', 'val_hd95', 'val_jac', 'val_mag'])
+        writer.writerow(['epoch', 'train_loss', 'train_img_loss', 'train_grad_loss', 'train_feature_edge_loss', 'val_dsc', 'val_hd95', 'val_jac', 'val_mag'])
 
     # Training loop
     print(f'Training for {args.epochs} epochs...')
@@ -1448,18 +1395,12 @@ def main():
         epoch_num = epoch + 1
         boundary_loss_active = args.use_boundary_loss and (epoch_num > args.boundary_loss_start_epoch)
         active_boundary_loss_weight = args.boundary_loss_weight if boundary_loss_active else 0.0
-        sasc_active = args.use_sasc and epoch_num >= args.sasc_start_epoch
-        if sasc_active and args.sasc_ramp_epochs > 0:
-            sasc_ramp = min(1.0, (epoch_num - args.sasc_start_epoch + 1) / args.sasc_ramp_epochs)
-        else:
-            sasc_ramp = 1.0 if sasc_active else 0.0
-        active_sasc_loss_weight = args.sasc_weight * sasc_ramp
         feature_edge_active = args.use_feature_edge_loss and (epoch_num >= args.feature_edge_start_epoch)
         active_feature_edge_loss_weight = base_feature_edge_loss_weight if feature_edge_active else 0.0
         pyramid_image_active = epoch_num >= args.pyramid_image_start_epoch
         active_pyramid_image_weight = args.pyramid_image_weight if pyramid_image_active else 0.0
         
-        avg_loss, train_img_loss, train_grad_loss, train_sasc_loss, train_feature_edge_loss = train_epoch(
+        avg_loss, train_img_loss, train_grad_loss, train_feature_edge_loss = train_epoch(
             model=model,
             dataloader=train_loader,
             optimizer=optimizer,
@@ -1477,8 +1418,6 @@ def main():
             boundary_loss_weight=active_boundary_loss_weight,
             boundary_ring_inner_kernel=args.boundary_ring_inner_kernel,
             boundary_ring_outer_kernel=args.boundary_ring_outer_kernel,
-            sasc_loss_fn=sasc_loss_fn,
-            sasc_loss_weight=active_sasc_loss_weight,
             feature_edge_loss_weight=active_feature_edge_loss_weight,
             feature_edge_indices=feature_edge_indices,
             pyramid_image_weight=active_pyramid_image_weight,
@@ -1500,8 +1439,6 @@ def main():
             boundary_loss_weight=active_boundary_loss_weight,
             boundary_ring_inner_kernel=args.boundary_ring_inner_kernel,
             boundary_ring_outer_kernel=args.boundary_ring_outer_kernel,
-            sasc_loss_fn=sasc_loss_fn,
-            sasc_loss_weight=active_sasc_loss_weight,
             feature_edge_loss_weight=active_feature_edge_loss_weight,
             feature_edge_indices=feature_edge_indices,
             pyramid_weight=args.pyramid_weight,
@@ -1535,8 +1472,6 @@ def main():
                 boundary_loss_weight=active_boundary_loss_weight,
                 boundary_ring_inner_kernel=args.boundary_ring_inner_kernel,
                 boundary_ring_outer_kernel=args.boundary_ring_outer_kernel,
-                sasc_loss_fn=sasc_loss_fn,
-                sasc_loss_weight=active_sasc_loss_weight,
                 feature_edge_loss_weight=active_feature_edge_loss_weight,
                 feature_edge_indices=feature_edge_indices,
                 pyramid_weight=args.pyramid_weight,
@@ -1559,9 +1494,9 @@ def main():
         
         current_lr = optimizer.param_groups[0]['lr']
         if compute_extra:
-            print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Img: {train_img_loss:.6f}, Grad: {train_grad_loss:.6f}, SASC: {train_sasc_loss:.6f}, FeatureEdge: {train_feature_edge_loss:.6f}, Val DSC: {val_dsc:.6f}, HD95: {val_hd95:.2f}, Jac: {val_jac:.4f}, Mag: {val_mag:.4f}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s, Peak: {peak_gpu_mem:.2f}MB')
+            print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Img: {train_img_loss:.6f}, Grad: {train_grad_loss:.6f}, FeatureEdge: {train_feature_edge_loss:.6f}, Val DSC: {val_dsc:.6f}, HD95: {val_hd95:.2f}, Jac: {val_jac:.4f}, Mag: {val_mag:.4f}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s, Peak: {peak_gpu_mem:.2f}MB')
         else:
-            print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Img: {train_img_loss:.6f}, Grad: {train_grad_loss:.6f}, SASC: {train_sasc_loss:.6f}, FeatureEdge: {train_feature_edge_loss:.6f}, Val DSC: {val_dsc:.6f}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s, Peak: {peak_gpu_mem:.2f}MB')
+            print(f'Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.6f}, Img: {train_img_loss:.6f}, Grad: {train_grad_loss:.6f}, FeatureEdge: {train_feature_edge_loss:.6f}, Val DSC: {val_dsc:.6f}, LR: {current_lr:.6f}, Time: {epoch_time:.2f}s, Peak: {peak_gpu_mem:.2f}MB')
 
         # Save visualizations periodically or when a new best model is found to reduce epoch overhead
         save_vis = compute_extra
@@ -1589,7 +1524,6 @@ def main():
                 f"{avg_loss:.6f}", 
                 f"{train_img_loss:.6f}",
                 f"{train_grad_loss:.6f}",
-                f"{train_sasc_loss:.6f}",
                 f"{train_feature_edge_loss:.6f}",
                 f"{val_dsc:.6f}", 
                 f"{val_hd95:.2f}" if compute_extra else "",
