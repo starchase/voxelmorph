@@ -88,7 +88,7 @@ def build_registration_model(args, device):
 
     if args.model_config == 'voxelmorph_baseline':
         ignored_flags = []
-        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv', 'use_boundary_branch', 'use_cross_frequency_modulation', 'use_sdmr'):
+        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv', 'use_boundary_branch', 'use_ussc', 'use_sdmr'):
             if getattr(args, flag):
                 ignored_flags.append(f'--{flag.replace("_", "-")}')
         if ignored_flags:
@@ -141,13 +141,11 @@ def build_registration_model(args, device):
             boundary_branch_strength=getattr(args, 'boundary_branch_strength', 0.5),
             boundary_kernel=getattr(args, 'boundary_kernel', 'sobel'),
             boundary_smooth_kernel=getattr(args, 'boundary_smooth_kernel', 3),
-            use_cross_frequency_modulation=getattr(args, 'use_cross_frequency_modulation', False),
-            cross_frequency_scales=getattr(args, 'cross_frequency_scales', '1/8,1/4'),
-            frequency_low_ratio=getattr(args, 'frequency_low_ratio', 0.25),
-            cross_frequency_structure_calibration=getattr(args, 'cross_frequency_structure_calibration', False),
-            spectral_window_size=getattr(args, 'spectral_window_size', 4),
-            spectral_temperature=getattr(args, 'spectral_temperature', 0.1),
-            spectral_guidance_strength=getattr(args, 'spectral_guidance_strength', 0.5),
+            use_ussc=getattr(args, 'use_ussc', False),
+            ussc_scales=getattr(args, 'ussc_scales', '1/8'),
+            ussc_search_radius=getattr(args, 'ussc_search_radius', 2),
+            ussc_temperature=getattr(args, 'ussc_temperature', 0.1),
+            ussc_guidance_strength=getattr(args, 'ussc_guidance_strength', 0.5),
             use_sdmr=getattr(args, 'use_sdmr', False),
             sdmr_use_mind=getattr(args, 'sdmr_use_mind', False),
             sdmr_scale=getattr(args, 'sdmr_scale', 0.125),
@@ -1167,13 +1165,11 @@ def main():
     parser.add_argument('--boundary-smooth-kernel', type=int, default=3, help='Odd smoothing kernel size applied before boundary extraction')
     parser.add_argument('--boundary-ring-inner-kernel', type=int, default=3, help='Inner erosion kernel size for the foreground boundary ring mask')
     parser.add_argument('--boundary-ring-outer-kernel', type=int, default=7, help='Outer dilation kernel size for the foreground boundary ring mask')
-    parser.add_argument('--use-cross-frequency-modulation', '--use-frequency-modulation', dest='use_cross_frequency_modulation', action='store_true', help='Enable deformation-aware local spectral correspondence guidance')
-    parser.add_argument('--cross-frequency-scales', '--frequency-modulation-scales', dest='cross_frequency_scales', type=str, default='1/8,1/4', help='Comma-separated decoder scales for local spectral correspondence guidance')
-    parser.add_argument('--frequency-low-ratio', type=float, default=0.25, help='Legacy compatibility argument; unused by local spectral correspondence')
-    parser.add_argument('--cross-frequency-structure-calibration', action='store_true', help='Legacy compatibility flag; local spectral correspondence is structure-aware by design')
-    parser.add_argument('--spectral-window-size', type=int, default=4, help='Local 3D window size for phase-correlation displacement responses')
-    parser.add_argument('--spectral-temperature', type=float, default=0.1, help='Softmax temperature for local spectral displacement responses')
-    parser.add_argument('--spectral-guidance-strength', type=float, default=0.5, help='Residual strength of local spectral correspondence guidance')
+    parser.add_argument('--use-ussc', '--use-cross-frequency-modulation', '--use-frequency-modulation', dest='use_ussc', action='store_true', help='Enable uncertainty-aware self-similarity correspondence guidance')
+    parser.add_argument('--ussc-scales', '--cross-frequency-scales', '--frequency-modulation-scales', dest='ussc_scales', type=str, default='1/8', help='Comma-separated decoder scales for USSC; 1/8 is recommended for both tasks')
+    parser.add_argument('--ussc-search-radius', type=int, default=2, help='USSC local search radius; 2 produces a 5x5x5 search neighborhood')
+    parser.add_argument('--ussc-temperature', '--spectral-temperature', dest='ussc_temperature', type=float, default=0.1, help='Softmax temperature for USSC local correspondence probabilities')
+    parser.add_argument('--ussc-guidance-strength', '--spectral-guidance-strength', dest='ussc_guidance_strength', type=float, default=0.5, help='Residual strength of uncertainty-weighted USSC guidance')
     parser.add_argument('--use-sdmr', action='store_true', help='Enable Structure-error-guided Diffeomorphic Mamba Refinement on the predicted velocity field')
     parser.add_argument('--sdmr-use-mind', action='store_true', help='Include low-resolution MIND residual maps in SDMR inputs')
     parser.add_argument('--sdmr-scale', type=float, default=0.125, help='Low-resolution scale used by SDMR refiner, e.g. 0.125 or 0.25')
@@ -1225,14 +1221,12 @@ def main():
         parser.error('--feature-edge-start-epoch must be a positive integer.')
     if args.start_epoch < 1 or args.start_epoch > args.epochs:
         parser.error('--start-epoch must be between 1 and --epochs.')
-    if args.use_cross_frequency_modulation and not (0 < args.frequency_low_ratio < 1):
-        parser.error('--frequency-low-ratio must be in (0, 1).')
-    if args.use_cross_frequency_modulation and args.spectral_window_size < 2:
-        parser.error('--spectral-window-size must be at least 2.')
-    if args.use_cross_frequency_modulation and args.spectral_temperature <= 0:
-        parser.error('--spectral-temperature must be positive.')
-    if args.use_cross_frequency_modulation and args.spectral_guidance_strength < 0:
-        parser.error('--spectral-guidance-strength must be non-negative.')
+    if args.use_ussc and args.ussc_search_radius < 1:
+        parser.error('--ussc-search-radius must be at least 1.')
+    if args.use_ussc and args.ussc_temperature <= 0:
+        parser.error('--ussc-temperature must be positive.')
+    if args.use_ussc and args.ussc_guidance_strength < 0:
+        parser.error('--ussc-guidance-strength must be non-negative.')
     if args.use_sdmr and not (0 < args.sdmr_scale <= 1.0):
         parser.error('--sdmr-scale must be in (0, 1].')
     if args.use_sdmr and args.sdmr_hidden_channels < 1:
@@ -1368,13 +1362,11 @@ def main():
         f.write(f"Feature Edge Loss Weight: {base_feature_edge_loss_weight}\n")
         f.write(f"Feature Edge Start Epoch: {args.feature_edge_start_epoch}\n")
         f.write(f"Feature Edge Scales: {args.feature_edge_scales}\n")
-        f.write(f"Use Cross Frequency Modulation: {args.use_cross_frequency_modulation}\n")
-        f.write(f"Cross Frequency Scales: {args.cross_frequency_scales}\n")
-        f.write(f"Frequency Low Ratio: {args.frequency_low_ratio}\n")
-        f.write(f"Cross Frequency Structure Calibration: {args.cross_frequency_structure_calibration}\n")
-        f.write(f"Spectral Window Size: {args.spectral_window_size}\n")
-        f.write(f"Spectral Temperature: {args.spectral_temperature}\n")
-        f.write(f"Spectral Guidance Strength: {args.spectral_guidance_strength}\n")
+        f.write(f"Use USSC: {args.use_ussc}\n")
+        f.write(f"USSC Scales: {args.ussc_scales}\n")
+        f.write(f"USSC Search Radius: {args.ussc_search_radius}\n")
+        f.write(f"USSC Temperature: {args.ussc_temperature}\n")
+        f.write(f"USSC Guidance Strength: {args.ussc_guidance_strength}\n")
         f.write(f"Use Residual Flow Pyramid: {args.use_residual_flow_pyramid}\n")
         f.write(f"Use Error-Guided Residual: {args.use_error_guided_residual}\n")
         f.write(f"Residual Flow Limit: {args.residual_flow_limit}\n")

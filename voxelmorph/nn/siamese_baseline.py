@@ -46,34 +46,26 @@ class ResidualMambaBlock(nn.Module):
         return x
 
 
-class CrossImageFrequencyConsistencyModulation3D(nn.Module):
-    """Deformation-aware local spectral correspondence guidance.
-
-    Shared projections place source and target features in a symmetric space.
-    Window-wise phase correlation then estimates local displacement responses
-    and confidence, which are softly injected into decoder features.
-    """
+class UncertaintyAwareSelfSimilarityCorrespondence3D(nn.Module):
+    """Modality-robust local correspondence from self-similarity descriptors."""
 
     def __init__(
         self,
         channels,
         feature_channels=None,
-        low_frequency_ratio=0.25,
-        use_structure_calibration=False,
-        window_size=4,
+        search_radius=2,
         temperature=0.1,
         guidance_strength=0.5,
     ):
         super().__init__()
-        del low_frequency_ratio, use_structure_calibration  # legacy arguments
         feature_channels = int(feature_channels or channels)
         projection_channels = min(8, feature_channels)
         hidden_channels = max(channels // 2, 8)
-        self.window_size = int(window_size)
+        self.search_radius = int(search_radius)
         self.temperature = float(temperature)
         self.guidance_strength = float(guidance_strength)
-        if self.window_size < 2:
-            raise ValueError('window_size must be at least 2')
+        if self.search_radius < 1:
+            raise ValueError('search_radius must be at least 1')
         if self.temperature <= 0:
             raise ValueError('temperature must be positive')
         if self.guidance_strength < 0:
@@ -85,7 +77,7 @@ class CrossImageFrequencyConsistencyModulation3D(nn.Module):
             nn.LeakyReLU(0.2),
         )
         self.guidance = nn.Sequential(
-            nn.Conv3d(4, hidden_channels, kernel_size=3, padding=1),
+            nn.Conv3d(6, hidden_channels, kernel_size=3, padding=1),
             nn.LeakyReLU(0.2),
             nn.Conv3d(hidden_channels, channels, kernel_size=1),
         )
@@ -100,69 +92,70 @@ class CrossImageFrequencyConsistencyModulation3D(nn.Module):
         self.decoder_gate[-1].weight.data.zero_()
         self.decoder_gate[-1].bias.data.zero_()
 
-    def _window_shape(self, spatial_shape):
-        return tuple(min(self.window_size, int(size)) for size in spatial_shape)
-
-    def _window_features(self, feature, window_shape):
-        wd, wh, ww = window_shape
+    @staticmethod
+    def _shift(feature, offset):
+        dd, dh, dw = offset
+        padded = F.pad(
+            feature,
+            (
+                max(-dw, 0), max(dw, 0),
+                max(-dh, 0), max(dh, 0),
+                max(-dd, 0), max(dd, 0),
+            ),
+            mode='replicate',
+        )
+        d0, h0, w0 = max(dd, 0), max(dh, 0), max(dw, 0)
         depth, height, width = feature.shape[-3:]
-        pad_d = (wd - depth % wd) % wd
-        pad_h = (wh - height % wh) % wh
-        pad_w = (ww - width % ww) % ww
-        feature = F.pad(feature, (0, pad_w, 0, pad_h, 0, pad_d), mode='replicate')
-        batch, channels, depth, height, width = feature.shape
-        feature = feature.reshape(
-            batch, channels, depth // wd, wd, height // wh, wh, width // ww, ww
+        return padded[..., d0:d0 + depth, h0:h0 + height, w0:w0 + width]
+
+    def _self_similarity(self, feature):
+        feature = self.shared_projection(feature.float())
+        offsets = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
+        descriptors = [
+            (feature * self._shift(feature, offset)).mean(dim=1, keepdim=True)
+            for offset in offsets
+        ]
+        descriptor = torch.cat(descriptors, dim=1)
+        descriptor = descriptor - descriptor.mean(dim=1, keepdim=True)
+        return F.normalize(descriptor, dim=1, eps=1e-6)
+
+    def _correspondence_guidance(self, source_feature, target_feature):
+        source = self._self_similarity(source_feature)
+        target = self._self_similarity(target_feature)
+        radius = self.search_radius
+        offsets = [
+            (dd, dh, dw)
+            for dd in range(-radius, radius + 1)
+            for dh in range(-radius, radius + 1)
+            for dw in range(-radius, radius + 1)
+        ]
+        logits = torch.cat(
+            [(source * self._shift(target, offset)).sum(dim=1, keepdim=True) for offset in offsets],
+            dim=1,
         )
-        return feature.permute(0, 2, 4, 6, 1, 3, 5, 7).contiguous()
-
-    def _phase_correlation_guidance(self, source_feature, target_feature):
-        source = self.shared_projection(source_feature.float())
-        target = self.shared_projection(target_feature.float())
-        source = F.normalize(source, dim=1, eps=1e-6)
-        target = F.normalize(target, dim=1, eps=1e-6)
-        window_shape = self._window_shape(source.shape[-3:])
-        source_windows = self._window_features(source, window_shape)
-        target_windows = self._window_features(target, window_shape)
-
-        spectrum_dims = (-3, -2, -1)
-        source_spectrum = torch.fft.fftn(source_windows, dim=spectrum_dims, norm='ortho')
-        target_spectrum = torch.fft.fftn(target_windows, dim=spectrum_dims, norm='ortho')
-        cross_power = source_spectrum * target_spectrum.conj()
-        cross_power = cross_power / cross_power.abs().clamp_min(1e-6)
-        response = torch.fft.ifftn(cross_power.mean(dim=4), dim=spectrum_dims, norm='ortho').real
-
-        wd, wh, ww = window_shape
-        probabilities = torch.softmax(response.flatten(start_dim=-3) / self.temperature, dim=-1)
-        probabilities = probabilities.reshape_as(response)
-        confidence = probabilities.amax(dim=(-3, -2, -1))
-
-        def periodic_coordinates(size, device, dtype):
-            coordinates = torch.arange(size, device=device, dtype=dtype)
-            return torch.where(coordinates <= size // 2, coordinates, coordinates - size)
-
-        coord_d = periodic_coordinates(wd, response.device, response.dtype)
-        coord_h = periodic_coordinates(wh, response.device, response.dtype)
-        coord_w = periodic_coordinates(ww, response.device, response.dtype)
-        offset_d = (probabilities * coord_d[:, None, None]).sum(dim=(-3, -2, -1)) / max(wd // 2, 1)
-        offset_h = (probabilities * coord_h[None, :, None]).sum(dim=(-3, -2, -1)) / max(wh // 2, 1)
-        offset_w = (probabilities * coord_w[None, None, :]).sum(dim=(-3, -2, -1)) / max(ww // 2, 1)
-        guidance = torch.stack([confidence, offset_d, offset_h, offset_w], dim=1)
-        return F.interpolate(
-            guidance,
-            size=source_feature.shape[-3:],
-            mode='trilinear',
-            align_corners=False,
-        )
+        probabilities = torch.softmax(logits / self.temperature, dim=1)
+        entropy = -(probabilities * probabilities.clamp_min(1e-8).log()).sum(dim=1, keepdim=True)
+        entropy = entropy / probabilities.new_tensor(float(len(offsets))).log()
+        confidence = 1.0 - entropy
+        peak = probabilities.amax(dim=1, keepdim=True)
+        offset_tensor = source.new_tensor(offsets).transpose(0, 1).view(1, 3, -1, 1, 1, 1)
+        expected_offset = (probabilities.unsqueeze(1) * offset_tensor).sum(dim=2) / float(radius)
+        expected_offset = expected_offset * confidence
+        match_score = (probabilities * logits).sum(dim=1, keepdim=True) * confidence
+        return torch.cat([confidence, peak, match_score, expected_offset], dim=1)
 
     def forward(self, x, source_feature, target_feature):
         input_dtype = x.dtype
-        guidance = self._phase_correlation_guidance(source_feature, target_feature)
+        guidance = self._correspondence_guidance(source_feature, target_feature)
         if guidance.shape[-3:] != x.shape[-3:]:
             guidance = F.interpolate(guidance, size=x.shape[-3:], mode='trilinear', align_corners=False)
         update = self.guidance(guidance)
         gate = torch.sigmoid(self.decoder_gate(x.float()))
         return (x.float() + self.guidance_strength * gate * update).to(dtype=input_dtype)
+
+
+# Backward-compatible class alias for old checkpoints and imports.
+CrossImageFrequencyConsistencyModulation3D = UncertaintyAwareSelfSimilarityCorrespondence3D
 
 
 class StructureErrorMambaRefiner(nn.Module):
@@ -529,6 +522,7 @@ class SiameseUNetBaseline(nn.Module):
                  boundary_branch_scales='deep', boundary_branch_strength=0.5, boundary_kernel='sobel', boundary_smooth_kernel=3,
                  use_cross_frequency_modulation=False, cross_frequency_scales='1/8,1/4', frequency_low_ratio=0.25, cross_frequency_structure_calibration=False,
                  spectral_window_size=4, spectral_temperature=0.1, spectral_guidance_strength=0.5,
+                 use_ussc=False, ussc_scales='1/8', ussc_search_radius=2, ussc_temperature=0.1, ussc_guidance_strength=0.5,
                  use_sdmr=False, sdmr_use_mind=True, sdmr_scale=0.125, sdmr_hidden_channels=16, sdmr_flow_limit=1.0, sdmr_alpha=0.5):
         super().__init__()
         self.inshape = inshape
@@ -558,8 +552,11 @@ class SiameseUNetBaseline(nn.Module):
         self.use_gcv = use_gcv
         self.encoder_type = encoder_type
         self.use_boundary_branch = use_boundary_branch
-        self.use_cross_frequency_modulation = use_cross_frequency_modulation
-        self.cross_frequency_scales = self._parse_decoder_scales(cross_frequency_scales)
+        self.use_ussc = bool(use_ussc or use_cross_frequency_modulation)
+        selected_ussc_scales = ussc_scales if use_ussc else cross_frequency_scales
+        self.ussc_scales = self._parse_decoder_scales(selected_ussc_scales)
+        self.use_cross_frequency_modulation = self.use_ussc
+        self.cross_frequency_scales = self.ussc_scales
         self.cross_frequency_structure_calibration = cross_frequency_structure_calibration
         self.boundary_branch_scales = boundary_branch_scales
         self.boundary_branch_strength = boundary_branch_strength
@@ -671,7 +668,7 @@ class SiameseUNetBaseline(nn.Module):
         
         # 2. Standard Decoder
         self.dec_blocks = nn.ModuleList()
-        self.cross_frequency_blocks = nn.ModuleDict()
+        self.ussc_blocks = nn.ModuleDict()
         self.up_blocks = nn.ModuleList()
         
         if self.use_daps:
@@ -716,17 +713,15 @@ class SiameseUNetBaseline(nn.Module):
                 self.dec_blocks.append(ConvBlock(ndim, in_ch, nf, stride=1))
 
             decoder_scale = f'1/{2 ** (len(enc_nf) - i - 1)}'
-            if self.use_cross_frequency_modulation and decoder_scale in self.cross_frequency_scales:
+            if self.use_ussc and decoder_scale in self.ussc_scales:
                 if ndim != 3:
-                    raise ValueError('CrossImageFrequencyConsistencyModulation3D requires ndim=3')
-                self.cross_frequency_blocks[str(i)] = CrossImageFrequencyConsistencyModulation3D(
+                    raise ValueError('UncertaintyAwareSelfSimilarityCorrespondence3D requires ndim=3')
+                self.ussc_blocks[str(i)] = UncertaintyAwareSelfSimilarityCorrespondence3D(
                     nf,
                     feature_channels=enc_nf[skip_idx],
-                    low_frequency_ratio=frequency_low_ratio,
-                    use_structure_calibration=self.cross_frequency_structure_calibration,
-                    window_size=spectral_window_size,
-                    temperature=spectral_temperature,
-                    guidance_strength=spectral_guidance_strength,
+                    search_radius=ussc_search_radius if use_ussc else max(1, spectral_window_size // 2),
+                    temperature=ussc_temperature if use_ussc else spectral_temperature,
+                    guidance_strength=ussc_guidance_strength if use_ussc else spectral_guidance_strength,
                 )
                 
             prev_channels = nf
@@ -983,7 +978,7 @@ class SiameseUNetBaseline(nn.Module):
         valid = {'1/8', '1/4', '1/2'}
         invalid = sorted(set(items) - valid)
         if invalid:
-            raise ValueError(f'Unsupported cross-frequency scales: {invalid}. Valid values are {sorted(valid)}')
+            raise ValueError(f'Unsupported USSC scales: {invalid}. Valid values are {sorted(valid)}')
         return set(items)
 
     def forward(self, source, target, return_warped_source=True, return_field_type='displacement', return_coarse_flows=False, return_residual_flows=False, return_feature_edge_loss=False, feature_edge_indices=(0, 1)):
@@ -1053,8 +1048,8 @@ class SiameseUNetBaseline(nn.Module):
             skip_idx = len(feat_s) - 2 - i
             s_skip_raw = None
             t_skip_raw = None
-            frequency_source_feature = None
-            frequency_target_feature = None
+            ussc_source_feature = None
+            ussc_target_feature = None
             if skip_idx >= 0:
                 s_skip = feat_s[skip_idx]
                 t_skip = feat_t[skip_idx]
@@ -1079,11 +1074,11 @@ class SiameseUNetBaseline(nn.Module):
                 if getattr(self, 'use_gcv', False) and str(skip_idx) in self.gcv_blocks:
                     s_skip = self.gcv_blocks[str(skip_idx)](x_fixed=t_skip, x_moving=s_skip)
 
-                # Local spectral matching needs symmetric representations.
-                # Cross-Mamba updates source only, so use the pre-interaction
-                # pair to avoid interpreting representation changes as motion.
-                frequency_source_feature = s_skip_raw
-                frequency_target_feature = t_skip_raw
+                # USSC compares symmetric pre-interaction features. Cross-Mamba
+                # updates source only, which would make self-similarity spaces
+                # asymmetric and corrupt local correspondence probabilities.
+                ussc_source_feature = s_skip_raw
+                ussc_target_feature = t_skip_raw
                 
                 # --- [Ablation 2: P-DAPS (Pyramid Deformation-Aware Progressive Skip) + Structure Matching] ---
                 # NOTE: P-DAPS essentially absorbs the traditional feature pyramid.
@@ -1138,11 +1133,11 @@ class SiameseUNetBaseline(nn.Module):
                 x = torch.cat([x, skip_concat], dim=1)
                 
             x = block(x)
-            if self.use_cross_frequency_modulation and str(i) in self.cross_frequency_blocks:
-                x = self.cross_frequency_blocks[str(i)](
+            if self.use_ussc and str(i) in self.ussc_blocks:
+                x = self.ussc_blocks[str(i)](
                     x,
-                    frequency_source_feature,
-                    frequency_target_feature,
+                    ussc_source_feature,
+                    ussc_target_feature,
                 )
 
             if self.use_residual_flow_pyramid:
