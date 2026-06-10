@@ -2075,9 +2075,10 @@ def main():
     parser.add_argument('--boundary-loss-metric', type=str, default='l1', choices=['ncc', 'l1'], help='Metric used by the boundary consistency loss; `l1` compares 3D Sobel gradient maps more directly and usually overlaps less with the main image NCC/MI term')
     parser.add_argument('--boundary-kernel', type=str, default='sobel', choices=['sobel', 'diff'], help='Fixed operator used to extract 3D boundary maps')
     parser.add_argument('--boundary-smooth-kernel', type=int, default=3, help='Odd smoothing kernel size applied before boundary extraction')
-    parser.add_argument('--use-frequency-modulation', action='store_true', help='Enable spatial-frequency position modulation in decoder features')
-    parser.add_argument('--frequency-modulation-scales', type=str, default='1/8,1/4', help='Comma-separated decoder scales for frequency modulation')
+    parser.add_argument('--use-cross-frequency-modulation', '--use-frequency-modulation', dest='use_cross_frequency_modulation', action='store_true', help='Enable cross-image frequency consistency modulation in decoder features')
+    parser.add_argument('--cross-frequency-scales', '--frequency-modulation-scales', dest='cross_frequency_scales', type=str, default='1/8,1/4', help='Comma-separated decoder scales for cross-image frequency consistency modulation')
     parser.add_argument('--frequency-low-ratio', type=float, default=0.25, help='Radial cutoff ratio for low-frequency feature components')
+    parser.add_argument('--cross-frequency-structure-calibration', action='store_true', help='Use label-free source/target feature-gradient consistency to calibrate cross-frequency gates')
     parser.add_argument('--use-sdmr', action='store_true', help='Enable Structure-error-guided Diffeomorphic Mamba Refinement on the predicted velocity field')
     parser.add_argument('--sdmr-use-mind', action='store_true', help='Include low-resolution MIND residual maps in SDMR inputs; recommended for CT-MR')
     parser.add_argument('--sdmr-scale', type=float, default=0.125, help='Low-resolution scale used by SDMR refiner, e.g. 0.125 or 0.25')
@@ -2100,7 +2101,7 @@ def main():
         parser.error('--use-error-guided-residual requires --use-residual-flow-pyramid.')
     if args.start_epoch < 1 or args.start_epoch > args.epochs:
         parser.error('--start-epoch must be between 1 and --epochs.')
-    if args.use_frequency_modulation and not (0 < args.frequency_low_ratio < 1):
+    if args.use_cross_frequency_modulation and not (0 < args.frequency_low_ratio < 1):
         parser.error('--frequency-low-ratio must be in (0, 1).')
     if args.use_sdmr and not (0 < args.sdmr_scale <= 1.0):
         parser.error('--sdmr-scale must be in (0, 1].')
@@ -2180,9 +2181,10 @@ def main():
             boundary_branch_strength=args.boundary_branch_strength,
             boundary_kernel=args.boundary_kernel,
             boundary_smooth_kernel=args.boundary_smooth_kernel,
-            use_frequency_modulation=args.use_frequency_modulation,
-            frequency_modulation_scales=args.frequency_modulation_scales,
+            use_cross_frequency_modulation=args.use_cross_frequency_modulation,
+            cross_frequency_scales=args.cross_frequency_scales,
             frequency_low_ratio=args.frequency_low_ratio,
+            cross_frequency_structure_calibration=args.cross_frequency_structure_calibration,
             use_sdmr=args.use_sdmr,
             sdmr_use_mind=args.sdmr_use_mind,
             sdmr_scale=args.sdmr_scale,
@@ -2360,9 +2362,10 @@ def main():
         f.write(f"Residual Flow Reg Weight: {args.residual_flow_reg_weight}\n")
         f.write(f"Feature Edge Loss Weight: {active_feature_edge_loss_weight}\n")
         f.write(f"Feature Edge Scales: {args.feature_edge_scales}\n")
-        f.write(f"Use Frequency Modulation: {args.use_frequency_modulation}\n")
-        f.write(f"Frequency Modulation Scales: {args.frequency_modulation_scales}\n")
+        f.write(f"Use Cross Frequency Modulation: {args.use_cross_frequency_modulation}\n")
+        f.write(f"Cross Frequency Scales: {args.cross_frequency_scales}\n")
         f.write(f"Frequency Low Ratio: {args.frequency_low_ratio}\n")
+        f.write(f"Cross Frequency Structure Calibration: {args.cross_frequency_structure_calibration}\n")
         f.write(f"Cross-Mamba Offset Limit: {args.cross_mamba_offset_limit}\n")
         f.write(f"Cross-Mamba Offset Smooth Kernel: {args.cross_mamba_offset_smooth_kernel}\n")
         f.write(f"Use SDMR: {args.use_sdmr}\n")

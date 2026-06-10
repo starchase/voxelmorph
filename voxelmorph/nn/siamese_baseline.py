@@ -46,20 +46,21 @@ class ResidualMambaBlock(nn.Module):
         return x
 
 
-class SpatialFrequencyPositionModulation3D(nn.Module):
+class CrossImageFrequencyConsistencyModulation3D(nn.Module):
     """
-    Residual spatial-frequency modulation for 3D decoder features.
+    Cross-image frequency consistency modulation for 3D decoder features.
 
-    Fixed radial masks separate low-frequency global deformation context from
-    high-frequency local detail. Feature-conditioned channel gates select the
-    useful frequency response, while a local spatial branch preserves explicit
-    neighborhood information.
+    Source/target feature spectra estimate modality-shared frequency energy.
+    The resulting consistency map suppresses source- or target-specific
+    frequencies before low/high-frequency decoder modulation. A local spatial
+    branch preserves explicit neighborhood information.
     """
 
-    def __init__(self, channels, low_frequency_ratio=0.25):
+    def __init__(self, channels, low_frequency_ratio=0.25, use_structure_calibration=False):
         super().__init__()
         hidden_channels = max(channels // 4, 8)
         self.low_frequency_ratio = float(low_frequency_ratio)
+        self.use_structure_calibration = bool(use_structure_calibration)
         if not (0 < self.low_frequency_ratio < 1):
             raise ValueError('low_frequency_ratio must be in (0, 1)')
 
@@ -78,6 +79,14 @@ class SpatialFrequencyPositionModulation3D(nn.Module):
         self.frequency_gate[-1].bias.data.zero_()
         self.local_branch[-1].weight.data.zero_()
         self.local_branch[-1].bias.data.zero_()
+        if self.use_structure_calibration:
+            self.structure_calibration = nn.Sequential(
+                nn.Conv3d(channels * 2, hidden_channels, kernel_size=1),
+                nn.LeakyReLU(0.2),
+                nn.Conv3d(hidden_channels, channels * 2, kernel_size=1),
+            )
+            self.structure_calibration[-1].weight.data.zero_()
+            self.structure_calibration[-1].bias.data.zero_()
 
     def _frequency_masks(self, spatial_shape, device, dtype):
         depth, height, width = spatial_shape
@@ -93,16 +102,64 @@ class SpatialFrequencyPositionModulation3D(nn.Module):
         low_mask = (radius <= cutoff).to(dtype=dtype)[None, None]
         return low_mask, 1.0 - low_mask
 
-    def forward(self, x):
+    def _frequency_consistency(self, source_feature, target_feature):
+        source_spectrum = torch.fft.rfftn(source_feature.float(), dim=(-3, -2, -1), norm='ortho')
+        target_spectrum = torch.fft.rfftn(target_feature.float(), dim=(-3, -2, -1), norm='ortho')
+        source_amplitude = source_spectrum.abs()
+        target_amplitude = target_spectrum.abs()
+        source_amplitude = source_amplitude / source_amplitude.mean(dim=(-3, -2, -1), keepdim=True).clamp_min(1e-6)
+        target_amplitude = target_amplitude / target_amplitude.mean(dim=(-3, -2, -1), keepdim=True).clamp_min(1e-6)
+        consistency = (
+            2.0 * source_amplitude * target_amplitude
+            / (source_amplitude.square() + target_amplitude.square() + 1e-6)
+        )
+        return consistency.mean(dim=1, keepdim=True).clamp_(0.0, 1.0).detach()
+
+    def _gradient_magnitude(self, feature):
+        gradient_d = F.pad(feature[:, :, 1:] - feature[:, :, :-1], (0, 0, 0, 0, 0, 1))
+        gradient_h = F.pad(feature[:, :, :, 1:] - feature[:, :, :, :-1], (0, 0, 0, 1, 0, 0))
+        gradient_w = F.pad(feature[:, :, :, :, 1:] - feature[:, :, :, :, :-1], (0, 1, 0, 0, 0, 0))
+        return torch.sqrt(gradient_d.square() + gradient_h.square() + gradient_w.square() + 1e-6)
+
+    def _structure_gates(self, source_feature, target_feature):
+        source_structure = self._gradient_magnitude(source_feature.float())
+        target_structure = self._gradient_magnitude(target_feature.float())
+        source_descriptor = F.adaptive_avg_pool3d(source_structure, 1)
+        target_descriptor = F.adaptive_avg_pool3d(target_structure, 1)
+        source_descriptor = source_descriptor / source_descriptor.mean(dim=1, keepdim=True).clamp_min(1e-6)
+        target_descriptor = target_descriptor / target_descriptor.mean(dim=1, keepdim=True).clamp_min(1e-6)
+        structure_context = torch.cat(
+            [
+                torch.abs(source_descriptor - target_descriptor),
+                2.0 * source_descriptor * target_descriptor
+                / (source_descriptor.square() + target_descriptor.square() + 1e-6),
+            ],
+            dim=1,
+        ).detach()
+        low_delta, high_delta = self.structure_calibration(structure_context).chunk(2, dim=1)
+        return 1.0 + torch.tanh(low_delta), 1.0 + torch.tanh(high_delta)
+
+    def forward(self, x, source_feature, target_feature):
         input_dtype = x.dtype
         x_float = x.float()
         spectrum = torch.fft.rfftn(x_float, dim=(-3, -2, -1), norm='ortho')
         low_mask, high_mask = self._frequency_masks(x.shape[-3:], x.device, spectrum.real.dtype)
-        low = torch.fft.irfftn(spectrum * low_mask, s=x.shape[-3:], dim=(-3, -2, -1), norm='ortho')
-        high = torch.fft.irfftn(spectrum * high_mask, s=x.shape[-3:], dim=(-3, -2, -1), norm='ortho')
+        consistency = self._frequency_consistency(source_feature, target_feature)
+        consistent_spectrum = spectrum * consistency
+        low = torch.fft.irfftn(consistent_spectrum * low_mask, s=x.shape[-3:], dim=(-3, -2, -1), norm='ortho')
+        high = torch.fft.irfftn(consistent_spectrum * high_mask, s=x.shape[-3:], dim=(-3, -2, -1), norm='ortho')
 
         low_gate, high_gate = self.frequency_gate(x_float).chunk(2, dim=1)
-        frequency_update = torch.tanh(low_gate) * low + torch.tanh(high_gate) * high
+        if self.use_structure_calibration:
+            structure_low_gate, structure_high_gate = self._structure_gates(source_feature, target_feature)
+        else:
+            structure_low_gate = structure_high_gate = 1.0
+        low_confidence = (consistency * low_mask).sum(dim=(-3, -2, -1), keepdim=True) / low_mask.sum().clamp_min(1.0)
+        high_confidence = (consistency * high_mask).sum(dim=(-3, -2, -1), keepdim=True) / high_mask.sum().clamp_min(1.0)
+        frequency_update = (
+            torch.tanh(low_gate) * structure_low_gate * low_confidence * low
+            + torch.tanh(high_gate) * structure_high_gate * high_confidence * high
+        )
         spatial_update = self.local_branch(x_float)
         return (x_float + frequency_update + spatial_update).to(dtype=input_dtype)
 
@@ -469,7 +526,7 @@ class SiameseUNetBaseline(nn.Module):
                  cross_mamba_scales='1/16,1/8',
                  use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, mamba_enc_shallow_multi=None, mamba_dec_shallow_multi=None, mamba_quarter_scale=False, mamba_dec_quarter_scale=False,  mamba_parallel_block=False, fusion_method='compress_concat', window_size=9, pdaps_flow_limit=20.0, use_residual_flow_pyramid=False, residual_flow_limit=4.0, use_error_guided_residual=False, error_guided_metric='feature_ncc',cross_mamba_offset_limit=0.0, cross_mamba_offset_smooth_kernel=1, use_boundary_branch=False,
                  boundary_branch_scales='deep', boundary_branch_strength=0.5, boundary_kernel='sobel', boundary_smooth_kernel=3,
-                 use_frequency_modulation=False, frequency_modulation_scales='1/8,1/4', frequency_low_ratio=0.25,
+                 use_cross_frequency_modulation=False, cross_frequency_scales='1/8,1/4', frequency_low_ratio=0.25, cross_frequency_structure_calibration=False,
                  use_sdmr=False, sdmr_use_mind=True, sdmr_scale=0.125, sdmr_hidden_channels=16, sdmr_flow_limit=1.0, sdmr_alpha=0.5):
         super().__init__()
         self.inshape = inshape
@@ -499,8 +556,9 @@ class SiameseUNetBaseline(nn.Module):
         self.use_gcv = use_gcv
         self.encoder_type = encoder_type
         self.use_boundary_branch = use_boundary_branch
-        self.use_frequency_modulation = use_frequency_modulation
-        self.frequency_modulation_scales = self._parse_decoder_scales(frequency_modulation_scales)
+        self.use_cross_frequency_modulation = use_cross_frequency_modulation
+        self.cross_frequency_scales = self._parse_decoder_scales(cross_frequency_scales)
+        self.cross_frequency_structure_calibration = cross_frequency_structure_calibration
         self.boundary_branch_scales = boundary_branch_scales
         self.boundary_branch_strength = boundary_branch_strength
         self.cross_mamba_scales = self._parse_cross_mamba_scales(cross_mamba_scales)
@@ -611,7 +669,7 @@ class SiameseUNetBaseline(nn.Module):
         
         # 2. Standard Decoder
         self.dec_blocks = nn.ModuleList()
-        self.frequency_modulation_blocks = nn.ModuleDict()
+        self.cross_frequency_blocks = nn.ModuleDict()
         self.up_blocks = nn.ModuleList()
         
         if self.use_daps:
@@ -656,12 +714,13 @@ class SiameseUNetBaseline(nn.Module):
                 self.dec_blocks.append(ConvBlock(ndim, in_ch, nf, stride=1))
 
             decoder_scale = f'1/{2 ** (len(enc_nf) - i - 1)}'
-            if self.use_frequency_modulation and decoder_scale in self.frequency_modulation_scales:
+            if self.use_cross_frequency_modulation and decoder_scale in self.cross_frequency_scales:
                 if ndim != 3:
-                    raise ValueError('SpatialFrequencyPositionModulation3D requires ndim=3')
-                self.frequency_modulation_blocks[str(i)] = SpatialFrequencyPositionModulation3D(
+                    raise ValueError('CrossImageFrequencyConsistencyModulation3D requires ndim=3')
+                self.cross_frequency_blocks[str(i)] = CrossImageFrequencyConsistencyModulation3D(
                     nf,
                     low_frequency_ratio=frequency_low_ratio,
+                    use_structure_calibration=self.cross_frequency_structure_calibration,
                 )
                 
             prev_channels = nf
@@ -915,10 +974,10 @@ class SiameseUNetBaseline(nn.Module):
             items = [item.strip() for item in scales.split(',') if item.strip()]
         else:
             items = [str(item).strip() for item in scales if str(item).strip()]
-        valid = {'1/8', '1/4', '1/2', '1/1'}
+        valid = {'1/8', '1/4', '1/2'}
         invalid = sorted(set(items) - valid)
         if invalid:
-            raise ValueError(f'Unsupported frequency modulation scales: {invalid}. Valid values are {sorted(valid)}')
+            raise ValueError(f'Unsupported cross-frequency scales: {invalid}. Valid values are {sorted(valid)}')
         return set(items)
 
     def forward(self, source, target, return_warped_source=True, return_field_type='displacement', return_coarse_flows=False, return_residual_flows=False, return_feature_edge_loss=False, feature_edge_indices=(0, 1)):
@@ -988,6 +1047,8 @@ class SiameseUNetBaseline(nn.Module):
             skip_idx = len(feat_s) - 2 - i
             s_skip_raw = None
             t_skip_raw = None
+            frequency_source_feature = None
+            frequency_target_feature = None
             if skip_idx >= 0:
                 s_skip = feat_s[skip_idx]
                 t_skip = feat_t[skip_idx]
@@ -1011,6 +1072,9 @@ class SiameseUNetBaseline(nn.Module):
                 # --- [GCV at Deep Scales] ---
                 if getattr(self, 'use_gcv', False) and str(skip_idx) in self.gcv_blocks:
                     s_skip = self.gcv_blocks[str(skip_idx)](x_fixed=t_skip, x_moving=s_skip)
+
+                frequency_source_feature = s_skip
+                frequency_target_feature = t_skip
                 
                 # --- [Ablation 2: P-DAPS (Pyramid Deformation-Aware Progressive Skip) + Structure Matching] ---
                 # NOTE: P-DAPS essentially absorbs the traditional feature pyramid.
@@ -1065,8 +1129,12 @@ class SiameseUNetBaseline(nn.Module):
                 x = torch.cat([x, skip_concat], dim=1)
                 
             x = block(x)
-            if self.use_frequency_modulation and str(i) in self.frequency_modulation_blocks:
-                x = self.frequency_modulation_blocks[str(i)](x)
+            if self.use_cross_frequency_modulation and str(i) in self.cross_frequency_blocks:
+                x = self.cross_frequency_blocks[str(i)](
+                    x,
+                    frequency_source_feature,
+                    frequency_target_feature,
+                )
 
             if self.use_residual_flow_pyramid:
                 sub_flow_limit = torch.as_tensor(self.residual_flow_limit, dtype=x.dtype, device=x.device).clamp(min=1e-3)

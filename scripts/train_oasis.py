@@ -88,7 +88,7 @@ def build_registration_model(args, device):
 
     if args.model_config == 'voxelmorph_baseline':
         ignored_flags = []
-        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv', 'use_boundary_branch', 'use_frequency_modulation', 'use_sdmr'):
+        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv', 'use_boundary_branch', 'use_cross_frequency_modulation', 'use_sdmr'):
             if getattr(args, flag):
                 ignored_flags.append(f'--{flag.replace("_", "-")}')
         if ignored_flags:
@@ -141,9 +141,10 @@ def build_registration_model(args, device):
             boundary_branch_strength=getattr(args, 'boundary_branch_strength', 0.5),
             boundary_kernel=getattr(args, 'boundary_kernel', 'sobel'),
             boundary_smooth_kernel=getattr(args, 'boundary_smooth_kernel', 3),
-            use_frequency_modulation=getattr(args, 'use_frequency_modulation', False),
-            frequency_modulation_scales=getattr(args, 'frequency_modulation_scales', '1/8,1/4'),
+            use_cross_frequency_modulation=getattr(args, 'use_cross_frequency_modulation', False),
+            cross_frequency_scales=getattr(args, 'cross_frequency_scales', '1/8,1/4'),
             frequency_low_ratio=getattr(args, 'frequency_low_ratio', 0.25),
+            cross_frequency_structure_calibration=getattr(args, 'cross_frequency_structure_calibration', False),
             use_sdmr=getattr(args, 'use_sdmr', False),
             sdmr_use_mind=getattr(args, 'sdmr_use_mind', False),
             sdmr_scale=getattr(args, 'sdmr_scale', 0.125),
@@ -1163,9 +1164,10 @@ def main():
     parser.add_argument('--boundary-smooth-kernel', type=int, default=3, help='Odd smoothing kernel size applied before boundary extraction')
     parser.add_argument('--boundary-ring-inner-kernel', type=int, default=3, help='Inner erosion kernel size for the foreground boundary ring mask')
     parser.add_argument('--boundary-ring-outer-kernel', type=int, default=7, help='Outer dilation kernel size for the foreground boundary ring mask')
-    parser.add_argument('--use-frequency-modulation', action='store_true', help='Enable spatial-frequency position modulation in decoder features')
-    parser.add_argument('--frequency-modulation-scales', type=str, default='1/8,1/4', help='Comma-separated decoder scales for frequency modulation')
+    parser.add_argument('--use-cross-frequency-modulation', '--use-frequency-modulation', dest='use_cross_frequency_modulation', action='store_true', help='Enable cross-image frequency consistency modulation in decoder features')
+    parser.add_argument('--cross-frequency-scales', '--frequency-modulation-scales', dest='cross_frequency_scales', type=str, default='1/8,1/4', help='Comma-separated decoder scales for cross-image frequency consistency modulation')
     parser.add_argument('--frequency-low-ratio', type=float, default=0.25, help='Radial cutoff ratio for low-frequency feature components')
+    parser.add_argument('--cross-frequency-structure-calibration', action='store_true', help='Use label-free source/target feature-gradient consistency to calibrate cross-frequency gates')
     parser.add_argument('--use-sdmr', action='store_true', help='Enable Structure-error-guided Diffeomorphic Mamba Refinement on the predicted velocity field')
     parser.add_argument('--sdmr-use-mind', action='store_true', help='Include low-resolution MIND residual maps in SDMR inputs')
     parser.add_argument('--sdmr-scale', type=float, default=0.125, help='Low-resolution scale used by SDMR refiner, e.g. 0.125 or 0.25')
@@ -1217,7 +1219,7 @@ def main():
         parser.error('--feature-edge-start-epoch must be a positive integer.')
     if args.start_epoch < 1 or args.start_epoch > args.epochs:
         parser.error('--start-epoch must be between 1 and --epochs.')
-    if args.use_frequency_modulation and not (0 < args.frequency_low_ratio < 1):
+    if args.use_cross_frequency_modulation and not (0 < args.frequency_low_ratio < 1):
         parser.error('--frequency-low-ratio must be in (0, 1).')
     if args.use_sdmr and not (0 < args.sdmr_scale <= 1.0):
         parser.error('--sdmr-scale must be in (0, 1].')
@@ -1354,9 +1356,10 @@ def main():
         f.write(f"Feature Edge Loss Weight: {base_feature_edge_loss_weight}\n")
         f.write(f"Feature Edge Start Epoch: {args.feature_edge_start_epoch}\n")
         f.write(f"Feature Edge Scales: {args.feature_edge_scales}\n")
-        f.write(f"Use Frequency Modulation: {args.use_frequency_modulation}\n")
-        f.write(f"Frequency Modulation Scales: {args.frequency_modulation_scales}\n")
+        f.write(f"Use Cross Frequency Modulation: {args.use_cross_frequency_modulation}\n")
+        f.write(f"Cross Frequency Scales: {args.cross_frequency_scales}\n")
         f.write(f"Frequency Low Ratio: {args.frequency_low_ratio}\n")
+        f.write(f"Cross Frequency Structure Calibration: {args.cross_frequency_structure_calibration}\n")
         f.write(f"Use Residual Flow Pyramid: {args.use_residual_flow_pyramid}\n")
         f.write(f"Use Error-Guided Residual: {args.use_error_guided_residual}\n")
         f.write(f"Residual Flow Limit: {args.residual_flow_limit}\n")
