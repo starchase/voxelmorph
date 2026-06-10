@@ -2075,10 +2075,13 @@ def main():
     parser.add_argument('--boundary-loss-metric', type=str, default='l1', choices=['ncc', 'l1'], help='Metric used by the boundary consistency loss; `l1` compares 3D Sobel gradient maps more directly and usually overlaps less with the main image NCC/MI term')
     parser.add_argument('--boundary-kernel', type=str, default='sobel', choices=['sobel', 'diff'], help='Fixed operator used to extract 3D boundary maps')
     parser.add_argument('--boundary-smooth-kernel', type=int, default=3, help='Odd smoothing kernel size applied before boundary extraction')
-    parser.add_argument('--use-cross-frequency-modulation', '--use-frequency-modulation', dest='use_cross_frequency_modulation', action='store_true', help='Enable cross-image frequency consistency modulation in decoder features')
-    parser.add_argument('--cross-frequency-scales', '--frequency-modulation-scales', dest='cross_frequency_scales', type=str, default='1/8,1/4', help='Comma-separated decoder scales for cross-image frequency consistency modulation')
-    parser.add_argument('--frequency-low-ratio', type=float, default=0.25, help='Radial cutoff ratio for low-frequency feature components')
-    parser.add_argument('--cross-frequency-structure-calibration', action='store_true', help='Use label-free source/target feature-gradient consistency to calibrate cross-frequency gates')
+    parser.add_argument('--use-cross-frequency-modulation', '--use-frequency-modulation', dest='use_cross_frequency_modulation', action='store_true', help='Enable deformation-aware local spectral correspondence guidance')
+    parser.add_argument('--cross-frequency-scales', '--frequency-modulation-scales', dest='cross_frequency_scales', type=str, default='1/8,1/4', help='Comma-separated decoder scales for local spectral correspondence guidance')
+    parser.add_argument('--frequency-low-ratio', type=float, default=0.25, help='Legacy compatibility argument; unused by local spectral correspondence')
+    parser.add_argument('--cross-frequency-structure-calibration', action='store_true', help='Legacy compatibility flag; local spectral correspondence is structure-aware by design')
+    parser.add_argument('--spectral-window-size', type=int, default=4, help='Local 3D window size for phase-correlation displacement responses')
+    parser.add_argument('--spectral-temperature', type=float, default=0.1, help='Softmax temperature for local spectral displacement responses')
+    parser.add_argument('--spectral-guidance-strength', type=float, default=0.5, help='Residual strength of local spectral correspondence guidance')
     parser.add_argument('--use-sdmr', action='store_true', help='Enable Structure-error-guided Diffeomorphic Mamba Refinement on the predicted velocity field')
     parser.add_argument('--sdmr-use-mind', action='store_true', help='Include low-resolution MIND residual maps in SDMR inputs; recommended for CT-MR')
     parser.add_argument('--sdmr-scale', type=float, default=0.125, help='Low-resolution scale used by SDMR refiner, e.g. 0.125 or 0.25')
@@ -2103,6 +2106,12 @@ def main():
         parser.error('--start-epoch must be between 1 and --epochs.')
     if args.use_cross_frequency_modulation and not (0 < args.frequency_low_ratio < 1):
         parser.error('--frequency-low-ratio must be in (0, 1).')
+    if args.use_cross_frequency_modulation and args.spectral_window_size < 2:
+        parser.error('--spectral-window-size must be at least 2.')
+    if args.use_cross_frequency_modulation and args.spectral_temperature <= 0:
+        parser.error('--spectral-temperature must be positive.')
+    if args.use_cross_frequency_modulation and args.spectral_guidance_strength < 0:
+        parser.error('--spectral-guidance-strength must be non-negative.')
     if args.use_sdmr and not (0 < args.sdmr_scale <= 1.0):
         parser.error('--sdmr-scale must be in (0, 1].')
     if args.use_sdmr and args.sdmr_hidden_channels < 1:
@@ -2185,6 +2194,9 @@ def main():
             cross_frequency_scales=args.cross_frequency_scales,
             frequency_low_ratio=args.frequency_low_ratio,
             cross_frequency_structure_calibration=args.cross_frequency_structure_calibration,
+            spectral_window_size=args.spectral_window_size,
+            spectral_temperature=args.spectral_temperature,
+            spectral_guidance_strength=args.spectral_guidance_strength,
             use_sdmr=args.use_sdmr,
             sdmr_use_mind=args.sdmr_use_mind,
             sdmr_scale=args.sdmr_scale,
@@ -2366,6 +2378,9 @@ def main():
         f.write(f"Cross Frequency Scales: {args.cross_frequency_scales}\n")
         f.write(f"Frequency Low Ratio: {args.frequency_low_ratio}\n")
         f.write(f"Cross Frequency Structure Calibration: {args.cross_frequency_structure_calibration}\n")
+        f.write(f"Spectral Window Size: {args.spectral_window_size}\n")
+        f.write(f"Spectral Temperature: {args.spectral_temperature}\n")
+        f.write(f"Spectral Guidance Strength: {args.spectral_guidance_strength}\n")
         f.write(f"Cross-Mamba Offset Limit: {args.cross_mamba_offset_limit}\n")
         f.write(f"Cross-Mamba Offset Smooth Kernel: {args.cross_mamba_offset_smooth_kernel}\n")
         f.write(f"Use SDMR: {args.use_sdmr}\n")
