@@ -109,7 +109,7 @@ class UncertaintyAwareSelfSimilarityCorrespondence3D(nn.Module):
         return padded[..., d0:d0 + depth, h0:h0 + height, w0:w0 + width]
 
     def _self_similarity(self, feature):
-        feature = self.shared_projection(feature.float())
+        feature = self.shared_projection(feature.float()).float()
         offsets = ((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))
         descriptors = [
             (feature * self._shift(feature, offset)).mean(dim=1, keepdim=True)
@@ -146,11 +146,16 @@ class UncertaintyAwareSelfSimilarityCorrespondence3D(nn.Module):
 
     def forward(self, x, source_feature, target_feature):
         input_dtype = x.dtype
-        guidance = self._correspondence_guidance(source_feature, target_feature)
-        if guidance.shape[-3:] != x.shape[-3:]:
-            guidance = F.interpolate(guidance, size=x.shape[-3:], mode='trilinear', align_corners=False)
-        update = self.guidance(guidance)
-        gate = torch.sigmoid(self.decoder_gate(x.float()))
+        # CUDA replication_pad3d and the correspondence softmax are not robust
+        # in BF16/FP16. Keep USSC matching in FP32 under the surrounding AMP
+        # context, then cast the residual back to the decoder dtype.
+        device_type = source_feature.device.type
+        with torch.autocast(device_type=device_type, enabled=False):
+            guidance = self._correspondence_guidance(source_feature.float(), target_feature.float())
+            if guidance.shape[-3:] != x.shape[-3:]:
+                guidance = F.interpolate(guidance, size=x.shape[-3:], mode='trilinear', align_corners=False)
+            update = self.guidance(guidance.float())
+            gate = torch.sigmoid(self.decoder_gate(x.float()))
         return (x.float() + self.guidance_strength * gate * update).to(dtype=input_dtype)
 
 
