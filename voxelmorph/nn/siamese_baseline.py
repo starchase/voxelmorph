@@ -690,7 +690,8 @@ class SiameseUNetBaseline(nn.Module):
                  use_ussc=False, ussc_scales='1/8', ussc_search_radius=2, ussc_temperature=0.1, ussc_guidance_strength=0.5,
                  use_dasr=False, dasr_scales='1/2', dasr_reduction=4, dasr_strength=0.2,
                  use_drfc=False, drfc_scale=0.25, drfc_hidden_channels=16, drfc_strength=0.5,
-                 use_sdmr=False, sdmr_use_mind=True, sdmr_scale=0.125, sdmr_hidden_channels=16, sdmr_flow_limit=1.0, sdmr_alpha=0.5):
+                 use_sdmr=False, sdmr_use_mind=True, sdmr_scale=0.125, sdmr_hidden_channels=16, sdmr_flow_limit=1.0, sdmr_alpha=0.5,
+                 use_dpfc=False, dpfc_flow_limit=8.0):
         super().__init__()
         self.inshape = inshape
         self.ndim = ndim
@@ -699,6 +700,8 @@ class SiameseUNetBaseline(nn.Module):
         self.fusion_method = fusion_method
         self.use_pdaps = use_pdaps
         self.use_residual_flow_pyramid = use_residual_flow_pyramid
+        self.use_dpfc = bool(use_dpfc)
+        self.dpfc_flow_limit = float(dpfc_flow_limit)
         self.use_error_guided_residual = use_error_guided_residual
         self.error_guided_metric = error_guided_metric
         self.use_sdmr = use_sdmr
@@ -744,6 +747,12 @@ class SiameseUNetBaseline(nn.Module):
 
         if self.use_pdaps and self.use_residual_flow_pyramid:
             raise ValueError('use_pdaps and use_residual_flow_pyramid cannot be enabled at the same time')
+        if self.use_dpfc and (self.use_pdaps or self.use_residual_flow_pyramid):
+            raise ValueError('use_dpfc is mutually exclusive with use_pdaps and use_residual_flow_pyramid')
+        if self.use_dpfc and self.int_steps <= 0:
+            raise ValueError('use_dpfc requires int_steps > 0 for per-scale diffeomorphic integration')
+        if self.use_dpfc and self.dpfc_flow_limit <= 0:
+            raise ValueError('dpfc_flow_limit must be positive')
         if self.use_error_guided_residual and not self.use_residual_flow_pyramid:
             raise ValueError('use_error_guided_residual requires use_residual_flow_pyramid to be enabled')
         
@@ -927,6 +936,23 @@ class SiameseUNetBaseline(nn.Module):
                 flow_head.weight.data.normal_(0, 1e-6)
                 flow_head.bias.data.zero_()
                 self.residual_flow_heads.append(flow_head)
+
+        if self.use_dpfc:
+            self.dpfc_velocity_heads = nn.ModuleList()
+            for nf in dec_nf:
+                velocity_head = Conv(nf, ndim, kernel_size=3, padding=1)
+                velocity_head.weight.data.normal_(0, 1e-6)
+                velocity_head.bias.data.zero_()
+                self.dpfc_velocity_heads.append(velocity_head)
+            full_resolution_limits = [
+                self.dpfc_flow_limit / (2 ** i)
+                for i in range(len(dec_nf))
+            ]
+            self.register_buffer(
+                'dpfc_full_resolution_limits',
+                torch.tensor(full_resolution_limits, dtype=torch.float32),
+                persistent=True,
+            )
 
         self.error_guided_residual_gates = nn.ModuleDict()
         self.error_guided_residual_stage_indices = set()
@@ -1219,6 +1245,7 @@ class SiameseUNetBaseline(nn.Module):
         residual_flows = []
         pyramid_acc_flow = None
         residual_acc_flow = None
+        dpfc_displacement = None
         self.latest_error_guided_residual_maps = []
         
         # 2. Decoding (Standard U-Net Upsampling)
@@ -1382,6 +1409,32 @@ class SiameseUNetBaseline(nn.Module):
                     else:
                         coarse_flows.append(residual_acc_flow)
 
+            if self.use_dpfc:
+                full_limit = self.dpfc_full_resolution_limits[i].to(dtype=x.dtype, device=x.device)
+                scale = x.new_tensor([
+                    x.shape[2 + axis] / self.inshape[axis]
+                    for axis in range(self.ndim)
+                ]).view(1, self.ndim, *([1] * self.ndim))
+                local_limit = (full_limit * scale).clamp(min=1e-3)
+                raw_local_velocity = self.dpfc_velocity_heads[i](x)
+                local_velocity = local_limit * torch.tanh(raw_local_velocity / local_limit)
+                residual_flows.append(local_velocity)
+                local_displacement = self.integrate(local_velocity)
+
+                if dpfc_displacement is None:
+                    dpfc_displacement = local_displacement
+                else:
+                    coarse_displacement = self._resize_displacement_to_feature(dpfc_displacement, x)
+                    # Apply the accumulated coarse transform first, then the
+                    # current local transform using exact displacement composition.
+                    dpfc_displacement = local_displacement + self.spatial_transform(
+                        coarse_displacement,
+                        local_displacement,
+                    )
+
+                if return_coarse_flows and i < len(self.dec_blocks) - 1:
+                    coarse_flows.append(dpfc_displacement)
+
             # --- [P-DAPS Coarse-to-fine Flow generation & Deep Supervision] ---
             if getattr(self, 'use_pdaps', False):
                 sub_flow_limit = torch.clamp(self.pdaps_flow_limits[i], min=1e-3).to(dtype=x.dtype)
@@ -1406,18 +1459,24 @@ class SiameseUNetBaseline(nn.Module):
             velocity = pyramid_acc_flow
         elif self.use_residual_flow_pyramid:
             velocity = residual_acc_flow
+        elif self.use_dpfc:
+            displacement = dpfc_displacement
+            # A composition of independently integrated velocities has no
+            # single stationary-velocity equivalent.
+            velocity = displacement
         else:
             velocity = 20.0 * torch.tanh(self.flow_conv(x) / 20.0)
 
-        if self.use_drfc:
+        if self.use_drfc and not self.use_dpfc:
             velocity = self._compute_drfc_velocity(velocity)
         
-        if self.integrate is not None:
-            displacement = self.integrate(velocity)
-        else:
-            displacement = velocity
+        if not self.use_dpfc:
+            if self.integrate is not None:
+                displacement = self.integrate(velocity)
+            else:
+                displacement = velocity
 
-        if self.use_sdmr:
+        if self.use_sdmr and not self.use_dpfc:
             delta_velocity = self._compute_sdmr_delta_velocity(source, target, velocity, displacement)
             velocity = velocity + self.sdmr_alpha * delta_velocity
             if self.integrate is not None:

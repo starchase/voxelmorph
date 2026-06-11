@@ -88,7 +88,7 @@ def build_registration_model(args, device):
 
     if args.model_config == 'voxelmorph_baseline':
         ignored_flags = []
-        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv', 'use_boundary_branch', 'use_ussc', 'use_dasr', 'use_drfc', 'use_sdmr'):
+        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv', 'use_boundary_branch', 'use_ussc', 'use_dasr', 'use_drfc', 'use_sdmr', 'use_dpfc'):
             if getattr(args, flag):
                 ignored_flags.append(f'--{flag.replace("_", "-")}')
         if ignored_flags:
@@ -134,6 +134,8 @@ def build_registration_model(args, device):
             window_size=getattr(args, 'window_size', 9),
             pdaps_flow_limit=getattr(args, 'pdaps_flow_limit', 20.0),
             use_residual_flow_pyramid=getattr(args, 'use_residual_flow_pyramid', False),
+            use_dpfc=getattr(args, 'use_dpfc', False),
+            dpfc_flow_limit=getattr(args, 'dpfc_flow_limit', 8.0),
             use_error_guided_residual=getattr(args, 'use_error_guided_residual', False),
             residual_flow_limit=getattr(args, 'residual_flow_limit', 4.0),
             use_boundary_branch=getattr(args, 'use_boundary_branch', False),
@@ -620,7 +622,8 @@ def validate(
             # Get the displacement fields
             use_feature_edge_loss = feature_edge_loss_weight > 0 and hasattr(model, '_feature_edge_loss')
             use_residual_flow_pyramid = getattr(model, 'use_residual_flow_pyramid', False)
-            supports_coarse_flows = getattr(model, 'use_pdaps', False) or use_residual_flow_pyramid
+            use_dpfc = getattr(model, 'use_dpfc', False)
+            supports_coarse_flows = getattr(model, 'use_pdaps', False) or use_residual_flow_pyramid or use_dpfc
             request_pyramid_outputs = supports_coarse_flows and (pyramid_weight > 0 or pyramid_image_weight > 0 or residual_flow_reg_weight > 0)
             out = model(
                 x,
@@ -628,14 +631,14 @@ def validate(
                 return_warped_source=True,
                 return_field_type='displacement',
                 return_coarse_flows=request_pyramid_outputs,
-                return_residual_flows=use_residual_flow_pyramid and request_pyramid_outputs,
+                return_residual_flows=(use_residual_flow_pyramid or use_dpfc) and request_pyramid_outputs,
                 return_feature_edge_loss=use_feature_edge_loss,
                 feature_edge_indices=feature_edge_indices,
             )
             displacement, warped_source, coarse_flows, residual_flows, feature_edge_loss = unpack_model_outputs(
                 out,
                 expect_coarse_flows=request_pyramid_outputs,
-                expect_residual_flows=use_residual_flow_pyramid and request_pyramid_outputs,
+                expect_residual_flows=(use_residual_flow_pyramid or use_dpfc) and request_pyramid_outputs,
                 expect_feature_edge_loss=use_feature_edge_loss,
             )
 
@@ -912,7 +915,7 @@ def compute_oasis_pyramid_losses(
                     x_down = source_float
                     mask_down = fg_mask if use_mask else None
 
-                if hasattr(model, 'integrate') and model.integrate is not None:
+                if not getattr(model, 'use_dpfc', False) and hasattr(model, 'integrate') and model.integrate is not None:
                     c_disp = model.integrate(c_flow_float)
                 else:
                     c_disp = c_flow_float
@@ -998,6 +1001,7 @@ def train_epoch(
         with torch.autocast('cuda', enabled=amp_enabled, dtype=torch.bfloat16):
             use_feature_edge_loss = feature_edge_loss_weight > 0 and hasattr(model, '_feature_edge_loss')
             use_residual_flow_pyramid = getattr(model, 'use_residual_flow_pyramid', False)
+            use_dpfc = getattr(model, 'use_dpfc', False)
             # Get the displacement and the warped source image from the model
             out = model(
                 x,
@@ -1005,14 +1009,14 @@ def train_epoch(
                 return_warped_source=True,
                 return_field_type='displacement',
                 return_coarse_flows=True,
-                return_residual_flows=use_residual_flow_pyramid,
+                return_residual_flows=use_residual_flow_pyramid or use_dpfc,
                 return_feature_edge_loss=use_feature_edge_loss,
                 feature_edge_indices=feature_edge_indices,
             )
             displacement, warped_source, coarse_flows, residual_flows, feature_edge_loss = unpack_model_outputs(
                 out,
                 expect_coarse_flows=True,
-                expect_residual_flows=use_residual_flow_pyramid,
+                expect_residual_flows=use_residual_flow_pyramid or use_dpfc,
                 expect_feature_edge_loss=use_feature_edge_loss,
             )
 
@@ -1143,6 +1147,8 @@ def main():
     parser.add_argument('--lambda', type=float, dest='lambda_param', default=0.01, help='Weight of gradient loss')
     parser.add_argument('--pyramid-weight', type=float, default=0.5, help='Weight for intermediate pyramid flow-smoothness deep supervision loss')
     parser.add_argument('--use-residual-flow-pyramid', action='store_true', help='Use lightweight coarse-to-fine residual flow accumulation without warping skip features')
+    parser.add_argument('--use-dpfc', action='store_true', help='Use diffeomorphic progressive flow composition across decoder scales')
+    parser.add_argument('--dpfc-flow-limit', type=float, default=8.0, help='Maximum full-resolution correction budget at the coarsest DPFC stage')
     parser.add_argument('--use-error-guided-residual', action='store_true', help='Enhance residual flow pyramid with Structure-aware & Error-guided side branch')
     parser.add_argument("--error-guided-metric", type=str, default="feature_ncc", choices=["feature_ncc", "mind"], help="Metric to compute error maps for guidance")
     parser.add_argument('--residual-flow-limit', type=float, default=4.0, help='Per-stage magnitude cap for residual flow heads when residual flow pyramid is enabled')
@@ -1229,6 +1235,12 @@ def main():
         parser.error('--use-cmim and --use-cross-mamba are mutually exclusive interaction modules.')
     if args.use_error_guided_residual and not args.use_residual_flow_pyramid:
         parser.error('--use-error-guided-residual requires --use-residual-flow-pyramid.')
+    if args.use_dpfc and (args.use_pdaps or args.use_residual_flow_pyramid):
+        parser.error('--use-dpfc is mutually exclusive with --use-pdaps and --use-residual-flow-pyramid.')
+    if args.use_dpfc and args.integration_steps <= 0:
+        parser.error('--use-dpfc requires --integration-steps greater than zero.')
+    if args.use_dpfc and args.dpfc_flow_limit <= 0:
+        parser.error('--dpfc-flow-limit must be positive.')
     if args.boundary_ring_inner_kernel < 1 or args.boundary_ring_outer_kernel < 1:
         parser.error('--boundary-ring-inner-kernel and --boundary-ring-outer-kernel must be positive integers.')
     if args.boundary_ring_outer_kernel < args.boundary_ring_inner_kernel:
@@ -1403,6 +1415,8 @@ def main():
         f.write(f"DRFC Hidden Channels: {args.drfc_hidden_channels}\n")
         f.write(f"DRFC Strength: {args.drfc_strength}\n")
         f.write(f"Use Residual Flow Pyramid: {args.use_residual_flow_pyramid}\n")
+        f.write(f"Use DPFC: {args.use_dpfc}\n")
+        f.write(f"DPFC Flow Limit: {args.dpfc_flow_limit}\n")
         f.write(f"Use Error-Guided Residual: {args.use_error_guided_residual}\n")
         f.write(f"Residual Flow Limit: {args.residual_flow_limit}\n")
         f.write(f"Residual Flow Reg Weight: {args.residual_flow_reg_weight}\n")

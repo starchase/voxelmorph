@@ -1278,20 +1278,21 @@ def train_epoch(
         with amp_autocast(device, dtype=amp_dtype, enabled=amp_enabled):
             use_feature_edge_loss = feature_edge_loss_weight > 0 and hasattr(model, '_feature_edge_loss')
             use_residual_flow_pyramid = getattr(model, 'use_residual_flow_pyramid', False)
+            use_dpfc = getattr(model, 'use_dpfc', False)
             out = model(
                 source,
                 target,
                 return_warped_source=True,
                 return_field_type='displacement',
                 return_coarse_flows=True,
-                return_residual_flows=use_residual_flow_pyramid,
+                return_residual_flows=use_residual_flow_pyramid or use_dpfc,
                 return_feature_edge_loss=use_feature_edge_loss,
                 feature_edge_indices=feature_edge_indices,
             )
             displacement, warped_source, coarse_flows, residual_flows, feature_edge_loss = unpack_model_outputs(
                 out,
                 expect_coarse_flows=True,
-                expect_residual_flows=use_residual_flow_pyramid,
+                expect_residual_flows=use_residual_flow_pyramid or use_dpfc,
                 expect_feature_edge_loss=use_feature_edge_loss,
             )
 
@@ -1514,21 +1515,22 @@ def validate(
             
             use_feature_edge_loss = feature_edge_loss_weight > 0 and hasattr(model, '_feature_edge_loss')
             use_residual_flow_pyramid = getattr(model, 'use_residual_flow_pyramid', False)
-            request_pyramid_outputs = use_residual_flow_pyramid and (pyramid_weight > 0 or pyramid_image_weight > 0 or residual_flow_reg_weight > 0)
+            use_dpfc = getattr(model, 'use_dpfc', False)
+            request_pyramid_outputs = (use_residual_flow_pyramid or use_dpfc) and (pyramid_weight > 0 or pyramid_image_weight > 0 or residual_flow_reg_weight > 0)
             out = model(
                 source,
                 target,
                 return_warped_source=True,
                 return_field_type='displacement',
                 return_coarse_flows=request_pyramid_outputs,
-                return_residual_flows=use_residual_flow_pyramid and request_pyramid_outputs,
+                return_residual_flows=(use_residual_flow_pyramid or use_dpfc) and request_pyramid_outputs,
                 return_feature_edge_loss=use_feature_edge_loss,
                 feature_edge_indices=feature_edge_indices,
             )
             displacement, warped_source, coarse_flows, residual_flows, feature_edge_loss = unpack_model_outputs(
                 out,
                 expect_coarse_flows=request_pyramid_outputs,
-                expect_residual_flows=use_residual_flow_pyramid and request_pyramid_outputs,
+                expect_residual_flows=(use_residual_flow_pyramid or use_dpfc) and request_pyramid_outputs,
                 expect_feature_edge_loss=use_feature_edge_loss,
             )
             
@@ -1738,21 +1740,22 @@ def test_evaluate(
             if device == 'cuda': torch.cuda.synchronize()
             use_feature_edge_loss = feature_edge_loss_weight > 0 and hasattr(model, '_feature_edge_loss')
             use_residual_flow_pyramid = getattr(model, 'use_residual_flow_pyramid', False)
-            request_pyramid_outputs = use_residual_flow_pyramid and (pyramid_weight > 0 or pyramid_image_weight > 0 or residual_flow_reg_weight > 0)
+            use_dpfc = getattr(model, 'use_dpfc', False)
+            request_pyramid_outputs = (use_residual_flow_pyramid or use_dpfc) and (pyramid_weight > 0 or pyramid_image_weight > 0 or residual_flow_reg_weight > 0)
             out = model(
                 source,
                 target,
                 return_warped_source=True,
                 return_field_type='displacement',
                 return_coarse_flows=request_pyramid_outputs,
-                return_residual_flows=use_residual_flow_pyramid and request_pyramid_outputs,
+                return_residual_flows=(use_residual_flow_pyramid or use_dpfc) and request_pyramid_outputs,
                 return_feature_edge_loss=use_feature_edge_loss,
                 feature_edge_indices=feature_edge_indices,
             )
             displacement, warped_source, coarse_flows, residual_flows, feature_edge_loss = unpack_model_outputs(
                 out,
                 expect_coarse_flows=request_pyramid_outputs,
-                expect_residual_flows=use_residual_flow_pyramid and request_pyramid_outputs,
+                expect_residual_flows=(use_residual_flow_pyramid or use_dpfc) and request_pyramid_outputs,
                 expect_feature_edge_loss=use_feature_edge_loss,
             )
             if device == 'cuda': torch.cuda.synchronize()
@@ -2036,6 +2039,8 @@ def main():
     parser.add_argument('--integration-steps', type=int, default=0, help='number of integration steps for diffeomorphic registration')
     parser.add_argument('--pyramid-weight', type=float, default=0.5, help='Weight for intermediate pyramid deep supervision loss')
     parser.add_argument('--use-residual-flow-pyramid', action='store_true', help='Use lightweight coarse-to-fine residual flow accumulation without warping skip features')
+    parser.add_argument('--use-dpfc', action='store_true', help='Use diffeomorphic progressive flow composition across decoder scales')
+    parser.add_argument('--dpfc-flow-limit', type=float, default=8.0, help='Maximum full-resolution correction budget at the coarsest DPFC stage')
     parser.add_argument('--use-error-guided-residual', action='store_true', help='Enhance residual flow pyramid with Structure-aware & Error-guided side branch')
     parser.add_argument("--error-guided-metric", type=str, default="feature_ncc", choices=["feature_ncc", "mind"], help="Metric to compute error maps for guidance")
     parser.add_argument('--residual-flow-limit', type=float, default=4.0, help='Per-stage magnitude cap for residual flow heads when residual flow pyramid is enabled')
@@ -2108,6 +2113,12 @@ def main():
         parser.error('--use-cmim and --use-cross-mamba are mutually exclusive interaction modules.')
     if args.use_error_guided_residual and not args.use_residual_flow_pyramid:
         parser.error('--use-error-guided-residual requires --use-residual-flow-pyramid.')
+    if args.use_dpfc and (args.use_pdaps or args.use_residual_flow_pyramid):
+        parser.error('--use-dpfc is mutually exclusive with --use-pdaps and --use-residual-flow-pyramid.')
+    if args.use_dpfc and args.integration_steps <= 0:
+        parser.error('--use-dpfc requires --integration-steps greater than zero.')
+    if args.use_dpfc and args.dpfc_flow_limit <= 0:
+        parser.error('--dpfc-flow-limit must be positive.')
     if args.start_epoch < 1 or args.start_epoch > args.epochs:
         parser.error('--start-epoch must be between 1 and --epochs.')
     if args.use_ussc and args.ussc_search_radius < 1:
@@ -2196,6 +2207,8 @@ def main():
             window_size=args.window_size,
             pdaps_flow_limit=args.pdaps_flow_limit,
             use_residual_flow_pyramid=args.use_residual_flow_pyramid,
+            use_dpfc=args.use_dpfc,
+            dpfc_flow_limit=args.dpfc_flow_limit,
                 use_error_guided_residual=args.use_error_guided_residual,
                 error_guided_metric=args.error_guided_metric,
             residual_flow_limit=args.residual_flow_limit,
@@ -2386,6 +2399,8 @@ def main():
         f.write(f"Lambda: {args.lambda_param}\n")
         f.write(f"Bend Weight: {args.bend_weight}\n")
         f.write(f"Use Residual Flow Pyramid: {args.use_residual_flow_pyramid}\n")
+        f.write(f"Use DPFC: {args.use_dpfc}\n")
+        f.write(f"DPFC Flow Limit: {args.dpfc_flow_limit}\n")
         f.write(f"Use Error-Guided Residual: {args.use_error_guided_residual}\n")
         f.write(f"Residual Flow Limit: {args.residual_flow_limit}\n")
         f.write(f"Pyramid Image Weight: {args.pyramid_image_weight}\n")
