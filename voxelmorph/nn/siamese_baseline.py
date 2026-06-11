@@ -938,11 +938,14 @@ class SiameseUNetBaseline(nn.Module):
                 self.residual_flow_heads.append(flow_head)
 
         if self.use_dpfc:
+            self.dpfc_residual_blocks = nn.ModuleList()
             self.dpfc_velocity_heads = nn.ModuleList()
             for nf in dec_nf:
+                residual_block = ConvBlock(ndim, nf + ndim + 2, nf, stride=1)
                 velocity_head = Conv(nf, ndim, kernel_size=3, padding=1)
                 velocity_head.weight.data.normal_(0, 1e-6)
                 velocity_head.bias.data.zero_()
+                self.dpfc_residual_blocks.append(residual_block)
                 self.dpfc_velocity_heads.append(velocity_head)
             full_resolution_limits = [
                 self.dpfc_flow_limit / (2 ** i)
@@ -1028,13 +1031,23 @@ class SiameseUNetBaseline(nn.Module):
         feature_shape = feature.shape[2:]
         displacement_shape = displacement.shape[2:]
         if displacement_shape != feature_shape:
-            displacement = F.interpolate(displacement, size=feature_shape, mode=mode, align_corners=False)
+            displacement = F.interpolate(displacement, size=feature_shape, mode=mode, align_corners=True)
             scale = displacement.new_tensor([
-                feature_shape[axis] / displacement_shape[axis]
+                (feature_shape[axis] - 1) / max(displacement_shape[axis] - 1, 1)
                 for axis in range(self.ndim)
             ]).view(1, self.ndim, *([1] * self.ndim))
             displacement = displacement * scale
         return displacement
+
+    @staticmethod
+    def _dpfc_structure_residual(source_feature, target_feature):
+        source_float = source_feature.float()
+        target_float = target_feature.float()
+        source_norm = F.normalize(source_float, dim=1, eps=1e-6)
+        target_norm = F.normalize(target_float, dim=1, eps=1e-6)
+        absolute_residual = (source_norm - target_norm).abs().mean(dim=1, keepdim=True)
+        cosine_residual = 1.0 - (source_norm * target_norm).sum(dim=1, keepdim=True)
+        return torch.cat([absolute_residual, cosine_residual], dim=1).to(source_feature.dtype)
 
     def _resize_flow(self, flow, target_shape):
         mode = 'trilinear' if self.ndim == 3 else 'bilinear'
@@ -1416,7 +1429,30 @@ class SiameseUNetBaseline(nn.Module):
                     for axis in range(self.ndim)
                 ]).view(1, self.ndim, *([1] * self.ndim))
                 local_limit = (full_limit * scale).clamp(min=1e-3)
-                raw_local_velocity = self.dpfc_velocity_heads[i](x)
+                if dpfc_displacement is None:
+                    coarse_displacement = x.new_zeros(x.shape[0], self.ndim, *x.shape[2:])
+                else:
+                    coarse_displacement = self._resize_displacement_to_feature(dpfc_displacement, x)
+
+                if s_skip_raw is not None and t_skip_raw is not None:
+                    warped_source_feature = self.spatial_transform(s_skip_raw, coarse_displacement)
+                    structure_residual = self._dpfc_structure_residual(warped_source_feature, t_skip_raw)
+                else:
+                    source_scale = F.interpolate(source, size=x.shape[2:], mode=mode, align_corners=True)
+                    target_scale = F.interpolate(target, size=x.shape[2:], mode=mode, align_corners=True)
+                    warped_source_scale = self.spatial_transform(source_scale, coarse_displacement)
+                    source_gradient = F.avg_pool3d(warped_source_scale.float(), kernel_size=3, stride=1, padding=1)
+                    target_gradient = F.avg_pool3d(target_scale.float(), kernel_size=3, stride=1, padding=1)
+                    structure_residual = torch.cat([
+                        (warped_source_scale.float() - source_gradient).abs(),
+                        (target_scale.float() - target_gradient).abs(),
+                    ], dim=1).to(x.dtype)
+
+                normalized_coarse = coarse_displacement / local_limit
+                residual_feature = self.dpfc_residual_blocks[i](
+                    torch.cat([x, structure_residual, normalized_coarse], dim=1)
+                )
+                raw_local_velocity = self.dpfc_velocity_heads[i](residual_feature)
                 local_velocity = local_limit * torch.tanh(raw_local_velocity / local_limit)
                 residual_flows.append(local_velocity)
                 local_displacement = self.integrate(local_velocity)
@@ -1424,7 +1460,6 @@ class SiameseUNetBaseline(nn.Module):
                 if dpfc_displacement is None:
                     dpfc_displacement = local_displacement
                 else:
-                    coarse_displacement = self._resize_displacement_to_feature(dpfc_displacement, x)
                     # Apply the accumulated coarse transform first, then the
                     # current local transform using exact displacement composition.
                     dpfc_displacement = local_displacement + self.spatial_transform(
