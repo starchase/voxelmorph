@@ -88,7 +88,7 @@ def build_registration_model(args, device):
 
     if args.model_config == 'voxelmorph_baseline':
         ignored_flags = []
-        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv', 'use_boundary_branch', 'use_ussc', 'use_drfc', 'use_sdmr'):
+        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv', 'use_boundary_branch', 'use_ussc', 'use_dasr', 'use_drfc', 'use_sdmr'):
             if getattr(args, flag):
                 ignored_flags.append(f'--{flag.replace("_", "-")}')
         if ignored_flags:
@@ -146,6 +146,10 @@ def build_registration_model(args, device):
             ussc_search_radius=getattr(args, 'ussc_search_radius', 2),
             ussc_temperature=getattr(args, 'ussc_temperature', 0.1),
             ussc_guidance_strength=getattr(args, 'ussc_guidance_strength', 0.5),
+            use_dasr=getattr(args, 'use_dasr', False),
+            dasr_scales=getattr(args, 'dasr_scales', '1/2'),
+            dasr_reduction=getattr(args, 'dasr_reduction', 4),
+            dasr_strength=getattr(args, 'dasr_strength', 0.5),
             use_drfc=getattr(args, 'use_drfc', False),
             drfc_scale=getattr(args, 'drfc_scale', 0.25),
             drfc_hidden_channels=getattr(args, 'drfc_hidden_channels', 16),
@@ -1174,6 +1178,10 @@ def main():
     parser.add_argument('--ussc-search-radius', type=int, default=2, help='USSC local search radius; 2 produces a 5x5x5 search neighborhood')
     parser.add_argument('--ussc-temperature', '--spectral-temperature', dest='ussc_temperature', type=float, default=0.1, help='Softmax temperature for USSC local correspondence probabilities')
     parser.add_argument('--ussc-guidance-strength', '--spectral-guidance-strength', dest='ussc_guidance_strength', type=float, default=0.5, help='Residual strength of uncertainty-weighted USSC guidance')
+    parser.add_argument('--use-dasr', action='store_true', help='Enable decoder-adaptive routing of dual-stream skip features')
+    parser.add_argument('--dasr-scales', type=str, default='1/2', help='Comma-separated decoder skip scales routed by DASR; 1/2 avoids Cross-Mamba scales')
+    parser.add_argument('--dasr-reduction', type=int, default=4, help='Channel reduction ratio of DASR routing predictors')
+    parser.add_argument('--dasr-strength', type=float, default=0.5, help='Maximum residual modulation strength of DASR gates')
     parser.add_argument('--use-drfc', action='store_true', help='Enable deformation reliability field calibration before diffeomorphic integration')
     parser.add_argument('--drfc-scale', type=float, default=0.25, help='Low-resolution scale used to calibrate velocity reliability')
     parser.add_argument('--drfc-hidden-channels', type=int, default=16, help='Hidden channels of the DRFC reliability predictor')
@@ -1235,6 +1243,10 @@ def main():
         parser.error('--ussc-temperature must be positive.')
     if args.use_ussc and args.ussc_guidance_strength < 0:
         parser.error('--ussc-guidance-strength must be non-negative.')
+    if args.use_dasr and args.dasr_reduction < 1:
+        parser.error('--dasr-reduction must be positive.')
+    if args.use_dasr and args.dasr_strength < 0:
+        parser.error('--dasr-strength must be non-negative.')
     if args.use_drfc and not (0 < args.drfc_scale <= 1):
         parser.error('--drfc-scale must be in (0, 1].')
     if args.use_drfc and args.drfc_hidden_channels < 1:
@@ -1381,6 +1393,10 @@ def main():
         f.write(f"USSC Search Radius: {args.ussc_search_radius}\n")
         f.write(f"USSC Temperature: {args.ussc_temperature}\n")
         f.write(f"USSC Guidance Strength: {args.ussc_guidance_strength}\n")
+        f.write(f"Use DASR: {args.use_dasr}\n")
+        f.write(f"DASR Scales: {args.dasr_scales}\n")
+        f.write(f"DASR Reduction: {args.dasr_reduction}\n")
+        f.write(f"DASR Strength: {args.dasr_strength}\n")
         f.write(f"Use DRFC: {args.use_drfc}\n")
         f.write(f"DRFC Scale: {args.drfc_scale}\n")
         f.write(f"DRFC Hidden Channels: {args.drfc_hidden_channels}\n")

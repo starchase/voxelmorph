@@ -262,6 +262,74 @@ class DeformationReliabilityFieldCalibration3D(nn.Module):
         return calibrated.to(dtype=input_dtype)
 
 
+class DecoderAdaptiveSkipRouting3D(nn.Module):
+    """Route dual-stream skip features using the current decoder state."""
+
+    def __init__(self, decoder_channels, skip_channels, reduction=4, strength=0.5):
+        super().__init__()
+        if reduction < 1:
+            raise ValueError('DASR reduction must be positive')
+        if strength < 0:
+            raise ValueError('DASR strength must be non-negative')
+        hidden_channels = max(skip_channels // reduction, 8)
+        self.strength = float(strength)
+        self.decoder_projection = nn.Conv3d(decoder_channels, skip_channels, kernel_size=1, bias=False)
+        self.channel_router = nn.Sequential(
+            nn.Conv3d(3 * skip_channels, hidden_channels, kernel_size=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv3d(hidden_channels, 2 * skip_channels, kernel_size=1),
+        )
+        self.spatial_router = nn.Sequential(
+            nn.Conv3d(5, hidden_channels, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv3d(hidden_channels, 2, kernel_size=1),
+        )
+        self.channel_router[-1].weight.data.zero_()
+        self.channel_router[-1].bias.data.zero_()
+        self.spatial_router[-1].weight.data.zero_()
+        self.spatial_router[-1].bias.data.zero_()
+
+    @staticmethod
+    def _normalize(feature):
+        return F.instance_norm(feature.float(), eps=1e-5)
+
+    def forward(self, decoder, source_skip, target_skip):
+        input_dtype = source_skip.dtype
+        decoder = self.decoder_projection(decoder.float())
+        source = self._normalize(source_skip)
+        target = self._normalize(target_skip)
+        decoder = self._normalize(decoder)
+
+        pooled = torch.cat(
+            [
+                F.adaptive_avg_pool3d(source.abs(), 1),
+                F.adaptive_avg_pool3d(target.abs(), 1),
+                F.adaptive_avg_pool3d(decoder.abs(), 1),
+            ],
+            dim=1,
+        )
+        source_channel, target_channel = self.channel_router(pooled).chunk(2, dim=1)
+
+        spatial_descriptor = torch.cat(
+            [
+                source.abs().mean(dim=1, keepdim=True),
+                source.abs().amax(dim=1, keepdim=True),
+                target.abs().mean(dim=1, keepdim=True),
+                target.abs().amax(dim=1, keepdim=True),
+                decoder.abs().mean(dim=1, keepdim=True),
+            ],
+            dim=1,
+        )
+        source_spatial, target_spatial = self.spatial_router(spatial_descriptor).chunk(2, dim=1)
+
+        source_gate = 1.0 + self.strength * torch.tanh(source_channel + source_spatial)
+        target_gate = 1.0 + self.strength * torch.tanh(target_channel + target_spatial)
+        return (
+            (source_skip.float() * source_gate).to(dtype=input_dtype),
+            (target_skip.float() * target_gate).to(dtype=target_skip.dtype),
+        )
+
+
 class SharedEncoder(nn.Module):
     """
     Shared dual-stream encoder for Siamese Network.
@@ -594,6 +662,7 @@ class SiameseUNetBaseline(nn.Module):
                  use_cross_frequency_modulation=False, cross_frequency_scales='1/8,1/4', frequency_low_ratio=0.25, cross_frequency_structure_calibration=False,
                  spectral_window_size=4, spectral_temperature=0.1, spectral_guidance_strength=0.5,
                  use_ussc=False, ussc_scales='1/8', ussc_search_radius=2, ussc_temperature=0.1, ussc_guidance_strength=0.5,
+                 use_dasr=False, dasr_scales='1/2', dasr_reduction=4, dasr_strength=0.5,
                  use_drfc=False, drfc_scale=0.25, drfc_hidden_channels=16, drfc_strength=0.5,
                  use_sdmr=False, sdmr_use_mind=True, sdmr_scale=0.125, sdmr_hidden_channels=16, sdmr_flow_limit=1.0, sdmr_alpha=0.5):
         super().__init__()
@@ -626,6 +695,8 @@ class SiameseUNetBaseline(nn.Module):
         self.use_gcv = use_gcv
         self.encoder_type = encoder_type
         self.use_boundary_branch = use_boundary_branch
+        self.use_dasr = bool(use_dasr)
+        self.dasr_scales = self._parse_decoder_scales(dasr_scales)
         self.use_ussc = bool(use_ussc or use_cross_frequency_modulation)
         selected_ussc_scales = ussc_scales if use_ussc else cross_frequency_scales
         self.ussc_scales = self._parse_decoder_scales(selected_ussc_scales)
@@ -743,6 +814,7 @@ class SiameseUNetBaseline(nn.Module):
         # 2. Standard Decoder
         self.dec_blocks = nn.ModuleList()
         self.ussc_blocks = nn.ModuleDict()
+        self.dasr_blocks = nn.ModuleDict()
         self.up_blocks = nn.ModuleList()
         
         if self.use_daps:
@@ -787,6 +859,15 @@ class SiameseUNetBaseline(nn.Module):
                 self.dec_blocks.append(ConvBlock(ndim, in_ch, nf, stride=1))
 
             decoder_scale = f'1/{2 ** (len(enc_nf) - i - 1)}'
+            if self.use_dasr and skip_idx >= 0 and decoder_scale in self.dasr_scales:
+                if ndim != 3:
+                    raise ValueError('DecoderAdaptiveSkipRouting3D requires ndim=3')
+                self.dasr_blocks[str(i)] = DecoderAdaptiveSkipRouting3D(
+                    decoder_channels=prev_channels,
+                    skip_channels=enc_nf[skip_idx],
+                    reduction=dasr_reduction,
+                    strength=dasr_strength,
+                )
             if self.use_ussc and decoder_scale in self.ussc_scales:
                 if ndim != 3:
                     raise ValueError('UncertaintyAwareSelfSimilarityCorrespondence3D requires ndim=3')
@@ -1161,6 +1242,9 @@ class SiameseUNetBaseline(nn.Module):
                         s_skip = self.cross_mamba_blocks['1_4'](s_skip, t_skip)
                     elif skip_idx == len(feat_s) - 4 and '1_2' in self.cross_mamba_blocks: # 1/2 scale
                         s_skip = self.cross_mamba_blocks['1_2'](s_skip, t_skip)
+
+                if self.use_dasr and str(i) in self.dasr_blocks:
+                    s_skip, t_skip = self.dasr_blocks[str(i)](x, s_skip, t_skip)
                 
                 # --- [GCV at Deep Scales] ---
                 if getattr(self, 'use_gcv', False) and str(skip_idx) in self.gcv_blocks:
