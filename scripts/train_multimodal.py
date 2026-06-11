@@ -2080,6 +2080,10 @@ def main():
     parser.add_argument('--ussc-search-radius', type=int, default=2, help='USSC local search radius; 2 produces a 5x5x5 search neighborhood')
     parser.add_argument('--ussc-temperature', '--spectral-temperature', dest='ussc_temperature', type=float, default=0.1, help='Softmax temperature for USSC local correspondence probabilities')
     parser.add_argument('--ussc-guidance-strength', '--spectral-guidance-strength', dest='ussc_guidance_strength', type=float, default=0.5, help='Residual strength of uncertainty-weighted USSC guidance')
+    parser.add_argument('--use-drfc', action='store_true', help='Enable deformation reliability field calibration before diffeomorphic integration')
+    parser.add_argument('--drfc-scale', type=float, default=0.25, help='Low-resolution scale used to calibrate velocity reliability')
+    parser.add_argument('--drfc-hidden-channels', type=int, default=16, help='Hidden channels of the DRFC reliability predictor')
+    parser.add_argument('--drfc-strength', type=float, default=0.5, help='Maximum strength for calibrating local velocity residuals')
     parser.add_argument('--use-sdmr', action='store_true', help='Enable Structure-error-guided Diffeomorphic Mamba Refinement on the predicted velocity field')
     parser.add_argument('--sdmr-use-mind', action='store_true', help='Include low-resolution MIND residual maps in SDMR inputs; recommended for CT-MR')
     parser.add_argument('--sdmr-scale', type=float, default=0.125, help='Low-resolution scale used by SDMR refiner, e.g. 0.125 or 0.25')
@@ -2108,6 +2112,12 @@ def main():
         parser.error('--ussc-temperature must be positive.')
     if args.use_ussc and args.ussc_guidance_strength < 0:
         parser.error('--ussc-guidance-strength must be non-negative.')
+    if args.use_drfc and not (0 < args.drfc_scale <= 1):
+        parser.error('--drfc-scale must be in (0, 1].')
+    if args.use_drfc and args.drfc_hidden_channels < 1:
+        parser.error('--drfc-hidden-channels must be positive.')
+    if args.use_drfc and args.drfc_strength < 0:
+        parser.error('--drfc-strength must be non-negative.')
     if args.use_sdmr and not (0 < args.sdmr_scale <= 1.0):
         parser.error('--sdmr-scale must be in (0, 1].')
     if args.use_sdmr and args.sdmr_hidden_channels < 1:
@@ -2191,6 +2201,10 @@ def main():
             ussc_search_radius=args.ussc_search_radius,
             ussc_temperature=args.ussc_temperature,
             ussc_guidance_strength=args.ussc_guidance_strength,
+            use_drfc=args.use_drfc,
+            drfc_scale=args.drfc_scale,
+            drfc_hidden_channels=args.drfc_hidden_channels,
+            drfc_strength=args.drfc_strength,
             use_sdmr=args.use_sdmr,
             sdmr_use_mind=args.sdmr_use_mind,
             sdmr_scale=args.sdmr_scale,
@@ -2373,6 +2387,10 @@ def main():
         f.write(f"USSC Search Radius: {args.ussc_search_radius}\n")
         f.write(f"USSC Temperature: {args.ussc_temperature}\n")
         f.write(f"USSC Guidance Strength: {args.ussc_guidance_strength}\n")
+        f.write(f"Use DRFC: {args.use_drfc}\n")
+        f.write(f"DRFC Scale: {args.drfc_scale}\n")
+        f.write(f"DRFC Hidden Channels: {args.drfc_hidden_channels}\n")
+        f.write(f"DRFC Strength: {args.drfc_strength}\n")
         f.write(f"Cross-Mamba Offset Limit: {args.cross_mamba_offset_limit}\n")
         f.write(f"Cross-Mamba Offset Smooth Kernel: {args.cross_mamba_offset_smooth_kernel}\n")
         f.write(f"Use SDMR: {args.use_sdmr}\n")

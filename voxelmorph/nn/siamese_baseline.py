@@ -196,6 +196,72 @@ class StructureErrorMambaRefiner(nn.Module):
             delta = limit * torch.tanh(delta / limit)
         return delta
 
+
+class DeformationReliabilityFieldCalibration3D(nn.Module):
+    """Calibrate unreliable local velocity residuals without image matching."""
+
+    def __init__(self, ndim=3, hidden_channels=16, strength=0.5):
+        super().__init__()
+        if ndim != 3:
+            raise ValueError('DeformationReliabilityFieldCalibration3D requires ndim=3')
+        if strength < 0:
+            raise ValueError('strength must be non-negative')
+        self.strength = float(strength)
+        descriptor_channels = 2 * ndim + 4
+        self.reliability = nn.Sequential(
+            nn.Conv3d(descriptor_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.InstanceNorm3d(hidden_channels),
+            nn.LeakyReLU(0.2),
+            nn.Conv3d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.2),
+            nn.Conv3d(hidden_channels, 1, kernel_size=1),
+        )
+        self.reliability[-1].weight.data.zero_()
+        self.reliability[-1].bias.data.zero_()
+
+    @staticmethod
+    def _diff(value, dim):
+        difference = value.diff(dim=dim)
+        pad = [0, 0, 0, 0, 0, 0]
+        pad[2 * (4 - dim) + 1] = 1
+        return F.pad(difference, tuple(pad), mode='replicate')
+
+    def forward(self, velocity):
+        input_dtype = velocity.dtype
+        velocity_float = velocity.float()
+        smooth = F.avg_pool3d(velocity_float, kernel_size=3, stride=1, padding=1)
+        residual = velocity_float - smooth
+
+        du_d, du_h, du_w = [self._diff(velocity_float[:, 0:1], dim) for dim in (2, 3, 4)]
+        dv_d, dv_h, dv_w = [self._diff(velocity_float[:, 1:2], dim) for dim in (2, 3, 4)]
+        dw_d, dw_h, dw_w = [self._diff(velocity_float[:, 2:3], dim) for dim in (2, 3, 4)]
+        divergence = du_d + dv_h + dw_w
+        curl = torch.cat([dw_h - dv_w, du_w - dw_d, dv_d - du_h], dim=1)
+        strain_magnitude = torch.sqrt(
+            du_d.square() + dv_h.square() + dw_w.square()
+            + 0.5 * (du_h + dv_d).square()
+            + 0.5 * (du_w + dw_d).square()
+            + 0.5 * (dv_w + dw_h).square()
+            + 1e-6
+        )
+        curl_magnitude = torch.sqrt(curl.square().sum(dim=1, keepdim=True) + 1e-6)
+        residual_magnitude = torch.sqrt(residual.square().sum(dim=1, keepdim=True) + 1e-6)
+        descriptor = torch.cat(
+            [
+                velocity_float,
+                residual,
+                strain_magnitude,
+                divergence.abs(),
+                curl_magnitude,
+                residual_magnitude,
+            ],
+            dim=1,
+        )
+        suppression = torch.tanh(self.reliability(descriptor))
+        calibrated = velocity_float - self.strength * suppression * residual
+        return calibrated.to(dtype=input_dtype)
+
+
 class SharedEncoder(nn.Module):
     """
     Shared dual-stream encoder for Siamese Network.
@@ -528,6 +594,7 @@ class SiameseUNetBaseline(nn.Module):
                  use_cross_frequency_modulation=False, cross_frequency_scales='1/8,1/4', frequency_low_ratio=0.25, cross_frequency_structure_calibration=False,
                  spectral_window_size=4, spectral_temperature=0.1, spectral_guidance_strength=0.5,
                  use_ussc=False, ussc_scales='1/8', ussc_search_radius=2, ussc_temperature=0.1, ussc_guidance_strength=0.5,
+                 use_drfc=False, drfc_scale=0.25, drfc_hidden_channels=16, drfc_strength=0.5,
                  use_sdmr=False, sdmr_use_mind=True, sdmr_scale=0.125, sdmr_hidden_channels=16, sdmr_flow_limit=1.0, sdmr_alpha=0.5):
         super().__init__()
         self.inshape = inshape
@@ -543,6 +610,8 @@ class SiameseUNetBaseline(nn.Module):
         self.sdmr_use_mind = sdmr_use_mind
         self.sdmr_scale = float(sdmr_scale)
         self.sdmr_alpha = float(sdmr_alpha)
+        self.use_drfc = bool(use_drfc)
+        self.drfc_scale = float(drfc_scale)
         
         if (self.use_error_guided_residual and self.error_guided_metric == 'mind') or (self.use_sdmr and self.sdmr_use_mind):
             from .losses import MINDLoss
@@ -798,6 +867,14 @@ class SiameseUNetBaseline(nn.Module):
                 scan_axes=('d',),
                 flow_limit=sdmr_flow_limit,
             )
+        if self.use_drfc:
+            if not (0 < self.drfc_scale <= 1.0):
+                raise ValueError(f'drfc_scale must be in (0, 1], got {self.drfc_scale}')
+            self.drfc = DeformationReliabilityFieldCalibration3D(
+                ndim=ndim,
+                hidden_channels=drfc_hidden_channels,
+                strength=drfc_strength,
+            )
 
         # 4. Spatial Transformer
         self.spatial_transform = SpatialTransformer()
@@ -837,6 +914,16 @@ class SiameseUNetBaseline(nn.Module):
 
     def _sdmr_low_shape(self, spatial_shape):
         return tuple(max(2, int(round(dim * self.sdmr_scale))) for dim in spatial_shape)
+
+    def _compute_drfc_velocity(self, velocity):
+        full_shape = velocity.shape[2:]
+        low_shape = tuple(max(4, int(round(dim * self.drfc_scale))) for dim in full_shape)
+        velocity_low = self._resize_flow(velocity.float(), low_shape)
+        with torch.autocast(device_type=velocity.device.type, enabled=False):
+            calibrated_low = self.drfc(velocity_low.float())
+        correction_low = calibrated_low - velocity_low
+        correction_full = self._resize_flow(correction_low, full_shape)
+        return (velocity.float() + correction_full).to(dtype=velocity.dtype)
 
     def _compute_sdmr_delta_velocity(self, source, target, velocity, displacement):
         mode = 'trilinear' if self.ndim == 3 else 'bilinear'
@@ -1208,6 +1295,9 @@ class SiameseUNetBaseline(nn.Module):
             velocity = residual_acc_flow
         else:
             velocity = 20.0 * torch.tanh(self.flow_conv(x) / 20.0)
+
+        if self.use_drfc:
+            velocity = self._compute_drfc_velocity(velocity)
         
         if self.integrate is not None:
             displacement = self.integrate(velocity)

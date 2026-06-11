@@ -88,7 +88,7 @@ def build_registration_model(args, device):
 
     if args.model_config == 'voxelmorph_baseline':
         ignored_flags = []
-        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv', 'use_boundary_branch', 'use_ussc', 'use_sdmr'):
+        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv', 'use_boundary_branch', 'use_ussc', 'use_drfc', 'use_sdmr'):
             if getattr(args, flag):
                 ignored_flags.append(f'--{flag.replace("_", "-")}')
         if ignored_flags:
@@ -146,6 +146,10 @@ def build_registration_model(args, device):
             ussc_search_radius=getattr(args, 'ussc_search_radius', 2),
             ussc_temperature=getattr(args, 'ussc_temperature', 0.1),
             ussc_guidance_strength=getattr(args, 'ussc_guidance_strength', 0.5),
+            use_drfc=getattr(args, 'use_drfc', False),
+            drfc_scale=getattr(args, 'drfc_scale', 0.25),
+            drfc_hidden_channels=getattr(args, 'drfc_hidden_channels', 16),
+            drfc_strength=getattr(args, 'drfc_strength', 0.5),
             use_sdmr=getattr(args, 'use_sdmr', False),
             sdmr_use_mind=getattr(args, 'sdmr_use_mind', False),
             sdmr_scale=getattr(args, 'sdmr_scale', 0.125),
@@ -1170,6 +1174,10 @@ def main():
     parser.add_argument('--ussc-search-radius', type=int, default=2, help='USSC local search radius; 2 produces a 5x5x5 search neighborhood')
     parser.add_argument('--ussc-temperature', '--spectral-temperature', dest='ussc_temperature', type=float, default=0.1, help='Softmax temperature for USSC local correspondence probabilities')
     parser.add_argument('--ussc-guidance-strength', '--spectral-guidance-strength', dest='ussc_guidance_strength', type=float, default=0.5, help='Residual strength of uncertainty-weighted USSC guidance')
+    parser.add_argument('--use-drfc', action='store_true', help='Enable deformation reliability field calibration before diffeomorphic integration')
+    parser.add_argument('--drfc-scale', type=float, default=0.25, help='Low-resolution scale used to calibrate velocity reliability')
+    parser.add_argument('--drfc-hidden-channels', type=int, default=16, help='Hidden channels of the DRFC reliability predictor')
+    parser.add_argument('--drfc-strength', type=float, default=0.5, help='Maximum strength for calibrating local velocity residuals')
     parser.add_argument('--use-sdmr', action='store_true', help='Enable Structure-error-guided Diffeomorphic Mamba Refinement on the predicted velocity field')
     parser.add_argument('--sdmr-use-mind', action='store_true', help='Include low-resolution MIND residual maps in SDMR inputs')
     parser.add_argument('--sdmr-scale', type=float, default=0.125, help='Low-resolution scale used by SDMR refiner, e.g. 0.125 or 0.25')
@@ -1227,6 +1235,12 @@ def main():
         parser.error('--ussc-temperature must be positive.')
     if args.use_ussc and args.ussc_guidance_strength < 0:
         parser.error('--ussc-guidance-strength must be non-negative.')
+    if args.use_drfc and not (0 < args.drfc_scale <= 1):
+        parser.error('--drfc-scale must be in (0, 1].')
+    if args.use_drfc and args.drfc_hidden_channels < 1:
+        parser.error('--drfc-hidden-channels must be positive.')
+    if args.use_drfc and args.drfc_strength < 0:
+        parser.error('--drfc-strength must be non-negative.')
     if args.use_sdmr and not (0 < args.sdmr_scale <= 1.0):
         parser.error('--sdmr-scale must be in (0, 1].')
     if args.use_sdmr and args.sdmr_hidden_channels < 1:
@@ -1367,6 +1381,10 @@ def main():
         f.write(f"USSC Search Radius: {args.ussc_search_radius}\n")
         f.write(f"USSC Temperature: {args.ussc_temperature}\n")
         f.write(f"USSC Guidance Strength: {args.ussc_guidance_strength}\n")
+        f.write(f"Use DRFC: {args.use_drfc}\n")
+        f.write(f"DRFC Scale: {args.drfc_scale}\n")
+        f.write(f"DRFC Hidden Channels: {args.drfc_hidden_channels}\n")
+        f.write(f"DRFC Strength: {args.drfc_strength}\n")
         f.write(f"Use Residual Flow Pyramid: {args.use_residual_flow_pyramid}\n")
         f.write(f"Use Error-Guided Residual: {args.use_error_guided_residual}\n")
         f.write(f"Residual Flow Limit: {args.residual_flow_limit}\n")
