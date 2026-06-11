@@ -263,9 +263,9 @@ class DeformationReliabilityFieldCalibration3D(nn.Module):
 
 
 class DecoderAdaptiveSkipRouting3D(nn.Module):
-    """Route dual-stream skip features using the current decoder state."""
+    """Conservatively route dual-stream skips using modality-robust structure."""
 
-    def __init__(self, decoder_channels, skip_channels, reduction=4, strength=0.5):
+    def __init__(self, decoder_channels, skip_channels, reduction=4, strength=0.2):
         super().__init__()
         if reduction < 1:
             raise ValueError('DASR reduction must be positive')
@@ -275,9 +275,9 @@ class DecoderAdaptiveSkipRouting3D(nn.Module):
         self.strength = float(strength)
         self.decoder_projection = nn.Conv3d(decoder_channels, skip_channels, kernel_size=1, bias=False)
         self.channel_router = nn.Sequential(
-            nn.Conv3d(3 * skip_channels, hidden_channels, kernel_size=1),
+            nn.Conv3d(4, hidden_channels, kernel_size=1),
             nn.LeakyReLU(0.2),
-            nn.Conv3d(hidden_channels, 2 * skip_channels, kernel_size=1),
+            nn.Conv3d(hidden_channels, 2, kernel_size=1),
         )
         self.spatial_router = nn.Sequential(
             nn.Conv3d(5, hidden_channels, kernel_size=3, padding=1),
@@ -293,18 +293,29 @@ class DecoderAdaptiveSkipRouting3D(nn.Module):
     def _normalize(feature):
         return F.instance_norm(feature.float(), eps=1e-5)
 
-    def forward(self, decoder, source_skip, target_skip):
-        input_dtype = source_skip.dtype
+    @staticmethod
+    def _gradient_magnitude(feature):
+        gradients = []
+        for dim in (2, 3, 4):
+            difference = feature.diff(dim=dim)
+            pad = [0, 0, 0, 0, 0, 0]
+            pad[2 * (4 - dim) + 1] = 1
+            gradients.append(F.pad(difference, tuple(pad), mode='replicate'))
+        return torch.sqrt(sum(gradient.square() for gradient in gradients) + 1e-6)
+
+    def _compute_gates(self, decoder, source_skip, target_skip):
         decoder = self.decoder_projection(decoder.float())
-        source = self._normalize(source_skip)
-        target = self._normalize(target_skip)
-        decoder = self._normalize(decoder)
+        source_structure = self._gradient_magnitude(self._normalize(source_skip))
+        target_structure = self._gradient_magnitude(self._normalize(target_skip))
+        decoder_structure = self._gradient_magnitude(self._normalize(decoder))
+        structure_disagreement = torch.abs(source_structure - target_structure)
 
         pooled = torch.cat(
             [
-                F.adaptive_avg_pool3d(source.abs(), 1),
-                F.adaptive_avg_pool3d(target.abs(), 1),
-                F.adaptive_avg_pool3d(decoder.abs(), 1),
+                F.adaptive_avg_pool3d(source_structure.mean(dim=1, keepdim=True), 1),
+                F.adaptive_avg_pool3d(target_structure.mean(dim=1, keepdim=True), 1),
+                F.adaptive_avg_pool3d(decoder_structure.mean(dim=1, keepdim=True), 1),
+                F.adaptive_avg_pool3d(structure_disagreement.mean(dim=1, keepdim=True), 1),
             ],
             dim=1,
         )
@@ -312,18 +323,33 @@ class DecoderAdaptiveSkipRouting3D(nn.Module):
 
         spatial_descriptor = torch.cat(
             [
-                source.abs().mean(dim=1, keepdim=True),
-                source.abs().amax(dim=1, keepdim=True),
-                target.abs().mean(dim=1, keepdim=True),
-                target.abs().amax(dim=1, keepdim=True),
-                decoder.abs().mean(dim=1, keepdim=True),
+                source_structure.mean(dim=1, keepdim=True),
+                target_structure.mean(dim=1, keepdim=True),
+                decoder_structure.mean(dim=1, keepdim=True),
+                structure_disagreement.mean(dim=1, keepdim=True),
+                structure_disagreement.amax(dim=1, keepdim=True),
             ],
             dim=1,
         )
         source_spatial, target_spatial = self.spatial_router(spatial_descriptor).chunk(2, dim=1)
 
-        source_gate = 1.0 + self.strength * torch.tanh(source_channel + source_spatial)
-        target_gate = 1.0 + self.strength * torch.tanh(target_channel + target_spatial)
+        route_logits = torch.stack(
+            [source_channel + source_spatial, target_channel + target_spatial],
+            dim=1,
+        )
+        route_weights = 2.0 * torch.softmax(route_logits, dim=1)
+        source_gate = 1.0 + self.strength * (route_weights[:, 0] - 1.0)
+        target_gate = 1.0 + self.strength * (route_weights[:, 1] - 1.0)
+        return source_gate, target_gate
+
+    def forward(self, decoder, source_skip, target_skip):
+        input_dtype = source_skip.dtype
+        with torch.autocast(device_type=source_skip.device.type, enabled=False):
+            source_gate, target_gate = self._compute_gates(
+                decoder.float(),
+                source_skip.float(),
+                target_skip.float(),
+            )
         return (
             (source_skip.float() * source_gate).to(dtype=input_dtype),
             (target_skip.float() * target_gate).to(dtype=target_skip.dtype),
@@ -662,7 +688,7 @@ class SiameseUNetBaseline(nn.Module):
                  use_cross_frequency_modulation=False, cross_frequency_scales='1/8,1/4', frequency_low_ratio=0.25, cross_frequency_structure_calibration=False,
                  spectral_window_size=4, spectral_temperature=0.1, spectral_guidance_strength=0.5,
                  use_ussc=False, ussc_scales='1/8', ussc_search_radius=2, ussc_temperature=0.1, ussc_guidance_strength=0.5,
-                 use_dasr=False, dasr_scales='1/2', dasr_reduction=4, dasr_strength=0.5,
+                 use_dasr=False, dasr_scales='1/2', dasr_reduction=4, dasr_strength=0.2,
                  use_drfc=False, drfc_scale=0.25, drfc_hidden_channels=16, drfc_strength=0.5,
                  use_sdmr=False, sdmr_use_mind=True, sdmr_scale=0.125, sdmr_hidden_channels=16, sdmr_flow_limit=1.0, sdmr_alpha=0.5):
         super().__init__()
@@ -862,12 +888,15 @@ class SiameseUNetBaseline(nn.Module):
             if self.use_dasr and skip_idx >= 0 and decoder_scale in self.dasr_scales:
                 if ndim != 3:
                     raise ValueError('DecoderAdaptiveSkipRouting3D requires ndim=3')
-                self.dasr_blocks[str(i)] = DecoderAdaptiveSkipRouting3D(
-                    decoder_channels=prev_channels,
-                    skip_channels=enc_nf[skip_idx],
-                    reduction=dasr_reduction,
-                    strength=dasr_strength,
-                )
+                # Keep subsequent base-model initialization identical for fair
+                # same-seed DASR ablations.
+                with torch.random.fork_rng(devices=[]):
+                    self.dasr_blocks[str(i)] = DecoderAdaptiveSkipRouting3D(
+                        decoder_channels=prev_channels,
+                        skip_channels=enc_nf[skip_idx],
+                        reduction=dasr_reduction,
+                        strength=dasr_strength,
+                    )
             if self.use_ussc and decoder_scale in self.ussc_scales:
                 if ndim != 3:
                     raise ValueError('UncertaintyAwareSelfSimilarityCorrespondence3D requires ndim=3')
