@@ -46,6 +46,56 @@ class ResidualMambaBlock(nn.Module):
         return x
 
 
+class ModalityInvariantSparseCostVolume3D(nn.Module):
+    """Local cosine cost volume summarized as offset and confidence cues."""
+
+    def __init__(self, feature_channels, projection_channels=8, search_radius=2, temperature=0.1):
+        super().__init__()
+        if search_radius < 1:
+            raise ValueError('search_radius must be at least 1')
+        if temperature <= 0:
+            raise ValueError('temperature must be positive')
+        self.search_radius = int(search_radius)
+        self.temperature = float(temperature)
+        self.projection = nn.Sequential(
+            nn.Conv3d(feature_channels, projection_channels, kernel_size=1, bias=False),
+            nn.InstanceNorm3d(projection_channels, affine=True),
+            nn.LeakyReLU(0.2),
+        )
+        offsets = [
+            (d, h, w)
+            for d in range(-self.search_radius, self.search_radius + 1)
+            for h in range(-self.search_radius, self.search_radius + 1)
+            for w in range(-self.search_radius, self.search_radius + 1)
+        ]
+        self.offset_tuples = offsets
+        self.register_buffer('offsets', torch.tensor(offsets, dtype=torch.float32), persistent=False)
+
+    @staticmethod
+    def _shift(feature, offset):
+        d, h, w = offset
+        pd, ph, pw = abs(d), abs(h), abs(w)
+        padded = F.pad(feature, (pw, pw, ph, ph, pd, pd), mode='constant', value=0)
+        d0, h0, w0 = pd + d, ph + h, pw + w
+        return padded[:, :, d0:d0 + feature.shape[2], h0:h0 + feature.shape[3], w0:w0 + feature.shape[4]]
+
+    def forward(self, source_feature, target_feature):
+        source = F.normalize(self.projection(source_feature).float(), dim=1, eps=1e-6)
+        target = F.normalize(self.projection(target_feature).float(), dim=1, eps=1e-6)
+        correlations = torch.cat([
+            (source * self._shift(target, offset)).sum(dim=1, keepdim=True)
+            for offset in self.offset_tuples
+        ], dim=1)
+        probabilities = torch.softmax(correlations / self.temperature, dim=1)
+        offsets = self.offsets.to(device=probabilities.device, dtype=probabilities.dtype)
+        expected_offset = torch.einsum('bndhw,nc->bcdhw', probabilities, offsets)
+        confidence, _ = probabilities.max(dim=1, keepdim=True)
+        entropy = -(probabilities * probabilities.clamp_min(1e-8).log()).sum(dim=1, keepdim=True)
+        entropy = entropy / max(float(torch.log(torch.tensor(probabilities.shape[1]))), 1e-6)
+        peak_correlation = correlations.max(dim=1, keepdim=True).values
+        return torch.cat([expected_offset, confidence, entropy, peak_correlation], dim=1).to(source_feature.dtype)
+
+
 class UncertaintyAwareSelfSimilarityCorrespondence3D(nn.Module):
     """Modality-robust local correspondence from self-similarity descriptors."""
 
@@ -691,7 +741,8 @@ class SiameseUNetBaseline(nn.Module):
                  use_dasr=False, dasr_scales='1/2', dasr_reduction=4, dasr_strength=0.2,
                  use_drfc=False, drfc_scale=0.25, drfc_hidden_channels=16, drfc_strength=0.5,
                  use_sdmr=False, sdmr_use_mind=True, sdmr_scale=0.125, sdmr_hidden_channels=16, sdmr_flow_limit=1.0, sdmr_alpha=0.5,
-                 use_dpfc=False, dpfc_flow_limit=8.0):
+                 use_dpfc=False, dpfc_flow_limit=8.0, use_miscv=False, miscv_scales='1/8,1/4',
+                 miscv_projection_channels=8, miscv_search_radius=2, miscv_temperature=0.1):
         super().__init__()
         self.inshape = inshape
         self.ndim = ndim
@@ -702,6 +753,8 @@ class SiameseUNetBaseline(nn.Module):
         self.use_residual_flow_pyramid = use_residual_flow_pyramid
         self.use_dpfc = bool(use_dpfc)
         self.dpfc_flow_limit = float(dpfc_flow_limit)
+        self.use_miscv = bool(use_miscv)
+        self.miscv_scales = self._parse_decoder_scales(miscv_scales)
         self.use_error_guided_residual = use_error_guided_residual
         self.error_guided_metric = error_guided_metric
         self.use_sdmr = use_sdmr
@@ -850,6 +903,8 @@ class SiameseUNetBaseline(nn.Module):
         self.dec_blocks = nn.ModuleList()
         self.ussc_blocks = nn.ModuleDict()
         self.dasr_blocks = nn.ModuleDict()
+        self.miscv_blocks = nn.ModuleDict()
+        self.miscv_guidance = nn.ModuleDict()
         self.up_blocks = nn.ModuleList()
         
         if self.use_daps:
@@ -916,6 +971,18 @@ class SiameseUNetBaseline(nn.Module):
                     temperature=ussc_temperature if use_ussc else spectral_temperature,
                     guidance_strength=ussc_guidance_strength if use_ussc else spectral_guidance_strength,
                 )
+            if self.use_miscv and skip_idx >= 0 and decoder_scale in self.miscv_scales:
+                radius = miscv_search_radius if decoder_scale == '1/8' else 1
+                self.miscv_blocks[str(i)] = ModalityInvariantSparseCostVolume3D(
+                    feature_channels=enc_nf[skip_idx],
+                    projection_channels=miscv_projection_channels,
+                    search_radius=radius,
+                    temperature=miscv_temperature,
+                )
+                guidance = Conv(6, nf, kernel_size=1)
+                guidance.weight.data.zero_()
+                guidance.bias.data.zero_()
+                self.miscv_guidance[str(i)] = guidance
                 
             prev_channels = nf
             
@@ -940,8 +1007,9 @@ class SiameseUNetBaseline(nn.Module):
         if self.use_dpfc:
             self.dpfc_residual_blocks = nn.ModuleList()
             self.dpfc_velocity_heads = nn.ModuleList()
-            for nf in dec_nf:
-                residual_block = ConvBlock(ndim, nf + ndim + 2, nf, stride=1)
+            for i, nf in enumerate(dec_nf):
+                miscv_channels = 6 if str(i) in self.miscv_blocks else 0
+                residual_block = ConvBlock(ndim, nf + ndim + 2 + miscv_channels, nf, stride=1)
                 velocity_head = Conv(nf, ndim, kernel_size=3, padding=1)
                 velocity_head.weight.data.normal_(0, 1e-6)
                 velocity_head.bias.data.zero_()
@@ -1292,6 +1360,7 @@ class SiameseUNetBaseline(nn.Module):
             t_skip_raw = None
             ussc_source_feature = None
             ussc_target_feature = None
+            miscv_descriptor = None
             if skip_idx >= 0:
                 s_skip = feat_s[skip_idx]
                 t_skip = feat_t[skip_idx]
@@ -1384,6 +1453,13 @@ class SiameseUNetBaseline(nn.Module):
                     ussc_source_feature,
                     ussc_target_feature,
                 )
+            if self.use_miscv and str(i) in self.miscv_blocks:
+                miscv_source_feature = s_skip_raw
+                if self.use_dpfc and dpfc_displacement is not None:
+                    miscv_coarse_displacement = self._resize_displacement_to_feature(dpfc_displacement, s_skip_raw)
+                    miscv_source_feature = self.spatial_transform(s_skip_raw, miscv_coarse_displacement)
+                miscv_descriptor = self.miscv_blocks[str(i)](miscv_source_feature, t_skip_raw)
+                x = x + self.miscv_guidance[str(i)](miscv_descriptor)
 
             if self.use_residual_flow_pyramid:
                 sub_flow_limit = torch.as_tensor(self.residual_flow_limit, dtype=x.dtype, device=x.device).clamp(min=1e-3)
@@ -1449,8 +1525,11 @@ class SiameseUNetBaseline(nn.Module):
                     ], dim=1).to(x.dtype)
 
                 normalized_coarse = coarse_displacement / local_limit
+                residual_inputs = [x, structure_residual, normalized_coarse]
+                if miscv_descriptor is not None:
+                    residual_inputs.append(miscv_descriptor)
                 residual_feature = self.dpfc_residual_blocks[i](
-                    torch.cat([x, structure_residual, normalized_coarse], dim=1)
+                    torch.cat(residual_inputs, dim=1)
                 )
                 raw_local_velocity = self.dpfc_velocity_heads[i](residual_feature)
                 local_velocity = local_limit * torch.tanh(raw_local_velocity / local_limit)

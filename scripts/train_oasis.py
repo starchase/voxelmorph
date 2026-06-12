@@ -88,7 +88,7 @@ def build_registration_model(args, device):
 
     if args.model_config == 'voxelmorph_baseline':
         ignored_flags = []
-        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv', 'use_boundary_branch', 'use_ussc', 'use_dasr', 'use_drfc', 'use_sdmr', 'use_dpfc'):
+        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv', 'use_boundary_branch', 'use_ussc', 'use_dasr', 'use_drfc', 'use_sdmr', 'use_dpfc', 'use_miscv'):
             if getattr(args, flag):
                 ignored_flags.append(f'--{flag.replace("_", "-")}')
         if ignored_flags:
@@ -136,6 +136,11 @@ def build_registration_model(args, device):
             use_residual_flow_pyramid=getattr(args, 'use_residual_flow_pyramid', False),
             use_dpfc=getattr(args, 'use_dpfc', False),
             dpfc_flow_limit=getattr(args, 'dpfc_flow_limit', 8.0),
+            use_miscv=getattr(args, 'use_miscv', False),
+            miscv_scales=getattr(args, 'miscv_scales', '1/8,1/4'),
+            miscv_projection_channels=getattr(args, 'miscv_projection_channels', 8),
+            miscv_search_radius=getattr(args, 'miscv_search_radius', 2),
+            miscv_temperature=getattr(args, 'miscv_temperature', 0.1),
             use_error_guided_residual=getattr(args, 'use_error_guided_residual', False),
             residual_flow_limit=getattr(args, 'residual_flow_limit', 4.0),
             use_boundary_branch=getattr(args, 'use_boundary_branch', False),
@@ -1149,6 +1154,11 @@ def main():
     parser.add_argument('--use-residual-flow-pyramid', action='store_true', help='Use lightweight coarse-to-fine residual flow accumulation without warping skip features')
     parser.add_argument('--use-dpfc', action='store_true', help='Use deformation-aware coarse-to-fine residual diffeomorphic composition')
     parser.add_argument('--dpfc-flow-limit', type=float, default=8.0, help='Maximum full-resolution correction budget at the coarsest DPFC stage')
+    parser.add_argument('--use-miscv', action='store_true', help='Use modality-invariant sparse cost-volume correspondence')
+    parser.add_argument('--miscv-scales', type=str, default='1/8,1/4', help='Decoder scales for MISC-V; recommended: 1/8,1/4')
+    parser.add_argument('--miscv-projection-channels', type=int, default=8, help='Shared low-dimensional projection channels for MISC-V')
+    parser.add_argument('--miscv-search-radius', type=int, default=2, help='MISC-V search radius at 1/8; 1/4 always uses radius 1')
+    parser.add_argument('--miscv-temperature', type=float, default=0.1, help='Softmax temperature for MISC-V local correspondence')
     parser.add_argument('--use-error-guided-residual', action='store_true', help='Enhance residual flow pyramid with Structure-aware & Error-guided side branch')
     parser.add_argument("--error-guided-metric", type=str, default="feature_ncc", choices=["feature_ncc", "mind"], help="Metric to compute error maps for guidance")
     parser.add_argument('--residual-flow-limit', type=float, default=4.0, help='Per-stage magnitude cap for residual flow heads when residual flow pyramid is enabled')
@@ -1241,6 +1251,12 @@ def main():
         parser.error('--use-dpfc requires --integration-steps greater than zero.')
     if args.use_dpfc and args.dpfc_flow_limit <= 0:
         parser.error('--dpfc-flow-limit must be positive.')
+    if args.use_miscv and args.miscv_projection_channels < 1:
+        parser.error('--miscv-projection-channels must be positive.')
+    if args.use_miscv and args.miscv_search_radius < 1:
+        parser.error('--miscv-search-radius must be at least 1.')
+    if args.use_miscv and args.miscv_temperature <= 0:
+        parser.error('--miscv-temperature must be positive.')
     if args.boundary_ring_inner_kernel < 1 or args.boundary_ring_outer_kernel < 1:
         parser.error('--boundary-ring-inner-kernel and --boundary-ring-outer-kernel must be positive integers.')
     if args.boundary_ring_outer_kernel < args.boundary_ring_inner_kernel:
@@ -1418,6 +1434,11 @@ def main():
         f.write(f"Use DPFC: {args.use_dpfc}\n")
         f.write("DPFC Version: v2-deformation-aware-c2f\n")
         f.write(f"DPFC Flow Limit: {args.dpfc_flow_limit}\n")
+        f.write(f"Use MISC-V: {args.use_miscv}\n")
+        f.write(f"MISC-V Scales: {args.miscv_scales}\n")
+        f.write(f"MISC-V Projection Channels: {args.miscv_projection_channels}\n")
+        f.write(f"MISC-V Search Radius: {args.miscv_search_radius}\n")
+        f.write(f"MISC-V Temperature: {args.miscv_temperature}\n")
         f.write(f"Use Error-Guided Residual: {args.use_error_guided_residual}\n")
         f.write(f"Residual Flow Limit: {args.residual_flow_limit}\n")
         f.write(f"Residual Flow Reg Weight: {args.residual_flow_reg_weight}\n")
