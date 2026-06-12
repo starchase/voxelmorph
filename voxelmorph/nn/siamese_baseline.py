@@ -979,7 +979,7 @@ class SiameseUNetBaseline(nn.Module):
                     search_radius=radius,
                     temperature=miscv_temperature,
                 )
-                guidance = Conv(6, nf, kernel_size=1)
+                guidance = getattr(nn, f'Conv{ndim}d')(6, nf, kernel_size=1)
                 guidance.weight.data.zero_()
                 guidance.bias.data.zero_()
                 self.miscv_guidance[str(i)] = guidance
