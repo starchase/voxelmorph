@@ -991,6 +991,7 @@ def train_epoch(
     saor_loss_fn: nn.Module = None,
     sbc_weight: float = 0.0,
     sbc_stage_weight: float = 0.5,
+    accumulation_steps: int = 1,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -998,10 +999,9 @@ def train_epoch(
     total_grad_loss = 0.0
     total_feature_edge_loss = 0.0
     valid_batches = 0
+    optimizer.zero_grad(set_to_none=True)
 
     for batch_idx, data in enumerate(dataloader):
-        optimizer.zero_grad()
-
         # TransMorph OASISDataset returns: x, y, x_seg, y_seg
         # x: moving image, y: fixed image
         x = data[0].to(device)
@@ -1145,17 +1145,22 @@ def train_epoch(
 
         if amp_enabled and scaler is not None:
             # 缩放 loss，反向传播
-            scaler.scale(loss).backward()
-            # 在执行梯度裁剪前，必须先 unscale 梯度
-            scaler.unscale_(optimizer)
-            # 增加梯度裁剪，防止黑背景区导致的除零或梯度爆炸
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            scaler.scale(loss / accumulation_steps).backward()
         else:
-            loss.backward()
+            (loss / accumulation_steps).backward()
+
+        should_step = (batch_idx + 1) % accumulation_steps == 0 or (batch_idx + 1) == len(dataloader)
+        if should_step:
+            if amp_enabled and scaler is not None:
+                # 在执行梯度裁剪前，必须先 unscale 梯度
+                scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+            if amp_enabled and scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
             
         total_loss += loss.item()
         total_img_loss += img_loss.item()
@@ -1181,6 +1186,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=200, help='Number of epochs')
     parser.add_argument('--workers', type=int, default=8, help='Number of workers')
     parser.add_argument('--batch-size', type=int, default=1, help='Batch size')
+    parser.add_argument('--accumulation-steps', type=int, default=1, help='Gradient accumulation steps used to preserve effective batch size')
     parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
     parser.add_argument('--loss', type=str, default='mse', choices=['mse', 'ncc'], help='Image similarity loss')
     parser.add_argument('--use-mask', action='store_true', help='Use foreground mask to exclude black background in loss calculation')
@@ -1307,6 +1313,8 @@ def main():
         parser.error('--use-sbc requires --use-dpfc for stage-level composition consistency.')
     if args.sbc_weight < 0 or args.sbc_stage_weight < 0 or args.sbc_start_epoch < 1:
         parser.error('SBC weights must be non-negative and --sbc-start-epoch must be positive.')
+    if args.accumulation_steps < 1:
+        parser.error('--accumulation-steps must be positive.')
     if args.boundary_ring_inner_kernel < 1 or args.boundary_ring_outer_kernel < 1:
         parser.error('--boundary-ring-inner-kernel and --boundary-ring-outer-kernel must be positive integers.')
     if args.boundary_ring_outer_kernel < args.boundary_ring_inner_kernel:
@@ -1507,6 +1515,7 @@ def main():
         f.write(f"SBC Weight: {args.sbc_weight}\n")
         f.write(f"SBC Stage Weight: {args.sbc_stage_weight}\n")
         f.write(f"SBC Start Epoch: {args.sbc_start_epoch}\n")
+        f.write(f"Gradient Accumulation Steps: {args.accumulation_steps}\n")
         f.write(f"Cross-Mamba Offset Limit: {args.cross_mamba_offset_limit}\n")
         f.write(f"Cross-Mamba Offset Smooth Kernel: {args.cross_mamba_offset_smooth_kernel}\n")
         f.write(f"Use SDMR: {args.use_sdmr}\n")
@@ -1573,6 +1582,7 @@ def main():
             saor_loss_fn=saor_loss_fn,
             sbc_weight=active_sbc_weight,
             sbc_stage_weight=args.sbc_stage_weight,
+            accumulation_steps=args.accumulation_steps,
         )
         loss_history.append(avg_loss)
         
