@@ -562,6 +562,42 @@ class DecoupledEncoder(nn.Module):
             
         return feat_s, feat_t
 
+
+class SharedSpatialCoordinateCalibration(nn.Module):
+    """Calibrate both streams in a shared continuous spatial frame."""
+
+    def __init__(self, channels, hidden_channels=16, strength=0.2):
+        super().__init__()
+        hidden_channels = max(4, min(int(hidden_channels), channels))
+        self.strength = float(strength)
+        self.coordinate_mlp = nn.Sequential(
+            nn.Conv3d(9, hidden_channels, kernel_size=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(hidden_channels, 2 * channels, kernel_size=1),
+        )
+        nn.init.zeros_(self.coordinate_mlp[-1].weight)
+        nn.init.zeros_(self.coordinate_mlp[-1].bias)
+
+    @staticmethod
+    def _coordinate_basis(feature):
+        depth, height, width = feature.shape[2:]
+        z = torch.linspace(-1.0, 1.0, depth, dtype=feature.dtype, device=feature.device)
+        y = torch.linspace(-1.0, 1.0, height, dtype=feature.dtype, device=feature.device)
+        x = torch.linspace(-1.0, 1.0, width, dtype=feature.dtype, device=feature.device)
+        zz, yy, xx = torch.meshgrid(z, y, x, indexing='ij')
+        basis = torch.stack([
+            zz, yy, xx,
+            zz.square(), yy.square(), xx.square(),
+            torch.sin(torch.pi * zz), torch.sin(torch.pi * yy), torch.sin(torch.pi * xx),
+        ], dim=0)
+        return basis.unsqueeze(0)
+
+    def forward(self, feature):
+        scale, bias = self.coordinate_mlp(self._coordinate_basis(feature)).chunk(2, dim=1)
+        strength = feature.new_tensor(self.strength)
+        return feature * (1.0 + strength * torch.tanh(scale)) + strength * torch.tanh(bias)
+
+
 class DAPS_PLR_Block(nn.Module):
     """
     Deformation-Aware Progressive Skip with Pyramid-Level Regularization (DAPS-PLR)
@@ -742,6 +778,7 @@ class SiameseUNetBaseline(nn.Module):
                  use_drfc=False, drfc_scale=0.25, drfc_hidden_channels=16, drfc_strength=0.5,
                  use_sdmr=False, sdmr_use_mind=True, sdmr_scale=0.125, sdmr_hidden_channels=16, sdmr_flow_limit=1.0, sdmr_alpha=0.5,
                  use_dpfc=False, dpfc_flow_limit=8.0, use_miscv=False, miscv_scales='1/8,1/4',
+                 use_sscc=False, sscc_scales='1/16,1/8', sscc_hidden_channels=16, sscc_strength=0.2,
                  miscv_projection_channels=8, miscv_search_radius=2, miscv_temperature=0.1):
         super().__init__()
         self.inshape = inshape
@@ -755,6 +792,8 @@ class SiameseUNetBaseline(nn.Module):
         self.dpfc_flow_limit = float(dpfc_flow_limit)
         self.use_miscv = bool(use_miscv)
         self.miscv_scales = self._parse_decoder_scales(miscv_scales)
+        self.use_sscc = bool(use_sscc)
+        self.sscc_scales = self._parse_cross_mamba_scales(sscc_scales)
         self.use_error_guided_residual = use_error_guided_residual
         self.error_guided_metric = error_guided_metric
         self.use_sdmr = use_sdmr
@@ -823,6 +862,16 @@ class SiameseUNetBaseline(nn.Module):
             mamba_quarter_scale=mamba_quarter_scale,
             mamba_parallel_block=mamba_parallel_block
         )
+        self.sscc_blocks = nn.ModuleDict()
+        if self.use_sscc:
+            scale_to_index = {'1/2': -4, '1/4': -3, '1/8': -2, '1/16': -1}
+            for scale_name in sorted(self.sscc_scales):
+                feature_index = scale_to_index[scale_name]
+                self.sscc_blocks[scale_name.replace('/', '_')] = SharedSpatialCoordinateCalibration(
+                    enc_nf[feature_index],
+                    hidden_channels=sscc_hidden_channels,
+                    strength=sscc_strength,
+                )
 
         self.boundary_feature_indices = []
         self.boundary_guidance = nn.ModuleDict()
@@ -1306,6 +1355,14 @@ class SiameseUNetBaseline(nn.Module):
             feat_t, feat_s = self.encoder(target_input, source_input)
         else:
             feat_s, feat_t = self.encoder(source_input, target_input)
+
+        if self.use_sscc:
+            scale_to_index = {'1/2': -4, '1/4': -3, '1/8': -2, '1/16': -1}
+            for scale_name in self.sscc_scales:
+                block = self.sscc_blocks[scale_name.replace('/', '_')]
+                feature_index = scale_to_index[scale_name]
+                feat_s[feature_index] = block(feat_s[feature_index])
+                feat_t[feature_index] = block(feat_t[feature_index])
 
         if self.use_boundary_branch:
             source_boundary = self.boundary_extractor(source_input)

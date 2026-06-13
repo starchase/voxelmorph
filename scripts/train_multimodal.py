@@ -2117,6 +2117,10 @@ def main():
     parser.add_argument('--miscv-projection-channels', type=int, default=8, help='Shared low-dimensional projection channels for MISC-V')
     parser.add_argument('--miscv-search-radius', type=int, default=2, help='MISC-V search radius at 1/8; 1/4 always uses radius 1')
     parser.add_argument('--miscv-temperature', type=float, default=0.1, help='Softmax temperature for MISC-V local correspondence')
+    parser.add_argument('--use-sscc', action='store_true', help='Use shared spatial coordinate calibration on dual-stream encoder features')
+    parser.add_argument('--sscc-scales', type=str, default='1/16,1/8', help='Comma-separated encoder scales for SSCC')
+    parser.add_argument('--sscc-hidden-channels', type=int, default=16, help='Hidden channels in SSCC coordinate projection')
+    parser.add_argument('--sscc-strength', type=float, default=0.2, help='Maximum SSCC feature calibration strength')
     parser.add_argument('--use-error-guided-residual', action='store_true', help='Enhance residual flow pyramid with Structure-aware & Error-guided side branch')
     parser.add_argument("--error-guided-metric", type=str, default="feature_ncc", choices=["feature_ncc", "mind"], help="Metric to compute error maps for guidance")
     parser.add_argument('--residual-flow-limit', type=float, default=4.0, help='Per-stage magnitude cap for residual flow heads when residual flow pyramid is enabled')
@@ -2216,6 +2220,8 @@ def main():
         parser.error('--miscv-search-radius must be at least 1.')
     if args.use_miscv and args.miscv_temperature <= 0:
         parser.error('--miscv-temperature must be positive.')
+    if args.sscc_hidden_channels <= 0 or args.sscc_strength <= 0:
+        parser.error('--sscc-hidden-channels and --sscc-strength must be positive.')
     if args.use_saor and (args.saor_alpha < 0 or args.saor_risk_gamma < 0 or args.saor_risk_threshold < 0):
         parser.error('SAOR parameters must be non-negative.')
     if args.use_sbc and not args.use_dpfc:
@@ -2321,6 +2327,10 @@ def main():
             miscv_projection_channels=args.miscv_projection_channels,
             miscv_search_radius=args.miscv_search_radius,
             miscv_temperature=args.miscv_temperature,
+            use_sscc=args.use_sscc,
+            sscc_scales=args.sscc_scales,
+            sscc_hidden_channels=args.sscc_hidden_channels,
+            sscc_strength=args.sscc_strength,
                 use_error_guided_residual=args.use_error_guided_residual,
                 error_guided_metric=args.error_guided_metric,
             residual_flow_limit=args.residual_flow_limit,
@@ -2526,6 +2536,10 @@ def main():
         f.write(f"MISC-V Projection Channels: {args.miscv_projection_channels}\n")
         f.write(f"MISC-V Search Radius: {args.miscv_search_radius}\n")
         f.write(f"MISC-V Temperature: {args.miscv_temperature}\n")
+        f.write(f"Use SSCC: {args.use_sscc}\n")
+        f.write(f"SSCC Scales: {args.sscc_scales}\n")
+        f.write(f"SSCC Hidden Channels: {args.sscc_hidden_channels}\n")
+        f.write(f"SSCC Strength: {args.sscc_strength}\n")
         f.write(f"Use Error-Guided Residual: {args.use_error_guided_residual}\n")
         f.write(f"Residual Flow Limit: {args.residual_flow_limit}\n")
         f.write(f"Pyramid Image Weight: {args.pyramid_image_weight}\n")
