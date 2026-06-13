@@ -78,6 +78,9 @@ def deformation_equivariance_loss(
     base_displacement,
     perturbed_displacement,
     target_perturbation,
+    structure_image=None,
+    structure_aware=False,
+    eps=1e-6,
 ):
     """Match a prediction to the known target-space deformation composition."""
     with torch.no_grad():
@@ -85,7 +88,26 @@ def deformation_equivariance_loss(
             base_displacement.detach().float(),
             target_perturbation.float(),
         )
-    return F.smooth_l1_loss(perturbed_displacement.float(), expected, beta=1.0)
+        weight = None
+        if structure_aware:
+            if structure_image is None:
+                raise ValueError('structure_image is required for structure-aware DESS')
+            image = structure_image.detach().float()
+            local_mean = F.avg_pool3d(image, kernel_size=5, stride=1, padding=2)
+            local_second = F.avg_pool3d(image.square(), kernel_size=5, stride=1, padding=2)
+            local_variance = (local_second - local_mean.square()).clamp_min(0.0)
+            variance_scale = local_variance.mean(dim=(2, 3, 4), keepdim=True).clamp_min(eps)
+            structure_weight = local_variance / (local_variance + variance_scale)
+
+            valid = spatial_transform(torch.ones_like(image), target_perturbation.float())
+            valid_weight = ((valid - 0.999) / 0.001).clamp(0.0, 1.0)
+            weight = structure_weight * valid_weight
+
+    error = F.smooth_l1_loss(perturbed_displacement.float(), expected, beta=1.0, reduction='none')
+    if weight is None:
+        return error.mean()
+    weight = weight.expand(-1, error.shape[1], *([-1] * (error.ndim - 2)))
+    return (error * weight).sum() / weight.sum().clamp_min(eps)
 
 
 class StructureAdaptiveOptimizationRegularization(nn.Module):

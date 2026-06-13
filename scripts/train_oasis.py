@@ -996,6 +996,7 @@ def train_epoch(
     dess_probability: float = 0.5,
     dess_max_displacement: float = 3.0,
     dess_coarse_scale: float = 0.125,
+    dess_structure_aware: bool = False,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -1121,6 +1122,8 @@ def train_epoch(
                 displacement,
                 perturbed_displacement,
                 target_perturbation,
+                structure_image=target_float,
+                structure_aware=dess_structure_aware,
             )
         
         grad_loss = saor_loss_fn(displacement.float(), target_float) if saor_loss_fn is not None else grad_loss_fn(displacement.float()).mean()
@@ -1259,6 +1262,7 @@ def main():
     parser.add_argument('--dess-max-displacement', type=float, default=3.0, help='Maximum synthetic target perturbation in full-resolution voxels')
     parser.add_argument('--dess-coarse-scale', type=float, default=0.125, help='Low-resolution scale used to generate smooth DESS perturbations')
     parser.add_argument('--dess-start-epoch', type=int, default=10, help='First epoch that enables DESS training')
+    parser.add_argument('--dess-structure-aware', action='store_true', help='DESS v2: supervise only valid structure-informative target regions')
     parser.add_argument('--use-pdaps', action='store_true', help='Use Pyramid-guided Deformation-Aware Progressive Skip')
     parser.add_argument('--pdaps-flow-limit', type=float, default=20.0, help='Maximum physical flow limit for P-DAPS. E.g., 20.0 for Brain, 30.0+ for Abdomen CT/MRI.')
     parser.add_argument('--use-daps', action='store_true', help='Use original DAPS')
@@ -1569,6 +1573,7 @@ def main():
         f.write(f"DESS Max Displacement: {args.dess_max_displacement}\n")
         f.write(f"DESS Coarse Scale: {args.dess_coarse_scale}\n")
         f.write(f"DESS Start Epoch: {args.dess_start_epoch}\n")
+        f.write(f"DESS Structure Aware: {args.dess_structure_aware}\n")
         f.write(f"Cross-Mamba Offset Limit: {args.cross_mamba_offset_limit}\n")
         f.write(f"Cross-Mamba Offset Smooth Kernel: {args.cross_mamba_offset_smooth_kernel}\n")
         f.write(f"Use SDMR: {args.use_sdmr}\n")
@@ -1641,6 +1646,7 @@ def main():
             dess_probability=args.dess_probability,
             dess_max_displacement=args.dess_max_displacement,
             dess_coarse_scale=args.dess_coarse_scale,
+            dess_structure_aware=args.dess_structure_aware,
         )
         loss_history.append(avg_loss)
         
