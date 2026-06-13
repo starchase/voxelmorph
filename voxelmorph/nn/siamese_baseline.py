@@ -1290,7 +1290,7 @@ class SiameseUNetBaseline(nn.Module):
             raise ValueError(f'Unsupported USSC scales: {invalid}. Valid values are {sorted(valid)}')
         return set(items)
 
-    def forward(self, source, target, return_warped_source=True, return_field_type='displacement', return_coarse_flows=False, return_residual_flows=False, return_feature_edge_loss=False, feature_edge_indices=(0, 1)):
+    def forward(self, source, target, return_warped_source=True, return_field_type='displacement', return_coarse_flows=False, return_residual_flows=False, return_feature_edge_loss=False, feature_edge_indices=(0, 1), swap_encoder_branches=False):
         # --- [Ablation 1 Hook: FDA will go here] ---
         source_input = source
         target_input = target
@@ -1300,7 +1300,12 @@ class SiameseUNetBaseline(nn.Module):
             self._mind_target = self.mind_extractor._mind_ssc(target_input)
         
         # 1. Feature Extraction (Decoupled/Shared)
-        feat_s, feat_t = self.encoder(source_input, target_input)
+        if swap_encoder_branches:
+            # Preserve modality-specific shallow encoders when reversing the
+            # registration direction (e.g. MR->CT after training CT->MR).
+            feat_t, feat_s = self.encoder(target_input, source_input)
+        else:
+            feat_s, feat_t = self.encoder(source_input, target_input)
 
         if self.use_boundary_branch:
             source_boundary = self.boundary_extractor(source_input)

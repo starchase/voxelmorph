@@ -63,6 +63,7 @@ class VxmBaselineAdapter(nn.Module):
         return_residual_flows=False,
         return_feature_edge_loss=False,
         feature_edge_indices=(0, 1),
+        swap_encoder_branches=False,
     ):
         out = self.model(
             source,

@@ -1306,6 +1306,7 @@ def train_epoch(
                     return_field_type='displacement',
                     return_coarse_flows=True,
                     return_residual_flows=False,
+                    swap_encoder_branches=True,
                 )
                 reverse_displacement, reverse_warped, reverse_coarse_flows, _, _ = unpack_model_outputs(
                     reverse_out,
