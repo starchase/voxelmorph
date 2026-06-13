@@ -14,6 +14,39 @@ import numpy as np
 from .modules import FixedGradientMagnitude3D
 
 
+def symmetric_displacement_composition_loss(
+    spatial_transform,
+    forward_displacement,
+    backward_displacement,
+    forward_stages=(),
+    backward_stages=(),
+    stage_weight=0.5,
+):
+    """Robust inverse-composition consistency for final and coarse-to-fine fields."""
+
+    def composition_loss(first, second):
+        # The model composes displacements as second + warp(first, second).
+        residual = second.float() + spatial_transform(first.float(), second.float())
+        return F.smooth_l1_loss(residual, torch.zeros_like(residual), beta=1.0)
+
+    final_loss = 0.5 * (
+        composition_loss(forward_displacement, backward_displacement)
+        + composition_loss(backward_displacement, forward_displacement)
+    )
+
+    paired_stages = list(zip(forward_stages, backward_stages))
+    if not paired_stages or stage_weight <= 0:
+        return final_loss
+
+    stage_loss = final_loss.new_tensor(0.0)
+    for forward_stage, backward_stage in paired_stages:
+        stage_loss = stage_loss + 0.5 * (
+            composition_loss(forward_stage, backward_stage)
+            + composition_loss(backward_stage, forward_stage)
+        )
+    return final_loss + float(stage_weight) * stage_loss / len(paired_stages)
+
+
 class StructureAdaptiveOptimizationRegularization(nn.Module):
     """Structure-aware smoothness with high-deformation risk protection."""
 

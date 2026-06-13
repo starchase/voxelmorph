@@ -1247,6 +1247,8 @@ def train_epoch(
     pyramid_image_weights: Sequence[float] = (),
     residual_flow_reg_weight: float = 0.0,
     saor_loss_fn: Optional[nn.Module] = None,
+    sbc_weight: float = 0.0,
+    sbc_stage_weight: float = 0.5,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -1296,6 +1298,19 @@ def train_epoch(
                 expect_residual_flows=use_residual_flow_pyramid or use_dpfc,
                 expect_feature_edge_loss=use_feature_edge_loss,
             )
+            if sbc_weight > 0:
+                reverse_out = model(
+                    target,
+                    source,
+                    return_warped_source=True,
+                    return_field_type='displacement',
+                    return_coarse_flows=True,
+                    return_residual_flows=False,
+                )
+                reverse_displacement, reverse_warped, reverse_coarse_flows, _, _ = unpack_model_outputs(
+                    reverse_out,
+                    expect_coarse_flows=True,
+                )
 
         # AMP 兼容性保护：强制将预测结果和 Loss 计算切回 float32。
         # 这是配准任务的常见坑，因为形变场和损失求导在 float16 下极易精度溢出
@@ -1313,6 +1328,18 @@ def train_epoch(
         )
 
         img_loss = compute_image_loss(image_loss_fn, target_float, warped_source_float, mask=loss_mask)
+        sbc_loss = displacement_float.new_tensor(0.0)
+        if sbc_weight > 0:
+            reverse_img_loss = compute_image_loss(image_loss_fn, source_float, reverse_warped.float(), mask=None)
+            img_loss = 0.5 * (img_loss + reverse_img_loss)
+            sbc_loss = vxm.nn.losses.symmetric_displacement_composition_loss(
+                model.spatial_transform,
+                displacement_float,
+                reverse_displacement,
+                coarse_flows,
+                reverse_coarse_flows,
+                stage_weight=sbc_stage_weight,
+            )
             
         grad_loss = saor_loss_fn(displacement_float, target_float) if saor_loss_fn is not None else grad_loss_fn(displacement_float).mean()
         bend_loss = displacement_float.new_tensor(0.0)
@@ -1362,6 +1389,8 @@ def train_epoch(
             loss = loss + feature_edge_loss_weight * feature_edge_loss.float()
         if residual_flow_reg_weight > 0:
             loss = loss + residual_flow_reg_weight * residual_flow_reg_loss
+        if sbc_weight > 0:
+            loss = loss + sbc_weight * sbc_loss
 
         if not torch.isfinite(loss):
             optimizer.zero_grad(set_to_none=True)
@@ -2058,6 +2087,10 @@ def main():
     parser.add_argument('--saor-alpha', type=float, default=3.0, help='Structure sensitivity of SAOR')
     parser.add_argument('--saor-risk-gamma', type=float, default=0.5, help='Strength of SAOR high-deformation risk protection')
     parser.add_argument('--saor-risk-threshold', type=float, default=0.5, help='Gradient-magnitude threshold for SAOR risk protection')
+    parser.add_argument('--use-sbc', action='store_true', help='Use stage-level symmetric bidirectional composition training')
+    parser.add_argument('--sbc-weight', type=float, default=0.05, help='Weight of symmetric inverse-composition consistency')
+    parser.add_argument('--sbc-stage-weight', type=float, default=0.5, help='Relative weight of C2F stage-level composition consistency')
+    parser.add_argument('--sbc-start-epoch', type=int, default=5, help='First epoch that enables SBC training')
     parser.add_argument('--use-pdaps', action='store_true', help='Use Pyramid-guided Deformation-Aware Progressive Skip')
     parser.add_argument('--use-daps', action='store_true', help='Use original DAPS')
     parser.add_argument('--use-dsin', action='store_true', help='Use DSIN')
@@ -2137,6 +2170,10 @@ def main():
         parser.error('--miscv-temperature must be positive.')
     if args.use_saor and (args.saor_alpha < 0 or args.saor_risk_gamma < 0 or args.saor_risk_threshold < 0):
         parser.error('SAOR parameters must be non-negative.')
+    if args.use_sbc and not args.use_dpfc:
+        parser.error('--use-sbc requires --use-dpfc for stage-level composition consistency.')
+    if args.sbc_weight < 0 or args.sbc_stage_weight < 0 or args.sbc_start_epoch < 1:
+        parser.error('SBC weights must be non-negative and --sbc-start-epoch must be positive.')
     if args.start_epoch < 1 or args.start_epoch > args.epochs:
         parser.error('--start-epoch must be between 1 and --epochs.')
     if args.use_ussc and args.ussc_search_radius < 1:
@@ -2447,6 +2484,10 @@ def main():
         f.write(f"SAOR Alpha: {args.saor_alpha}\n")
         f.write(f"SAOR Risk Gamma: {args.saor_risk_gamma}\n")
         f.write(f"SAOR Risk Threshold: {args.saor_risk_threshold}\n")
+        f.write(f"Use SBC: {args.use_sbc}\n")
+        f.write(f"SBC Weight: {args.sbc_weight}\n")
+        f.write(f"SBC Stage Weight: {args.sbc_stage_weight}\n")
+        f.write(f"SBC Start Epoch: {args.sbc_start_epoch}\n")
         f.write(f"Feature Edge Loss Weight: {active_feature_edge_loss_weight}\n")
         f.write(f"Feature Edge Scales: {args.feature_edge_scales}\n")
         f.write(f"Use USSC: {args.use_ussc}\n")
@@ -2510,6 +2551,7 @@ def main():
         active_feature_edge_loss_weight = args.feature_edge_loss_weight if feature_edge_active else 0.0
         pyramid_image_active = curr_epoch_1_based >= args.pyramid_image_start_epoch
         active_pyramid_image_weight = args.pyramid_image_weight if pyramid_image_active else 0.0
+        active_sbc_weight = args.sbc_weight if args.use_sbc and curr_epoch_1_based >= args.sbc_start_epoch else 0.0
         avg_loss, train_boundary_loss, last_img_loss, last_grad_loss, avg_grad_norm, update_ratio = train_epoch(
             model=model,
             dataloader=train_loader,
@@ -2532,6 +2574,8 @@ def main():
             pyramid_image_weights=pyramid_image_weights,
             residual_flow_reg_weight=args.residual_flow_reg_weight,
             saor_loss_fn=saor_loss_fn,
+            sbc_weight=active_sbc_weight,
+            sbc_stage_weight=args.sbc_stage_weight,
         )
 
         # -----------------------------
