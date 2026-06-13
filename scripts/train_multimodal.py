@@ -1249,6 +1249,10 @@ def train_epoch(
     saor_loss_fn: Optional[nn.Module] = None,
     sbc_weight: float = 0.0,
     sbc_stage_weight: float = 0.5,
+    dess_weight: float = 0.0,
+    dess_probability: float = 0.5,
+    dess_max_displacement: float = 2.0,
+    dess_coarse_scale: float = 0.125,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -1258,6 +1262,8 @@ def train_epoch(
     num_grad_norm = 0
     effective_update_steps = 0
     nonfinite_steps = 0
+    total_dess_loss = 0.0
+    dess_steps = 0
 
     # Keep AMP scaler persistent across epochs. If not provided, fallback to local scaler.
     if scaler is None:
@@ -1277,6 +1283,15 @@ def train_epoch(
 
         source = batch['source'].to(device, non_blocking=True)
         target = batch['target'].to(device, non_blocking=True)
+        dess_active = dess_weight > 0 and torch.rand((), device=device).item() < dess_probability
+        if dess_active:
+            target_perturbation = vxm.nn.losses.random_diffeomorphic_displacement(
+                target,
+                model.spatial_transform,
+                max_displacement=dess_max_displacement,
+                coarse_scale=dess_coarse_scale,
+            )
+            perturbed_target = model.spatial_transform(target.float(), target_perturbation)
 
         with amp_autocast(device, dtype=amp_dtype, enabled=amp_enabled):
             use_feature_edge_loss = feature_edge_loss_weight > 0 and hasattr(model, '_feature_edge_loss')
@@ -1312,6 +1327,13 @@ def train_epoch(
                     reverse_out,
                     expect_coarse_flows=True,
                 )
+            if dess_active:
+                perturbed_displacement = model(
+                    source,
+                    perturbed_target,
+                    return_warped_source=False,
+                    return_field_type='displacement',
+                )
 
         # AMP 兼容性保护：强制将预测结果和 Loss 计算切回 float32。
         # 这是配准任务的常见坑，因为形变场和损失求导在 float16 下极易精度溢出
@@ -1340,6 +1362,14 @@ def train_epoch(
                 coarse_flows,
                 reverse_coarse_flows,
                 stage_weight=sbc_stage_weight,
+            )
+        dess_loss = displacement_float.new_tensor(0.0)
+        if dess_active:
+            dess_loss = vxm.nn.losses.deformation_equivariance_loss(
+                model.spatial_transform,
+                displacement_float,
+                perturbed_displacement,
+                target_perturbation,
             )
             
         grad_loss = saor_loss_fn(displacement_float, target_float) if saor_loss_fn is not None else grad_loss_fn(displacement_float).mean()
@@ -1392,6 +1422,8 @@ def train_epoch(
             loss = loss + residual_flow_reg_weight * residual_flow_reg_loss
         if sbc_weight > 0:
             loss = loss + sbc_weight * sbc_loss
+        if dess_active:
+            loss = loss + dess_weight * dess_loss
 
         if not torch.isfinite(loss):
             optimizer.zero_grad(set_to_none=True)
@@ -1449,6 +1481,9 @@ def train_epoch(
 
         total_loss += loss.item()
         total_boundary_loss += boundary_loss.item()
+        if dess_active:
+            total_dess_loss += dess_loss.item()
+            dess_steps += 1
         # Track components for debugging
         # Note: We need to detach to avoid accumulation
         num_steps += 1
@@ -1459,6 +1494,8 @@ def train_epoch(
     update_ratio = effective_update_steps / max(num_steps, 1)
     if nonfinite_steps > 0:
         print(f'  [Warning] Non-finite train steps: {nonfinite_steps}/{num_steps}. Consider reducing lr or disabling AMP for this loss.')
+    if dess_weight > 0:
+        print(f'  [DESS] Loss: {total_dess_loss / max(dess_steps, 1):.6f}, Active: {dess_steps}/{num_steps}')
     avg_boundary_loss = total_boundary_loss / num_steps if num_steps > 0 else 0.0
     return total_loss / num_steps, avg_boundary_loss, img_loss.item(), grad_loss.item() + (deep_sup_loss.item() if isinstance(deep_sup_loss, torch.Tensor) else 0), avg_grad_norm, update_ratio
 
@@ -2092,6 +2129,12 @@ def main():
     parser.add_argument('--sbc-weight', type=float, default=0.05, help='Weight of symmetric inverse-composition consistency')
     parser.add_argument('--sbc-stage-weight', type=float, default=0.5, help='Relative weight of C2F stage-level composition consistency')
     parser.add_argument('--sbc-start-epoch', type=int, default=5, help='First epoch that enables SBC training')
+    parser.add_argument('--use-dess', action='store_true', help='Use target-conditioned deformation-equivariant spatial supervision')
+    parser.add_argument('--dess-weight', type=float, default=0.03, help='Weight of DESS final-displacement supervision')
+    parser.add_argument('--dess-probability', type=float, default=0.5, help='Probability of applying DESS to a training pair')
+    parser.add_argument('--dess-max-displacement', type=float, default=2.0, help='Maximum synthetic target perturbation in full-resolution voxels')
+    parser.add_argument('--dess-coarse-scale', type=float, default=0.125, help='Low-resolution scale used to generate smooth DESS perturbations')
+    parser.add_argument('--dess-start-epoch', type=int, default=10, help='First epoch that enables DESS training')
     parser.add_argument('--use-pdaps', action='store_true', help='Use Pyramid-guided Deformation-Aware Progressive Skip')
     parser.add_argument('--use-daps', action='store_true', help='Use original DAPS')
     parser.add_argument('--use-dsin', action='store_true', help='Use DSIN')
@@ -2175,6 +2218,10 @@ def main():
         parser.error('--use-sbc requires --use-dpfc for stage-level composition consistency.')
     if args.sbc_weight < 0 or args.sbc_stage_weight < 0 or args.sbc_start_epoch < 1:
         parser.error('SBC weights must be non-negative and --sbc-start-epoch must be positive.')
+    if args.dess_weight < 0 or not (0 <= args.dess_probability <= 1) or args.dess_max_displacement <= 0:
+        parser.error('DESS weight/probability/displacement parameters are invalid.')
+    if not (0 < args.dess_coarse_scale <= 1) or args.dess_start_epoch < 1:
+        parser.error('--dess-coarse-scale must be in (0, 1] and --dess-start-epoch must be positive.')
     if args.start_epoch < 1 or args.start_epoch > args.epochs:
         parser.error('--start-epoch must be between 1 and --epochs.')
     if args.use_ussc and args.ussc_search_radius < 1:
@@ -2489,6 +2536,12 @@ def main():
         f.write(f"SBC Weight: {args.sbc_weight}\n")
         f.write(f"SBC Stage Weight: {args.sbc_stage_weight}\n")
         f.write(f"SBC Start Epoch: {args.sbc_start_epoch}\n")
+        f.write(f"Use DESS: {args.use_dess}\n")
+        f.write(f"DESS Weight: {args.dess_weight}\n")
+        f.write(f"DESS Probability: {args.dess_probability}\n")
+        f.write(f"DESS Max Displacement: {args.dess_max_displacement}\n")
+        f.write(f"DESS Coarse Scale: {args.dess_coarse_scale}\n")
+        f.write(f"DESS Start Epoch: {args.dess_start_epoch}\n")
         f.write(f"Feature Edge Loss Weight: {active_feature_edge_loss_weight}\n")
         f.write(f"Feature Edge Scales: {args.feature_edge_scales}\n")
         f.write(f"Use USSC: {args.use_ussc}\n")
@@ -2553,6 +2606,7 @@ def main():
         pyramid_image_active = curr_epoch_1_based >= args.pyramid_image_start_epoch
         active_pyramid_image_weight = args.pyramid_image_weight if pyramid_image_active else 0.0
         active_sbc_weight = args.sbc_weight if args.use_sbc and curr_epoch_1_based >= args.sbc_start_epoch else 0.0
+        active_dess_weight = args.dess_weight if args.use_dess and curr_epoch_1_based >= args.dess_start_epoch else 0.0
         avg_loss, train_boundary_loss, last_img_loss, last_grad_loss, avg_grad_norm, update_ratio = train_epoch(
             model=model,
             dataloader=train_loader,
@@ -2577,6 +2631,10 @@ def main():
             saor_loss_fn=saor_loss_fn,
             sbc_weight=active_sbc_weight,
             sbc_stage_weight=args.sbc_stage_weight,
+            dess_weight=active_dess_weight,
+            dess_probability=args.dess_probability,
+            dess_max_displacement=args.dess_max_displacement,
+            dess_coarse_scale=args.dess_coarse_scale,
         )
 
         # -----------------------------

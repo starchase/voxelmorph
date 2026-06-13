@@ -47,6 +47,47 @@ def symmetric_displacement_composition_loss(
     return final_loss + float(stage_weight) * stage_loss / len(paired_stages)
 
 
+@torch.no_grad()
+def random_diffeomorphic_displacement(
+    reference,
+    spatial_transform,
+    max_displacement=3.0,
+    coarse_scale=0.125,
+    integration_steps=5,
+):
+    """Generate a smooth random displacement in full-resolution voxel units."""
+    spatial_shape = reference.shape[2:]
+    coarse_shape = tuple(max(4, int(round(size * coarse_scale))) for size in spatial_shape)
+    velocity = torch.randn(
+        reference.shape[0],
+        len(spatial_shape),
+        *coarse_shape,
+        device=reference.device,
+        dtype=torch.float32,
+    )
+    velocity = F.interpolate(velocity, size=spatial_shape, mode='trilinear', align_corners=True)
+    velocity = float(max_displacement) * torch.tanh(velocity)
+    displacement = velocity / (2 ** int(integration_steps))
+    for _ in range(int(integration_steps)):
+        displacement = displacement + spatial_transform(displacement, displacement)
+    return displacement
+
+
+def deformation_equivariance_loss(
+    spatial_transform,
+    base_displacement,
+    perturbed_displacement,
+    target_perturbation,
+):
+    """Match a prediction to the known target-space deformation composition."""
+    with torch.no_grad():
+        expected = target_perturbation.float() + spatial_transform(
+            base_displacement.detach().float(),
+            target_perturbation.float(),
+        )
+    return F.smooth_l1_loss(perturbed_displacement.float(), expected, beta=1.0)
+
+
 class StructureAdaptiveOptimizationRegularization(nn.Module):
     """Structure-aware smoothness with high-deformation risk protection."""
 
