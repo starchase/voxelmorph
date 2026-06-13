@@ -987,6 +987,7 @@ def train_epoch(
     pyramid_image_weight: float = 0.0,
     pyramid_image_weights: tuple = (),
     residual_flow_reg_weight: float = 0.0,
+    saor_loss_fn: nn.Module = None,
 ) -> float:
     model.train()
     total_loss = 0.0
@@ -1059,7 +1060,7 @@ def train_epoch(
             else:
                 img_loss = -image_loss_fn(target_float, warped_float).mean()
         
-        grad_loss = grad_loss_fn(displacement.float()).mean()
+        grad_loss = saor_loss_fn(displacement.float(), target_float) if saor_loss_fn is not None else grad_loss_fn(displacement.float()).mean()
         boundary_loss = displacement.new_tensor(0.0)
         if boundary_loss_fn is not None and boundary_loss_weight > 0:
             boundary_loss = boundary_loss_fn(warped_float, target_float, mask=boundary_ring_mask)
@@ -1166,6 +1167,10 @@ def main():
     parser.add_argument('--pyramid-image-weights', type=str, default='0.2,0.35,0.5', help='Comma-separated relative weights for intermediate pyramid image supervision from coarse to fine')
     parser.add_argument('--pyramid-image-start-epoch', type=int, default=1, help='Enable pyramid image supervision starting from this 1-based epoch')
     parser.add_argument('--residual-flow-reg-weight', type=float, default=0.0, help='Weight for gradient regularization on per-stage residual flow heads')
+    parser.add_argument('--use-saor', action='store_true', help='Replace fixed final-flow smoothness with structure-adaptive optimization regularization')
+    parser.add_argument('--saor-alpha', type=float, default=3.0, help='Structure sensitivity of SAOR')
+    parser.add_argument('--saor-risk-gamma', type=float, default=0.5, help='Strength of SAOR high-deformation risk protection')
+    parser.add_argument('--saor-risk-threshold', type=float, default=0.5, help='Gradient-magnitude threshold for SAOR risk protection')
     parser.add_argument('--use-pdaps', action='store_true', help='Use Pyramid-guided Deformation-Aware Progressive Skip')
     parser.add_argument('--pdaps-flow-limit', type=float, default=20.0, help='Maximum physical flow limit for P-DAPS. E.g., 20.0 for Brain, 30.0+ for Abdomen CT/MRI.')
     parser.add_argument('--use-daps', action='store_true', help='Use original DAPS')
@@ -1257,6 +1262,8 @@ def main():
         parser.error('--miscv-search-radius must be at least 1.')
     if args.use_miscv and args.miscv_temperature <= 0:
         parser.error('--miscv-temperature must be positive.')
+    if args.use_saor and (args.saor_alpha < 0 or args.saor_risk_gamma < 0 or args.saor_risk_threshold < 0):
+        parser.error('SAOR parameters must be non-negative.')
     if args.boundary_ring_inner_kernel < 1 or args.boundary_ring_outer_kernel < 1:
         parser.error('--boundary-ring-inner-kernel and --boundary-ring-outer-kernel must be positive integers.')
     if args.boundary_ring_outer_kernel < args.boundary_ring_inner_kernel:
@@ -1334,6 +1341,13 @@ def main():
         image_loss_fn_coarse = ne.nn.modules.MSE()
         
     grad_loss_fn = ne.nn.modules.SpatialGradient('l2')
+    saor_loss_fn = None
+    if args.use_saor:
+        saor_loss_fn = vxm.nn.losses.StructureAdaptiveOptimizationRegularization(
+            alpha=args.saor_alpha,
+            risk_gamma=args.saor_risk_gamma,
+            risk_threshold=args.saor_risk_threshold,
+        ).to(device)
     boundary_loss_fn = None
     if args.use_boundary_loss:
         boundary_loss_fn = vxm.nn.losses.BoundaryConsistencyLoss(
@@ -1442,6 +1456,10 @@ def main():
         f.write(f"Use Error-Guided Residual: {args.use_error_guided_residual}\n")
         f.write(f"Residual Flow Limit: {args.residual_flow_limit}\n")
         f.write(f"Residual Flow Reg Weight: {args.residual_flow_reg_weight}\n")
+        f.write(f"Use SAOR: {args.use_saor}\n")
+        f.write(f"SAOR Alpha: {args.saor_alpha}\n")
+        f.write(f"SAOR Risk Gamma: {args.saor_risk_gamma}\n")
+        f.write(f"SAOR Risk Threshold: {args.saor_risk_threshold}\n")
         f.write(f"Cross-Mamba Offset Limit: {args.cross_mamba_offset_limit}\n")
         f.write(f"Cross-Mamba Offset Smooth Kernel: {args.cross_mamba_offset_smooth_kernel}\n")
         f.write(f"Use SDMR: {args.use_sdmr}\n")
@@ -1504,6 +1522,7 @@ def main():
             pyramid_image_weight=active_pyramid_image_weight,
             pyramid_image_weights=pyramid_image_weights,
             residual_flow_reg_weight=args.residual_flow_reg_weight,
+            saor_loss_fn=saor_loss_fn,
         )
         loss_history.append(avg_loss)
         

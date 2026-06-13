@@ -14,6 +14,41 @@ import numpy as np
 from .modules import FixedGradientMagnitude3D
 
 
+class StructureAdaptiveOptimizationRegularization(nn.Module):
+    """Structure-aware smoothness with high-deformation risk protection."""
+
+    def __init__(self, alpha=3.0, risk_gamma=0.5, risk_threshold=0.5, eps=1e-6):
+        super().__init__()
+        self.alpha = float(alpha)
+        self.risk_gamma = float(risk_gamma)
+        self.risk_threshold = float(risk_threshold)
+        self.eps = float(eps)
+
+    @staticmethod
+    def _diff(value, dim):
+        difference = value.diff(dim=dim)
+        pad = [0, 0, 0, 0, 0, 0]
+        pad[2 * (4 - dim) + 1] = 1
+        return F.pad(difference, tuple(pad), mode='replicate')
+
+    def forward(self, displacement, fixed_image):
+        displacement = displacement.float()
+        fixed_image = fixed_image.float()
+        image_gradient = torch.sqrt(sum(
+            self._diff(fixed_image, dim).square() for dim in (2, 3, 4)
+        ) + self.eps)
+        gradient_scale = image_gradient.mean(dim=(2, 3, 4), keepdim=True).clamp_min(self.eps)
+        normalized_structure = (image_gradient / gradient_scale).clamp(max=5.0)
+        structure_weight = torch.exp(-self.alpha * normalized_structure)
+
+        flow_diffs = [self._diff(displacement, dim) for dim in (2, 3, 4)]
+        flow_energy = sum(diff.square() for diff in flow_diffs).mean(dim=1, keepdim=True)
+        risk_weight = torch.sigmoid(8.0 * (torch.sqrt(flow_energy + self.eps) - self.risk_threshold))
+        weight = structure_weight + self.risk_gamma * risk_weight
+        weight = weight / weight.mean(dim=(2, 3, 4), keepdim=True).clamp_min(self.eps)
+        return (weight * flow_energy).mean()
+
+
 class NCC:
     """
     Local (over window) normalized cross correlation loss.
