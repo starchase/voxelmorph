@@ -779,6 +779,7 @@ class SiameseUNetBaseline(nn.Module):
                  use_sdmr=False, sdmr_use_mind=True, sdmr_scale=0.125, sdmr_hidden_channels=16, sdmr_flow_limit=1.0, sdmr_alpha=0.5,
                  use_dpfc=False, dpfc_flow_limit=8.0, use_miscv=False, miscv_scales='1/8,1/4',
                  use_sscc=False, sscc_scales='1/16,1/8', sscc_hidden_channels=16, sscc_strength=0.2,
+                 use_cagr=False, cagr_strength=0.5,
                  miscv_projection_channels=8, miscv_search_radius=2, miscv_temperature=0.1):
         super().__init__()
         self.inshape = inshape
@@ -794,6 +795,8 @@ class SiameseUNetBaseline(nn.Module):
         self.miscv_scales = self._parse_decoder_scales(miscv_scales)
         self.use_sscc = bool(use_sscc)
         self.sscc_scales = self._parse_cross_mamba_scales(sscc_scales)
+        self.use_cagr = bool(use_cagr)
+        self.cagr_strength = float(cagr_strength)
         self.use_error_guided_residual = use_error_guided_residual
         self.error_guided_metric = error_guided_metric
         self.use_sdmr = use_sdmr
@@ -1056,6 +1059,7 @@ class SiameseUNetBaseline(nn.Module):
         if self.use_dpfc:
             self.dpfc_residual_blocks = nn.ModuleList()
             self.dpfc_velocity_heads = nn.ModuleList()
+            self.cagr_confidence_heads = nn.ModuleList()
             for i, nf in enumerate(dec_nf):
                 miscv_channels = 6 if str(i) in self.miscv_blocks else 0
                 residual_block = ConvBlock(ndim, nf + ndim + 2 + miscv_channels, nf, stride=1)
@@ -1064,6 +1068,10 @@ class SiameseUNetBaseline(nn.Module):
                 velocity_head.bias.data.zero_()
                 self.dpfc_residual_blocks.append(residual_block)
                 self.dpfc_velocity_heads.append(velocity_head)
+                confidence_head = Conv(nf, 1, kernel_size=3, padding=1)
+                confidence_head.weight.data.zero_()
+                confidence_head.bias.data.zero_()
+                self.cagr_confidence_heads.append(confidence_head)
             full_resolution_limits = [
                 self.dpfc_flow_limit / (2 ** i)
                 for i in range(len(dec_nf))
@@ -1595,6 +1603,10 @@ class SiameseUNetBaseline(nn.Module):
                 )
                 raw_local_velocity = self.dpfc_velocity_heads[i](residual_feature)
                 local_velocity = local_limit * torch.tanh(raw_local_velocity / local_limit)
+                if self.use_cagr:
+                    confidence_logits = self.cagr_confidence_heads[i](residual_feature)
+                    confidence_scale = 1.0 + self.cagr_strength * (2.0 * torch.sigmoid(confidence_logits) - 1.0)
+                    local_velocity = local_velocity * confidence_scale
                 residual_flows.append(local_velocity)
                 local_displacement = self.integrate(local_velocity)
 

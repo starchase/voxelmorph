@@ -2121,6 +2121,8 @@ def main():
     parser.add_argument('--sscc-scales', type=str, default='1/16,1/8', help='Comma-separated encoder scales for SSCC')
     parser.add_argument('--sscc-hidden-channels', type=int, default=16, help='Hidden channels in SSCC coordinate projection')
     parser.add_argument('--sscc-strength', type=float, default=0.2, help='Maximum SSCC feature calibration strength')
+    parser.add_argument('--use-cagr', action='store_true', help='Use confidence-aware gated refinement inside C2F-RDC')
+    parser.add_argument('--cagr-strength', type=float, default=0.5, help='Maximum multiplicative confidence modulation around neutral scale 1')
     parser.add_argument('--use-error-guided-residual', action='store_true', help='Enhance residual flow pyramid with Structure-aware & Error-guided side branch')
     parser.add_argument("--error-guided-metric", type=str, default="feature_ncc", choices=["feature_ncc", "mind"], help="Metric to compute error maps for guidance")
     parser.add_argument('--residual-flow-limit', type=float, default=4.0, help='Per-stage magnitude cap for residual flow heads when residual flow pyramid is enabled')
@@ -2222,6 +2224,10 @@ def main():
         parser.error('--miscv-temperature must be positive.')
     if args.sscc_hidden_channels <= 0 or args.sscc_strength <= 0:
         parser.error('--sscc-hidden-channels and --sscc-strength must be positive.')
+    if args.use_cagr and not args.use_dpfc:
+        parser.error('--use-cagr requires --use-dpfc.')
+    if args.cagr_strength < 0 or args.cagr_strength >= 1:
+        parser.error('--cagr-strength must be in [0, 1).')
     if args.use_saor and (args.saor_alpha < 0 or args.saor_risk_gamma < 0 or args.saor_risk_threshold < 0):
         parser.error('SAOR parameters must be non-negative.')
     if args.use_sbc and not args.use_dpfc:
@@ -2331,6 +2337,8 @@ def main():
             sscc_scales=args.sscc_scales,
             sscc_hidden_channels=args.sscc_hidden_channels,
             sscc_strength=args.sscc_strength,
+            use_cagr=args.use_cagr,
+            cagr_strength=args.cagr_strength,
                 use_error_guided_residual=args.use_error_guided_residual,
                 error_guided_metric=args.error_guided_metric,
             residual_flow_limit=args.residual_flow_limit,
@@ -2540,6 +2548,8 @@ def main():
         f.write(f"SSCC Scales: {args.sscc_scales}\n")
         f.write(f"SSCC Hidden Channels: {args.sscc_hidden_channels}\n")
         f.write(f"SSCC Strength: {args.sscc_strength}\n")
+        f.write(f"Use CAGR: {args.use_cagr}\n")
+        f.write(f"CAGR Strength: {args.cagr_strength}\n")
         f.write(f"Use Error-Guided Residual: {args.use_error_guided_residual}\n")
         f.write(f"Residual Flow Limit: {args.residual_flow_limit}\n")
         f.write(f"Pyramid Image Weight: {args.pyramid_image_weight}\n")
