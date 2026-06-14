@@ -1059,7 +1059,8 @@ class SiameseUNetBaseline(nn.Module):
         if self.use_dpfc:
             self.dpfc_residual_blocks = nn.ModuleList()
             self.dpfc_velocity_heads = nn.ModuleList()
-            self.cagr_confidence_heads = nn.ModuleList()
+            if self.use_cagr:
+                self.cagr_confidence_heads = nn.ModuleList()
             for i, nf in enumerate(dec_nf):
                 miscv_channels = 6 if str(i) in self.miscv_blocks else 0
                 residual_block = ConvBlock(ndim, nf + ndim + 2 + miscv_channels, nf, stride=1)
@@ -1068,10 +1069,11 @@ class SiameseUNetBaseline(nn.Module):
                 velocity_head.bias.data.zero_()
                 self.dpfc_residual_blocks.append(residual_block)
                 self.dpfc_velocity_heads.append(velocity_head)
-                confidence_head = Conv(nf, 1, kernel_size=3, padding=1)
-                confidence_head.weight.data.zero_()
-                confidence_head.bias.data.zero_()
-                self.cagr_confidence_heads.append(confidence_head)
+                if self.use_cagr:
+                    confidence_head = Conv(nf, 1, kernel_size=3, padding=1)
+                    confidence_head.weight.data.zero_()
+                    confidence_head.bias.data.zero_()
+                    self.cagr_confidence_heads.append(confidence_head)
             full_resolution_limits = [
                 self.dpfc_flow_limit / (2 ** i)
                 for i in range(len(dec_nf))
