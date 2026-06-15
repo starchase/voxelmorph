@@ -2153,6 +2153,8 @@ def main():
     parser.add_argument('--cross-mamba-scales', type=str, default='1/16,1/8', help='Comma-separated deep scales for Cross-Mamba, e.g. 1/16 or 1/16,1/8,1/4,1/2')
     parser.add_argument('--cross-mamba-offset-limit', type=float, default=0.0, help='Feature-space resampling offset cap inside Cross-Mamba; 0 disables offset limiting/resampling regularization for cleaner ablations')
     parser.add_argument('--cross-mamba-offset-smooth-kernel', type=int, default=1, help='Odd average-pooling kernel for smoothing Cross-Mamba offsets; 1 disables smoothing')
+    parser.add_argument('--cross-mamba-no-resampling', dest='cross_mamba_use_resampling', action='store_false', help='Disable Cross-Mamba feature-grid resampling and keep only semantic cross-context fusion')
+    parser.set_defaults(cross_mamba_use_resampling=True)
     parser.add_argument('--use-wcv', action='store_true', help='Use window cost volume on deep skip features')
     parser.add_argument('--use-swcv', action='store_true', help='Use structure-aware window cost volume on deep skip features')
     parser.add_argument('--use-gcv', action='store_true', help='Use global cost volume on deep features')
@@ -2312,6 +2314,7 @@ def main():
             cross_mamba_scales=getattr(args, 'cross_mamba_scales', '1/16,1/8'),
             cross_mamba_offset_limit=args.cross_mamba_offset_limit,
             cross_mamba_offset_smooth_kernel=args.cross_mamba_offset_smooth_kernel,
+            cross_mamba_use_resampling=args.cross_mamba_use_resampling,
             use_wcv=(args.use_wcv or args.use_wmca),
             use_swcv=args.use_swcv,
             use_gcv=args.use_gcv,
@@ -2589,6 +2592,7 @@ def main():
         f.write(f"DRFC Strength: {args.drfc_strength}\n")
         f.write(f"Cross-Mamba Offset Limit: {args.cross_mamba_offset_limit}\n")
         f.write(f"Cross-Mamba Offset Smooth Kernel: {args.cross_mamba_offset_smooth_kernel}\n")
+        f.write(f"Cross-Mamba Use Resampling: {args.cross_mamba_use_resampling}\n")
         f.write(f"Use SDMR: {args.use_sdmr}\n")
         f.write(f"SDMR Use MIND: {args.sdmr_use_mind}\n")
         f.write(f"SDMR Scale: {args.sdmr_scale}\n")
