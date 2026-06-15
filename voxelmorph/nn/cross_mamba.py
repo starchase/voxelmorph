@@ -18,12 +18,16 @@ class CrossMambaModule(nn.Module):
         use_resampling=True,
         offset_limit=0.75,
         offset_smooth_kernel=3,
+        use_structure_norm=False,
+        residual_scale=1.0,
     ):
         super().__init__()
         self.channels = channels
         self.use_resampling = use_resampling
         self.offset_limit = float(offset_limit)
         self.offset_smooth_kernel = int(offset_smooth_kernel)
+        self.use_structure_norm = bool(use_structure_norm)
+        self.residual_scale = float(residual_scale)
         
         # 3D learnable positional embedding (optional but highly recommended for 1D scanning)
         # 用一个极小的晶格尺寸 (10x12x10) 作为连续位置编码的种子，大大降低参数量
@@ -58,6 +62,7 @@ class CrossMambaModule(nn.Module):
         
         self.act = nn.GELU()
         self.norm = nn.InstanceNorm3d(channels)
+        self.input_norm = nn.InstanceNorm3d(channels, affine=False)
 
     def _regularize_offset(self, offset):
         if self.offset_limit > 0:
@@ -81,13 +86,19 @@ class CrossMambaModule(nn.Module):
         else:
             pos_embed = self.pos_embed
 
-        source = source + pos_embed
-        target = target + pos_embed
+        if self.use_structure_norm:
+            residual_source = source
+            scan_source = self.input_norm(source.float()).to(dtype=source.dtype) + pos_embed
+            scan_target = self.input_norm(target.float()).to(dtype=target.dtype) + pos_embed
+        else:
+            scan_source = source + pos_embed
+            scan_target = target + pos_embed
+            residual_source = scan_source
 
         # 防雷机制：强制转成 FP32 运算，防止 Mamba 在半精度下的指数运算爆炸
-        B, C, D, H, W = source.shape
-        src_fp32 = source.float()
-        tgt_fp32 = target.float()
+        B, C, D, H, W = scan_source.shape
+        src_fp32 = scan_source.float()
+        tgt_fp32 = scan_target.float()
         
         out_features = []
         
@@ -126,7 +137,7 @@ class CrossMambaModule(nn.Module):
             mask = torch.sigmoid(self.mask_conv(mamba_guidance))  # (B, C, D, H, W)
             
             # 2. 构建特征级的仿射网格 (Feature Grid)
-            device, dtype = source.device, source.dtype
+            device, dtype = scan_source.device, scan_source.dtype
             vectors = [torch.arange(0, s, device=device, dtype=dtype) for s in (D, H, W)]
             grids = torch.meshgrid(vectors, indexing='ij')
             base_grid = torch.stack(grids).unsqueeze(0).expand(B, -1, -1, -1, -1) # (B, 3, D, H, W)
@@ -145,7 +156,7 @@ class CrossMambaModule(nn.Module):
             
             # 3. 对 Source 进行双线性可变形重采样。修改 padding_mode 为 'border' 防止边界黑边伪影
             resampled_source = nn.functional.grid_sample(
-                source, normalized_grid, 
+                residual_source, normalized_grid,
                 mode='bilinear', padding_mode='border', align_corners=True
             )
             
@@ -156,12 +167,12 @@ class CrossMambaModule(nn.Module):
             cat_feat = torch.cat([modulated_source, mamba_guidance], dim=1)
             refined_fused = self.fuse_local(cat_feat)
             
-            return self.norm(self.act(refined_fused) + source)
+            return self.norm(residual_source + self.residual_scale * self.act(refined_fused))
         else:
             # 退回原始的特征直接加法融合逻辑，取消重采样模块的介入
-            cat_feat = torch.cat([source, mamba_guidance], dim=1)
+            cat_feat = torch.cat([residual_source, mamba_guidance], dim=1)
             refined_fused = self.fuse_local(cat_feat)
-            return self.norm(self.act(refined_fused) + source)
+            return self.norm(residual_source + self.residual_scale * self.act(refined_fused))
         
     def _scan_and_extract(self, seq_s, seq_t, D, H, W, order='z', reverse=False):
         B, L, C = seq_s.shape

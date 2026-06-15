@@ -123,6 +123,8 @@ def build_registration_model(args, device):
             cross_mamba_offset_limit=getattr(args, 'cross_mamba_offset_limit', 0.0),
             cross_mamba_offset_smooth_kernel=getattr(args, 'cross_mamba_offset_smooth_kernel', 1),
             cross_mamba_use_resampling=getattr(args, 'cross_mamba_use_resampling', True),
+            cross_mamba_structure_norm=getattr(args, 'cross_mamba_structure_norm', False),
+            cross_mamba_residual_scale=getattr(args, 'cross_mamba_residual_scale', 1.0),
             use_wcv=args.use_wcv,
             use_swcv=args.use_swcv,
             use_gcv=args.use_gcv,
@@ -1287,6 +1289,8 @@ def main():
     parser.add_argument('--cross-mamba-offset-smooth-kernel', type=int, default=1, help='Odd average-pooling kernel for smoothing Cross-Mamba offsets; 1 disables smoothing')
     parser.add_argument('--cross-mamba-no-resampling', dest='cross_mamba_use_resampling', action='store_false', help='Disable Cross-Mamba feature-grid resampling and keep only semantic cross-context fusion')
     parser.set_defaults(cross_mamba_use_resampling=True)
+    parser.add_argument('--cross-mamba-structure-norm', action='store_true', help='Use instance-normalized structure features for Cross-Mamba token interaction')
+    parser.add_argument('--cross-mamba-residual-scale', type=float, default=1.0, help='Residual injection scale for Cross-Mamba output')
     parser.add_argument('--use-wcv', action='store_true', help='Enable window cross-attention on shallow skip features')
     parser.add_argument('--use-swcv', action='store_true', help='Enable Structure-Aware WCV on deep skip features')
     parser.add_argument('--use-gcv', action='store_true', help='Enable global cost volume on deep features')
@@ -1604,6 +1608,8 @@ def main():
         f.write(f"Cross-Mamba Offset Limit: {args.cross_mamba_offset_limit}\n")
         f.write(f"Cross-Mamba Offset Smooth Kernel: {args.cross_mamba_offset_smooth_kernel}\n")
         f.write(f"Cross-Mamba Use Resampling: {args.cross_mamba_use_resampling}\n")
+        f.write(f"Cross-Mamba Structure Norm: {args.cross_mamba_structure_norm}\n")
+        f.write(f"Cross-Mamba Residual Scale: {args.cross_mamba_residual_scale}\n")
         f.write(f"Use SDMR: {args.use_sdmr}\n")
         f.write(f"SDMR Use MIND: {args.sdmr_use_mind}\n")
         f.write(f"SDMR Scale: {args.sdmr_scale}\n")
