@@ -769,7 +769,7 @@ class SiameseUNetBaseline(nn.Module):
     """
     def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False, use_pdaps=False, use_dsin=False, use_cmim=False, use_cross_mamba=False, use_wcv=False,
                  cross_mamba_scales='1/16,1/8',
-                 use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, mamba_enc_shallow_multi=None, mamba_dec_shallow_multi=None, mamba_quarter_scale=False, mamba_dec_quarter_scale=False,  mamba_parallel_block=False, fusion_method='compress_concat', window_size=9, pdaps_flow_limit=20.0, use_residual_flow_pyramid=False, residual_flow_limit=4.0, use_error_guided_residual=False, error_guided_metric='feature_ncc',cross_mamba_offset_limit=0.0, cross_mamba_offset_smooth_kernel=1, cross_mamba_use_resampling=True, cross_mamba_structure_norm=False, cross_mamba_residual_scale=1.0, use_boundary_branch=False,
+                 use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, mamba_enc_shallow_multi=None, mamba_dec_shallow_multi=None, mamba_quarter_scale=False, mamba_dec_quarter_scale=False,  mamba_parallel_block=False, fusion_method='compress_concat', window_size=9, pdaps_flow_limit=20.0, use_residual_flow_pyramid=False, residual_flow_limit=4.0, use_error_guided_residual=False, error_guided_metric='feature_ncc',cross_mamba_offset_limit=0.0, cross_mamba_offset_smooth_kernel=1, cross_mamba_use_resampling=True, cross_mamba_structure_norm=False, cross_mamba_residual_scale=1.0, cross_mamba_residual_scales='', cross_mamba_start_epochs='', use_boundary_branch=False,
                  boundary_branch_scales='deep', boundary_branch_strength=0.5, boundary_kernel='sobel', boundary_smooth_kernel=3,
                  use_cross_frequency_modulation=False, cross_frequency_scales='1/8,1/4', frequency_low_ratio=0.25, cross_frequency_structure_calibration=False,
                  spectral_window_size=4, spectral_temperature=0.1, spectral_guidance_strength=0.5,
@@ -835,6 +835,21 @@ class SiameseUNetBaseline(nn.Module):
         self.cross_mamba_use_resampling = bool(cross_mamba_use_resampling)
         self.cross_mamba_structure_norm = bool(cross_mamba_structure_norm)
         self.cross_mamba_residual_scale = float(cross_mamba_residual_scale)
+        self.cross_mamba_residual_scales = self._parse_cross_mamba_scale_values(
+            cross_mamba_residual_scales,
+            self.cross_mamba_scales,
+            default=self.cross_mamba_residual_scale,
+            cast=float,
+            name='cross_mamba_residual_scales',
+        )
+        self.cross_mamba_start_epochs = self._parse_cross_mamba_scale_values(
+            cross_mamba_start_epochs,
+            self.cross_mamba_scales,
+            default=1,
+            cast=int,
+            name='cross_mamba_start_epochs',
+        )
+        self.cross_mamba_current_epoch = 1
         if mamba_enc_shallow_multi is None:
             mamba_enc_shallow_multi = mamba_shallow_multi
         if mamba_dec_shallow_multi is None:
@@ -911,7 +926,7 @@ class SiameseUNetBaseline(nn.Module):
                     offset_limit=self.cross_mamba_offset_limit,
                     offset_smooth_kernel=self.cross_mamba_offset_smooth_kernel,
                     use_structure_norm=self.cross_mamba_structure_norm,
-                    residual_scale=self.cross_mamba_residual_scale,
+                    residual_scale=self.cross_mamba_residual_scales['1/16'],
                 )
             if '1/8' in self.cross_mamba_scales:
                 self.cross_mamba_blocks['1_8'] = CrossMambaModule(
@@ -920,7 +935,7 @@ class SiameseUNetBaseline(nn.Module):
                     offset_limit=self.cross_mamba_offset_limit,
                     offset_smooth_kernel=self.cross_mamba_offset_smooth_kernel,
                     use_structure_norm=self.cross_mamba_structure_norm,
-                    residual_scale=self.cross_mamba_residual_scale,
+                    residual_scale=self.cross_mamba_residual_scales['1/8'],
                 )
             if '1/4' in self.cross_mamba_scales:
                 self.cross_mamba_blocks['1_4'] = CrossMambaModule(
@@ -929,7 +944,7 @@ class SiameseUNetBaseline(nn.Module):
                     offset_limit=self.cross_mamba_offset_limit,
                     offset_smooth_kernel=self.cross_mamba_offset_smooth_kernel,
                     use_structure_norm=self.cross_mamba_structure_norm,
-                    residual_scale=self.cross_mamba_residual_scale,
+                    residual_scale=self.cross_mamba_residual_scales['1/4'],
                 )
             if '1/2' in self.cross_mamba_scales:
                 self.cross_mamba_blocks['1_2'] = CrossMambaModule(
@@ -938,7 +953,7 @@ class SiameseUNetBaseline(nn.Module):
                     offset_limit=self.cross_mamba_offset_limit,
                     offset_smooth_kernel=self.cross_mamba_offset_smooth_kernel,
                     use_structure_norm=self.cross_mamba_structure_norm,
-                    residual_scale=self.cross_mamba_residual_scale,
+                    residual_scale=self.cross_mamba_residual_scales['1/2'],
                 )
             
         # 1.6 Window Cost Volume (WCV) at shallow scales
@@ -1351,6 +1366,38 @@ class SiameseUNetBaseline(nn.Module):
 
         return set(items)
 
+    @staticmethod
+    def _parse_cross_mamba_scale_values(values, scales, default, cast, name):
+        result = {scale: cast(default) for scale in scales}
+        if values is None or values == '':
+            return result
+        if isinstance(values, str):
+            items = [item.strip() for item in values.split(',') if item.strip()]
+        else:
+            items = [str(item).strip() for item in values if str(item).strip()]
+        if not items:
+            return result
+        if all(':' in item for item in items):
+            for item in items:
+                scale, value = [part.strip() for part in item.split(':', 1)]
+                if scale not in scales:
+                    raise ValueError(f'Unsupported scale {scale!r} in {name}. Enabled scales are {sorted(scales)}')
+                result[scale] = cast(value)
+            return result
+        ordered_scales = ['1/16', '1/8', '1/4', '1/2']
+        selected = [scale for scale in ordered_scales if scale in scales]
+        if len(items) != len(selected):
+            raise ValueError(f'{name} must provide {len(selected)} values for scales {selected}, got {len(items)}')
+        for scale, value in zip(selected, items):
+            result[scale] = cast(value)
+        return result
+
+    def set_cross_mamba_epoch(self, epoch):
+        self.cross_mamba_current_epoch = int(epoch)
+
+    def _is_cross_mamba_scale_active(self, scale):
+        return self.cross_mamba_current_epoch >= self.cross_mamba_start_epochs.get(scale, 1)
+
     def _parse_decoder_scales(self, scales):
         if scales is None:
             return set()
@@ -1420,7 +1467,7 @@ class SiameseUNetBaseline(nn.Module):
         # Start from the bottom-most features (1/16 scale)
         if self.use_cmim:
             feat_s[-1] = self.cmim_blocks[0](feat_s[-1], feat_t[-1])
-        elif getattr(self, 'use_cross_mamba', False) and '1_16' in self.cross_mamba_blocks:
+        elif getattr(self, 'use_cross_mamba', False) and '1_16' in self.cross_mamba_blocks and self._is_cross_mamba_scale_active('1/16'):
             feat_s[-1] = self.cross_mamba_blocks['1_16'](feat_s[-1], feat_t[-1])
         if getattr(self, 'use_wcv', False) and "bottleneck" in self.wcv_blocks:
             feat_s[-1] = self.wcv_blocks["bottleneck"](x_fixed=feat_t[-1], x_moving=feat_s[-1])
@@ -1461,11 +1508,11 @@ class SiameseUNetBaseline(nn.Module):
                 
                 # --- [Cross-Mamba at multi scales] ---
                 if getattr(self, 'use_cross_mamba', False):
-                    if skip_idx == len(feat_s) - 2 and '1_8' in self.cross_mamba_blocks:   # 1/8 scale
+                    if skip_idx == len(feat_s) - 2 and '1_8' in self.cross_mamba_blocks and self._is_cross_mamba_scale_active('1/8'):   # 1/8 scale
                         s_skip = self.cross_mamba_blocks['1_8'](s_skip, t_skip)
-                    elif skip_idx == len(feat_s) - 3 and '1_4' in self.cross_mamba_blocks: # 1/4 scale
+                    elif skip_idx == len(feat_s) - 3 and '1_4' in self.cross_mamba_blocks and self._is_cross_mamba_scale_active('1/4'): # 1/4 scale
                         s_skip = self.cross_mamba_blocks['1_4'](s_skip, t_skip)
-                    elif skip_idx == len(feat_s) - 4 and '1_2' in self.cross_mamba_blocks: # 1/2 scale
+                    elif skip_idx == len(feat_s) - 4 and '1_2' in self.cross_mamba_blocks and self._is_cross_mamba_scale_active('1/2'): # 1/2 scale
                         s_skip = self.cross_mamba_blocks['1_2'](s_skip, t_skip)
 
                 if self.use_dasr and str(i) in self.dasr_blocks:

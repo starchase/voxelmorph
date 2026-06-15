@@ -125,6 +125,8 @@ def build_registration_model(args, device):
             cross_mamba_use_resampling=getattr(args, 'cross_mamba_use_resampling', True),
             cross_mamba_structure_norm=getattr(args, 'cross_mamba_structure_norm', False),
             cross_mamba_residual_scale=getattr(args, 'cross_mamba_residual_scale', 1.0),
+            cross_mamba_residual_scales=getattr(args, 'cross_mamba_residual_scales', ''),
+            cross_mamba_start_epochs=getattr(args, 'cross_mamba_start_epochs', ''),
             use_wcv=args.use_wcv,
             use_swcv=args.use_swcv,
             use_gcv=args.use_gcv,
@@ -1291,6 +1293,8 @@ def main():
     parser.set_defaults(cross_mamba_use_resampling=True)
     parser.add_argument('--cross-mamba-structure-norm', action='store_true', help='Use instance-normalized structure features for Cross-Mamba token interaction')
     parser.add_argument('--cross-mamba-residual-scale', type=float, default=1.0, help='Residual injection scale for Cross-Mamba output')
+    parser.add_argument('--cross-mamba-residual-scales', type=str, default='', help='Comma-separated residual scales matching --cross-mamba-scales, or scale:value entries')
+    parser.add_argument('--cross-mamba-start-epochs', type=str, default='', help='Comma-separated start epochs matching --cross-mamba-scales, or scale:epoch entries')
     parser.add_argument('--use-wcv', action='store_true', help='Enable window cross-attention on shallow skip features')
     parser.add_argument('--use-swcv', action='store_true', help='Enable Structure-Aware WCV on deep skip features')
     parser.add_argument('--use-gcv', action='store_true', help='Enable global cost volume on deep features')
@@ -1610,6 +1614,8 @@ def main():
         f.write(f"Cross-Mamba Use Resampling: {args.cross_mamba_use_resampling}\n")
         f.write(f"Cross-Mamba Structure Norm: {args.cross_mamba_structure_norm}\n")
         f.write(f"Cross-Mamba Residual Scale: {args.cross_mamba_residual_scale}\n")
+        f.write(f"Cross-Mamba Residual Scales: {args.cross_mamba_residual_scales}\n")
+        f.write(f"Cross-Mamba Start Epochs: {args.cross_mamba_start_epochs}\n")
         f.write(f"Use SDMR: {args.use_sdmr}\n")
         f.write(f"SDMR Use MIND: {args.sdmr_use_mind}\n")
         f.write(f"SDMR Scale: {args.sdmr_scale}\n")
@@ -1640,6 +1646,8 @@ def main():
     for epoch in range(args.start_epoch - 1, args.epochs):
         epoch_start_time = time.time()
         epoch_num = epoch + 1
+        if hasattr(model, 'set_cross_mamba_epoch'):
+            model.set_cross_mamba_epoch(epoch_num)
         boundary_loss_active = args.use_boundary_loss and (epoch_num > args.boundary_loss_start_epoch)
         active_boundary_loss_weight = args.boundary_loss_weight if boundary_loss_active else 0.0
         feature_edge_active = args.use_feature_edge_loss and (epoch_num >= args.feature_edge_start_epoch)
