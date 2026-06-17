@@ -769,7 +769,7 @@ class SiameseUNetBaseline(nn.Module):
     """
     def __init__(self, inshape, in_channels=1, enc_nf=[16, 32, 32, 32], dec_nf=[32, 32, 32, 16], ndim=3, int_steps=0, decouple_layers=2, use_daps=False, use_pdaps=False, use_dsin=False, use_cmim=False, use_cross_mamba=False, use_wcv=False,
                  cross_mamba_scales='1/16,1/8',
-                 use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, mamba_enc_shallow_multi=None, mamba_dec_shallow_multi=None, mamba_quarter_scale=False, mamba_dec_quarter_scale=False,  mamba_parallel_block=False, fusion_method='compress_concat', window_size=9, pdaps_flow_limit=20.0, use_residual_flow_pyramid=False, residual_flow_limit=4.0, use_error_guided_residual=False, error_guided_metric='feature_ncc',cross_mamba_offset_limit=0.0, cross_mamba_offset_smooth_kernel=1, cross_mamba_use_resampling=True, cross_mamba_structure_norm=False, cross_mamba_residual_scale=1.0, cross_mamba_residual_scales='', cross_mamba_start_epochs='', use_boundary_branch=False,
+                 use_swcv=False, use_gcv=False, encoder_type='cnn', mamba_shallow_multi=False, mamba_enc_shallow_multi=None, mamba_dec_shallow_multi=None, mamba_quarter_scale=False, mamba_dec_quarter_scale=False,  mamba_parallel_block=False, fusion_method='compress_concat', window_size=9, pdaps_flow_limit=20.0, use_residual_flow_pyramid=False, residual_flow_limit=4.0, use_error_guided_residual=False, error_guided_metric='feature_ncc',cross_mamba_offset_limit=0.0, cross_mamba_offset_smooth_kernel=1, cross_mamba_use_resampling=True, cross_mamba_structure_norm=False, cross_mamba_residual_scale=1.0, cross_mamba_residual_scales='', cross_mamba_start_epochs='', use_acf_cross_mamba=False, acf_hidden_channels=16, acf_min_gate=0.25, cross_mamba_structured_interaction=False, cross_mamba_structure_edge_weight=0.5, cross_mamba_structure_min_gate=0.2, cross_mamba_channel_gate=False, cross_mamba_channel_gate_min=0.25, use_boundary_branch=False,
                  boundary_branch_scales='deep', boundary_branch_strength=0.5, boundary_kernel='sobel', boundary_smooth_kernel=3,
                  use_cross_frequency_modulation=False, cross_frequency_scales='1/8,1/4', frequency_low_ratio=0.25, cross_frequency_structure_calibration=False,
                  spectral_window_size=4, spectral_temperature=0.1, spectral_guidance_strength=0.5,
@@ -779,7 +779,8 @@ class SiameseUNetBaseline(nn.Module):
                  use_sdmr=False, sdmr_use_mind=True, sdmr_scale=0.125, sdmr_hidden_channels=16, sdmr_flow_limit=1.0, sdmr_alpha=0.5,
                  use_dpfc=False, dpfc_flow_limit=8.0, use_miscv=False, miscv_scales='1/8,1/4',
                  use_sscc=False, sscc_scales='1/16,1/8', sscc_hidden_channels=16, sscc_strength=0.2,
-                 use_cagr=False, cagr_strength=0.5,
+                 use_cagr=False, cagr_strength=0.5, use_rrrc=False, rrrc_min_gate=0.2,
+                 use_rcc=False, rcc_strength=0.25, rcc_scales='all', rcc_start_epoch=1,
                  miscv_projection_channels=8, miscv_search_radius=2, miscv_temperature=0.1):
         super().__init__()
         self.inshape = inshape
@@ -797,6 +798,13 @@ class SiameseUNetBaseline(nn.Module):
         self.sscc_scales = self._parse_cross_mamba_scales(sscc_scales)
         self.use_cagr = bool(use_cagr)
         self.cagr_strength = float(cagr_strength)
+        self.use_rrrc = bool(use_rrrc)
+        self.rrrc_min_gate = float(rrrc_min_gate)
+        self.use_rcc = bool(use_rcc)
+        self.rcc_strength = float(rcc_strength)
+        self.rcc_scales = self._parse_rcc_scales(rcc_scales)
+        self.rcc_start_epoch = int(rcc_start_epoch)
+        self.rcc_current_epoch = 1
         self.use_error_guided_residual = use_error_guided_residual
         self.error_guided_metric = error_guided_metric
         self.use_sdmr = use_sdmr
@@ -835,6 +843,14 @@ class SiameseUNetBaseline(nn.Module):
         self.cross_mamba_use_resampling = bool(cross_mamba_use_resampling)
         self.cross_mamba_structure_norm = bool(cross_mamba_structure_norm)
         self.cross_mamba_residual_scale = float(cross_mamba_residual_scale)
+        self.use_acf_cross_mamba = bool(use_acf_cross_mamba)
+        self.acf_hidden_channels = int(acf_hidden_channels)
+        self.acf_min_gate = float(acf_min_gate)
+        self.cross_mamba_structured_interaction = bool(cross_mamba_structured_interaction)
+        self.cross_mamba_structure_edge_weight = float(cross_mamba_structure_edge_weight)
+        self.cross_mamba_structure_min_gate = float(cross_mamba_structure_min_gate)
+        self.cross_mamba_channel_gate = bool(cross_mamba_channel_gate)
+        self.cross_mamba_channel_gate_min = float(cross_mamba_channel_gate_min)
         self.cross_mamba_residual_scales = self._parse_cross_mamba_scale_values(
             cross_mamba_residual_scales,
             self.cross_mamba_scales,
@@ -866,6 +882,20 @@ class SiameseUNetBaseline(nn.Module):
             raise ValueError('use_dpfc requires int_steps > 0 for per-scale diffeomorphic integration')
         if self.use_dpfc and self.dpfc_flow_limit <= 0:
             raise ValueError('dpfc_flow_limit must be positive')
+        if self.use_cagr and not self.use_dpfc:
+            raise ValueError('CAGR requires use_dpfc=True')
+        if not (0 <= self.cagr_strength < 1):
+            raise ValueError('cagr_strength must be in [0, 1)')
+        if self.use_rrrc and not self.use_dpfc:
+            raise ValueError('RRRC requires use_dpfc=True')
+        if not (0 <= self.rrrc_min_gate < 1):
+            raise ValueError('rrrc_min_gate must be in [0, 1)')
+        if self.use_rcc and not self.use_dpfc:
+            raise ValueError('RCC requires use_dpfc=True')
+        if not (0 <= self.rcc_strength < 1):
+            raise ValueError('rcc_strength must be in [0, 1)')
+        if self.rcc_start_epoch < 1:
+            raise ValueError('rcc_start_epoch must be positive')
         if self.use_error_guided_residual and not self.use_residual_flow_pyramid:
             raise ValueError('use_error_guided_residual requires use_residual_flow_pyramid to be enabled')
         
@@ -927,6 +957,14 @@ class SiameseUNetBaseline(nn.Module):
                     offset_smooth_kernel=self.cross_mamba_offset_smooth_kernel,
                     use_structure_norm=self.cross_mamba_structure_norm,
                     residual_scale=self.cross_mamba_residual_scales['1/16'],
+                    use_acf=self.use_acf_cross_mamba,
+                    acf_hidden_channels=self.acf_hidden_channels,
+                    acf_min_gate=self.acf_min_gate,
+                    use_structured_interaction=self.cross_mamba_structured_interaction,
+                    structure_edge_weight=self.cross_mamba_structure_edge_weight,
+                    structure_min_gate=self.cross_mamba_structure_min_gate,
+                    use_channel_gate=self.cross_mamba_channel_gate,
+                    channel_gate_min=self.cross_mamba_channel_gate_min,
                 )
             if '1/8' in self.cross_mamba_scales:
                 self.cross_mamba_blocks['1_8'] = CrossMambaModule(
@@ -936,6 +974,14 @@ class SiameseUNetBaseline(nn.Module):
                     offset_smooth_kernel=self.cross_mamba_offset_smooth_kernel,
                     use_structure_norm=self.cross_mamba_structure_norm,
                     residual_scale=self.cross_mamba_residual_scales['1/8'],
+                    use_acf=self.use_acf_cross_mamba,
+                    acf_hidden_channels=self.acf_hidden_channels,
+                    acf_min_gate=self.acf_min_gate,
+                    use_structured_interaction=self.cross_mamba_structured_interaction,
+                    structure_edge_weight=self.cross_mamba_structure_edge_weight,
+                    structure_min_gate=self.cross_mamba_structure_min_gate,
+                    use_channel_gate=self.cross_mamba_channel_gate,
+                    channel_gate_min=self.cross_mamba_channel_gate_min,
                 )
             if '1/4' in self.cross_mamba_scales:
                 self.cross_mamba_blocks['1_4'] = CrossMambaModule(
@@ -945,6 +991,14 @@ class SiameseUNetBaseline(nn.Module):
                     offset_smooth_kernel=self.cross_mamba_offset_smooth_kernel,
                     use_structure_norm=self.cross_mamba_structure_norm,
                     residual_scale=self.cross_mamba_residual_scales['1/4'],
+                    use_acf=self.use_acf_cross_mamba,
+                    acf_hidden_channels=self.acf_hidden_channels,
+                    acf_min_gate=self.acf_min_gate,
+                    use_structured_interaction=self.cross_mamba_structured_interaction,
+                    structure_edge_weight=self.cross_mamba_structure_edge_weight,
+                    structure_min_gate=self.cross_mamba_structure_min_gate,
+                    use_channel_gate=self.cross_mamba_channel_gate,
+                    channel_gate_min=self.cross_mamba_channel_gate_min,
                 )
             if '1/2' in self.cross_mamba_scales:
                 self.cross_mamba_blocks['1_2'] = CrossMambaModule(
@@ -954,6 +1008,14 @@ class SiameseUNetBaseline(nn.Module):
                     offset_smooth_kernel=self.cross_mamba_offset_smooth_kernel,
                     use_structure_norm=self.cross_mamba_structure_norm,
                     residual_scale=self.cross_mamba_residual_scales['1/2'],
+                    use_acf=self.use_acf_cross_mamba,
+                    acf_hidden_channels=self.acf_hidden_channels,
+                    acf_min_gate=self.acf_min_gate,
+                    use_structured_interaction=self.cross_mamba_structured_interaction,
+                    structure_edge_weight=self.cross_mamba_structure_edge_weight,
+                    structure_min_gate=self.cross_mamba_structure_min_gate,
+                    use_channel_gate=self.cross_mamba_channel_gate,
+                    channel_gate_min=self.cross_mamba_channel_gate_min,
                 )
             
         # 1.6 Window Cost Volume (WCV) at shallow scales
@@ -983,6 +1045,7 @@ class SiameseUNetBaseline(nn.Module):
         
         # 2. Standard Decoder
         self.dec_blocks = nn.ModuleList()
+        self.decoder_scales = []
         self.ussc_blocks = nn.ModuleDict()
         self.dasr_blocks = nn.ModuleDict()
         self.miscv_blocks = nn.ModuleDict()
@@ -1067,6 +1130,7 @@ class SiameseUNetBaseline(nn.Module):
                 self.miscv_guidance[str(i)] = guidance
                 
             prev_channels = nf
+            self.decoder_scales.append(decoder_scale)
             
         # 3. Final Flow Prediction (Only at full resolution)
         Conv = getattr(nn, f'Conv{ndim}d')
@@ -1091,6 +1155,11 @@ class SiameseUNetBaseline(nn.Module):
             self.dpfc_velocity_heads = nn.ModuleList()
             if self.use_cagr:
                 self.cagr_confidence_heads = nn.ModuleList()
+            if self.use_rrrc:
+                self.rrrc_risk_heads = nn.ModuleList()
+            if self.use_rcc:
+                self.rcc_correction_blocks = nn.ModuleList()
+                self.rcc_correction_heads = nn.ModuleList()
             for i, nf in enumerate(dec_nf):
                 miscv_channels = 6 if str(i) in self.miscv_blocks else 0
                 residual_block = ConvBlock(ndim, nf + ndim + 2 + miscv_channels, nf, stride=1)
@@ -1104,6 +1173,21 @@ class SiameseUNetBaseline(nn.Module):
                     confidence_head.weight.data.zero_()
                     confidence_head.bias.data.zero_()
                     self.cagr_confidence_heads.append(confidence_head)
+                if self.use_rrrc:
+                    risk_head = Conv(nf, 1, kernel_size=3, padding=1)
+                    risk_head.weight.data.zero_()
+                    risk_head.bias.data.fill_(-6.0)
+                    self.rrrc_risk_heads.append(risk_head)
+                if self.use_rcc and self.decoder_scales[i] in self.rcc_scales:
+                    correction_block = ConvBlock(ndim, nf + ndim, nf, stride=1)
+                    correction_head = Conv(nf, ndim, kernel_size=3, padding=1)
+                    correction_head.weight.data.zero_()
+                    correction_head.bias.data.zero_()
+                    self.rcc_correction_blocks.append(correction_block)
+                    self.rcc_correction_heads.append(correction_head)
+                elif self.use_rcc:
+                    self.rcc_correction_blocks.append(nn.Identity())
+                    self.rcc_correction_heads.append(nn.Identity())
             full_resolution_limits = [
                 self.dpfc_flow_limit / (2 ** i)
                 for i in range(len(dec_nf))
@@ -1395,6 +1479,12 @@ class SiameseUNetBaseline(nn.Module):
     def set_cross_mamba_epoch(self, epoch):
         self.cross_mamba_current_epoch = int(epoch)
 
+    def set_rcc_epoch(self, epoch):
+        self.rcc_current_epoch = int(epoch)
+
+    def _is_rcc_active(self):
+        return self.rcc_current_epoch >= self.rcc_start_epoch
+
     def _is_cross_mamba_scale_active(self, scale):
         return self.cross_mamba_current_epoch >= self.cross_mamba_start_epochs.get(scale, 1)
 
@@ -1409,6 +1499,21 @@ class SiameseUNetBaseline(nn.Module):
         invalid = sorted(set(items) - valid)
         if invalid:
             raise ValueError(f'Unsupported USSC scales: {invalid}. Valid values are {sorted(valid)}')
+        return set(items)
+
+    def _parse_rcc_scales(self, scales):
+        valid = {'1/8', '1/4', '1/2', '1/1'}
+        if scales is None:
+            return set(valid)
+        if isinstance(scales, str):
+            if scales.strip().lower() == 'all':
+                return set(valid)
+            items = [item.strip() for item in scales.split(',') if item.strip()]
+        else:
+            items = [str(item).strip() for item in scales if str(item).strip()]
+        invalid = sorted(set(items) - valid)
+        if invalid:
+            raise ValueError(f'Unsupported RCC scales: {invalid}. Valid values are {sorted(valid)}')
         return set(items)
 
     def forward(self, source, target, return_warped_source=True, return_field_type='displacement', return_coarse_flows=False, return_residual_flows=False, return_feature_edge_loss=False, feature_edge_indices=(0, 1), swap_encoder_branches=False):
@@ -1671,6 +1776,18 @@ class SiameseUNetBaseline(nn.Module):
                     confidence_logits = self.cagr_confidence_heads[i](residual_feature)
                     confidence_scale = 1.0 + self.cagr_strength * (2.0 * torch.sigmoid(confidence_logits) - 1.0)
                     local_velocity = local_velocity * confidence_scale
+                if self.use_rrrc:
+                    risk = torch.sigmoid(self.rrrc_risk_heads[i](residual_feature))
+                    reliability_gate = 1.0 - (1.0 - self.rrrc_min_gate) * risk
+                    local_velocity = local_velocity * reliability_gate.to(dtype=local_velocity.dtype)
+                if self.use_rcc and self._is_rcc_active() and self.decoder_scales[i] in self.rcc_scales:
+                    normalized_velocity = local_velocity / local_limit
+                    correction_feature = self.rcc_correction_blocks[i](
+                        torch.cat([residual_feature, normalized_velocity], dim=1)
+                    )
+                    raw_correction = self.rcc_correction_heads[i](correction_feature)
+                    correction = self.rcc_strength * local_limit * torch.tanh(raw_correction / local_limit)
+                    local_velocity = local_velocity + correction
                 residual_flows.append(local_velocity)
                 local_displacement = self.integrate(local_velocity)
 

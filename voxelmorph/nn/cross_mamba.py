@@ -20,6 +20,14 @@ class CrossMambaModule(nn.Module):
         offset_smooth_kernel=3,
         use_structure_norm=False,
         residual_scale=1.0,
+        use_acf=False,
+        acf_hidden_channels=16,
+        acf_min_gate=0.25,
+        use_structured_interaction=False,
+        structure_edge_weight=0.5,
+        structure_min_gate=0.2,
+        use_channel_gate=False,
+        channel_gate_min=0.25,
     ):
         super().__init__()
         self.channels = channels
@@ -28,6 +36,13 @@ class CrossMambaModule(nn.Module):
         self.offset_smooth_kernel = int(offset_smooth_kernel)
         self.use_structure_norm = bool(use_structure_norm)
         self.residual_scale = float(residual_scale)
+        self.use_acf = bool(use_acf)
+        self.acf_min_gate = float(acf_min_gate)
+        self.use_structured_interaction = bool(use_structured_interaction)
+        self.structure_edge_weight = float(structure_edge_weight)
+        self.structure_min_gate = float(structure_min_gate)
+        self.use_channel_gate = bool(use_channel_gate)
+        self.channel_gate_min = float(channel_gate_min)
         
         # 3D learnable positional embedding (optional but highly recommended for 1D scanning)
         # 用一个极小的晶格尺寸 (10x12x10) 作为连续位置编码的种子，大大降低参数量
@@ -63,6 +78,88 @@ class CrossMambaModule(nn.Module):
         self.act = nn.GELU()
         self.norm = nn.InstanceNorm3d(channels)
         self.input_norm = nn.InstanceNorm3d(channels, affine=False)
+        if self.use_structured_interaction:
+            self.structure_gate = nn.Sequential(
+                nn.Conv3d(4, acf_hidden_channels, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv3d(acf_hidden_channels, 1, kernel_size=1),
+            )
+            nn.init.zeros_(self.structure_gate[-1].weight)
+            nn.init.zeros_(self.structure_gate[-1].bias)
+        if self.use_channel_gate:
+            hidden_channels = max(4, int(acf_hidden_channels))
+            self.channel_gate = nn.Sequential(
+                nn.Conv3d(channels * 3, hidden_channels, kernel_size=1),
+                nn.GELU(),
+                nn.Conv3d(hidden_channels, channels, kernel_size=1),
+            )
+            nn.init.zeros_(self.channel_gate[-1].weight)
+            nn.init.zeros_(self.channel_gate[-1].bias)
+        if self.use_acf:
+            hidden_channels = max(4, int(acf_hidden_channels))
+            self.acf_gate = nn.Sequential(
+                nn.Conv3d(channels * 2, hidden_channels, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.Conv3d(hidden_channels, 1, kernel_size=1),
+            )
+            nn.init.zeros_(self.acf_gate[-1].weight)
+            nn.init.zeros_(self.acf_gate[-1].bias)
+
+    def _high_pass(self, feature):
+        return feature - nn.functional.avg_pool3d(
+            feature,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+        )
+
+    def _structure_descriptor(self, feature):
+        feature = self.input_norm(feature.float())
+        high_pass = self._high_pass(feature)
+        return feature + self.structure_edge_weight * high_pass
+
+    @staticmethod
+    def _structure_energy(structure):
+        return structure.abs().mean(dim=1, keepdim=True)
+
+    def _structured_modulate(self, cross_delta, source, target):
+        if not self.use_structured_interaction:
+            return cross_delta
+
+        source_struct = self._structure_descriptor(source)
+        target_struct = self._structure_descriptor(target)
+        source_energy = self._structure_energy(source_struct)
+        target_energy = self._structure_energy(target_struct)
+        gate_input = torch.cat(
+            [
+                source_energy,
+                target_energy,
+                (source_energy - target_energy).abs(),
+                (source_struct - target_struct).abs().mean(dim=1, keepdim=True),
+            ],
+            dim=1,
+        )
+        gate = torch.sigmoid(self.structure_gate(gate_input).to(dtype=cross_delta.dtype))
+        gate = self.structure_min_gate + (1.0 - self.structure_min_gate) * gate
+        return cross_delta * gate
+
+    def _channel_gate_modulate(self, cross_delta, source, target):
+        if not self.use_channel_gate:
+            return cross_delta
+
+        source_struct = self.input_norm(source.float()).to(dtype=cross_delta.dtype)
+        target_struct = self.input_norm(target.float()).to(dtype=cross_delta.dtype)
+        gate_input = torch.cat(
+            [
+                source_struct,
+                target_struct,
+                (source_struct - target_struct).abs(),
+            ],
+            dim=1,
+        )
+        gate = torch.sigmoid(self.channel_gate(gate_input.float())).to(dtype=cross_delta.dtype)
+        gate = self.channel_gate_min + (1.0 - self.channel_gate_min) * gate
+        return cross_delta * gate
 
     def _regularize_offset(self, offset):
         if self.offset_limit > 0:
@@ -77,6 +174,23 @@ class CrossMambaModule(nn.Module):
             )
 
         return offset
+
+    def _acf_modulate(self, cross_delta, source, target, guidance):
+        if not self.use_acf:
+            return cross_delta
+
+        source_struct = self.input_norm(source.float())
+        target_struct = self.input_norm(target.float())
+        reliability_input = torch.cat(
+            [
+                (source_struct - target_struct).abs().to(dtype=guidance.dtype),
+                guidance.abs(),
+            ],
+            dim=1,
+        )
+        gate = torch.sigmoid(self.acf_gate(reliability_input.float())).to(dtype=cross_delta.dtype)
+        gate = self.acf_min_gate + (1.0 - self.acf_min_gate) * gate
+        return cross_delta * gate
         
     def forward(self, source, target):
         # 加上 3D 选择性位置编码
@@ -86,7 +200,11 @@ class CrossMambaModule(nn.Module):
         else:
             pos_embed = self.pos_embed
 
-        if self.use_structure_norm:
+        if self.use_structured_interaction:
+            residual_source = source
+            scan_source = self._structure_descriptor(source).to(dtype=source.dtype) + pos_embed
+            scan_target = self._structure_descriptor(target).to(dtype=target.dtype) + pos_embed
+        elif self.use_structure_norm:
             residual_source = source
             scan_source = self.input_norm(source.float()).to(dtype=source.dtype) + pos_embed
             scan_target = self.input_norm(target.float()).to(dtype=target.dtype) + pos_embed
@@ -166,13 +284,29 @@ class CrossMambaModule(nn.Module):
             # 【核心修复】将重采样后的 source 与 Mamba 本身提取的全局语义特征拼接融合！如果不拼，Mamba 就变成了一个纯 STN，丧失特征提取意义。
             cat_feat = torch.cat([modulated_source, mamba_guidance], dim=1)
             refined_fused = self.fuse_local(cat_feat)
-            
-            return self.norm(residual_source + self.residual_scale * self.act(refined_fused))
+            cross_delta = self._acf_modulate(
+                self.act(refined_fused),
+                source,
+                target,
+                mamba_guidance,
+            )
+            cross_delta = self._structured_modulate(cross_delta, source, target)
+            cross_delta = self._channel_gate_modulate(cross_delta, source, target)
+
+            return self.norm(residual_source + self.residual_scale * cross_delta)
         else:
             # 退回原始的特征直接加法融合逻辑，取消重采样模块的介入
             cat_feat = torch.cat([residual_source, mamba_guidance], dim=1)
             refined_fused = self.fuse_local(cat_feat)
-            return self.norm(residual_source + self.residual_scale * self.act(refined_fused))
+            cross_delta = self._acf_modulate(
+                self.act(refined_fused),
+                source,
+                target,
+                mamba_guidance,
+            )
+            cross_delta = self._structured_modulate(cross_delta, source, target)
+            cross_delta = self._channel_gate_modulate(cross_delta, source, target)
+            return self.norm(residual_source + self.residual_scale * cross_delta)
         
     def _scan_and_extract(self, seq_s, seq_t, D, H, W, order='z', reverse=False):
         B, L, C = seq_s.shape

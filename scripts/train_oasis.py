@@ -89,7 +89,7 @@ def build_registration_model(args, device):
 
     if args.model_config == 'voxelmorph_baseline':
         ignored_flags = []
-        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv', 'use_boundary_branch', 'use_ussc', 'use_dasr', 'use_drfc', 'use_sdmr', 'use_dpfc', 'use_miscv', 'use_sscc', 'use_cagr'):
+        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv', 'use_boundary_branch', 'use_ussc', 'use_dasr', 'use_drfc', 'use_sdmr', 'use_dpfc', 'use_miscv', 'use_sscc', 'use_cagr', 'use_rrrc', 'use_rcc'):
             if getattr(args, flag):
                 ignored_flags.append(f'--{flag.replace("_", "-")}')
         if ignored_flags:
@@ -127,6 +127,14 @@ def build_registration_model(args, device):
             cross_mamba_residual_scale=getattr(args, 'cross_mamba_residual_scale', 1.0),
             cross_mamba_residual_scales=getattr(args, 'cross_mamba_residual_scales', ''),
             cross_mamba_start_epochs=getattr(args, 'cross_mamba_start_epochs', ''),
+            use_acf_cross_mamba=getattr(args, 'use_acf_cross_mamba', False),
+            acf_hidden_channels=getattr(args, 'acf_hidden_channels', 16),
+            acf_min_gate=getattr(args, 'acf_min_gate', 0.25),
+            cross_mamba_structured_interaction=getattr(args, 'cross_mamba_structured_interaction', False),
+            cross_mamba_structure_edge_weight=getattr(args, 'cross_mamba_structure_edge_weight', 0.5),
+            cross_mamba_structure_min_gate=getattr(args, 'cross_mamba_structure_min_gate', 0.2),
+            cross_mamba_channel_gate=getattr(args, 'cross_mamba_channel_gate', False),
+            cross_mamba_channel_gate_min=getattr(args, 'cross_mamba_channel_gate_min', 0.25),
             use_wcv=args.use_wcv,
             use_swcv=args.use_swcv,
             use_gcv=args.use_gcv,
@@ -153,6 +161,12 @@ def build_registration_model(args, device):
             sscc_strength=getattr(args, 'sscc_strength', 0.2),
             use_cagr=getattr(args, 'use_cagr', False),
             cagr_strength=getattr(args, 'cagr_strength', 0.5),
+            use_rrrc=getattr(args, 'use_rrrc', False),
+            rrrc_min_gate=getattr(args, 'rrrc_min_gate', 0.2),
+            use_rcc=getattr(args, 'use_rcc', False),
+            rcc_strength=getattr(args, 'rcc_strength', 0.25),
+            rcc_scales=getattr(args, 'rcc_scales', 'all'),
+            rcc_start_epoch=getattr(args, 'rcc_start_epoch', 1),
             use_error_guided_residual=getattr(args, 'use_error_guided_residual', False),
             residual_flow_limit=getattr(args, 'residual_flow_limit', 4.0),
             use_boundary_branch=getattr(args, 'use_boundary_branch', False),
@@ -1258,12 +1272,22 @@ def main():
     parser.add_argument('--sscc-strength', type=float, default=0.2, help='Maximum SSCC feature calibration strength')
     parser.add_argument('--use-cagr', action='store_true', help='Use confidence-aware gated refinement inside C2F-RDC')
     parser.add_argument('--cagr-strength', type=float, default=0.5, help='Maximum multiplicative confidence modulation around neutral scale 1')
+    parser.add_argument('--use-rrrc', action='store_true', help='Use residual reliability-regulated composition inside C2F-RDC')
+    parser.add_argument('--rrrc-min-gate', type=float, default=0.2, help='Minimum suppressive gate for RRRC residual velocity')
+    parser.add_argument('--use-rcc', action='store_true', help='Use residual consistency correction inside C2F-RDC')
+    parser.add_argument('--rcc-strength', type=float, default=0.25, help='Maximum additive correction strength for RCC residual velocity')
+    parser.add_argument('--rcc-scales', type=str, default='all', help='Comma-separated decoder scales for RCC, e.g. 1/4,1/2, or all')
+    parser.add_argument('--rcc-start-epoch', type=int, default=1, help='First 1-based epoch that enables RCC correction')
     parser.add_argument('--use-error-guided-residual', action='store_true', help='Enhance residual flow pyramid with Structure-aware & Error-guided side branch')
     parser.add_argument("--error-guided-metric", type=str, default="feature_ncc", choices=["feature_ncc", "mind"], help="Metric to compute error maps for guidance")
     parser.add_argument('--residual-flow-limit', type=float, default=4.0, help='Per-stage magnitude cap for residual flow heads when residual flow pyramid is enabled')
     parser.add_argument('--pyramid-image-weight', type=float, default=0.0, help='Weight for multi-scale image supervision on intermediate pyramid displacements')
     parser.add_argument('--pyramid-image-weights', type=str, default='0.2,0.35,0.5', help='Comma-separated relative weights for intermediate pyramid image supervision from coarse to fine')
     parser.add_argument('--pyramid-image-start-epoch', type=int, default=1, help='Enable pyramid image supervision starting from this 1-based epoch')
+    parser.add_argument('--use-sdcs', action='store_true', help='Use Stage-wise Deformation Consistency Supervision on C2F-RDC intermediate displacements')
+    parser.add_argument('--sdcs-weight', type=float, default=0.15, help='Weight for SDCS stage-wise image consistency loss')
+    parser.add_argument('--sdcs-weights', type=str, default='0.2,0.3,0.5', help='Comma-separated SDCS stage weights from coarse to fine')
+    parser.add_argument('--sdcs-start-epoch', type=int, default=5, help='Enable SDCS starting from this 1-based epoch')
     parser.add_argument('--residual-flow-reg-weight', type=float, default=0.0, help='Weight for gradient regularization on per-stage residual flow heads')
     parser.add_argument('--use-saor', action='store_true', help='Replace fixed final-flow smoothness with structure-adaptive optimization regularization')
     parser.add_argument('--saor-alpha', type=float, default=3.0, help='Structure sensitivity of SAOR')
@@ -1295,6 +1319,14 @@ def main():
     parser.add_argument('--cross-mamba-residual-scale', type=float, default=1.0, help='Residual injection scale for Cross-Mamba output')
     parser.add_argument('--cross-mamba-residual-scales', type=str, default='', help='Comma-separated residual scales matching --cross-mamba-scales, or scale:value entries')
     parser.add_argument('--cross-mamba-start-epochs', type=str, default='', help='Comma-separated start epochs matching --cross-mamba-scales, or scale:epoch entries')
+    parser.add_argument('--use-acf-cross-mamba', action='store_true', help='Use adaptive coupling gate for Cross-Mamba residual injection')
+    parser.add_argument('--acf-hidden-channels', type=int, default=16, help='Hidden channels for the ACF Cross-Mamba gate')
+    parser.add_argument('--acf-min-gate', type=float, default=0.25, help='Minimum residual gate for ACF Cross-Mamba')
+    parser.add_argument('--cross-mamba-structured-interaction', action='store_true', help='Use high-pass structural descriptors and structure-reliability gating for Cross-Mamba')
+    parser.add_argument('--cross-mamba-structure-edge-weight', type=float, default=0.5, help='High-pass structural descriptor weight for structured Cross-Mamba')
+    parser.add_argument('--cross-mamba-structure-min-gate', type=float, default=0.2, help='Minimum structure-reliability gate for structured Cross-Mamba')
+    parser.add_argument('--cross-mamba-channel-gate', action='store_true', help='Use direct instance-normalized channel gating for Cross-Mamba residual injection')
+    parser.add_argument('--cross-mamba-channel-gate-min', type=float, default=0.25, help='Minimum channel gate value for direct Cross-Mamba gating')
     parser.add_argument('--use-wcv', action='store_true', help='Enable window cross-attention on shallow skip features')
     parser.add_argument('--use-swcv', action='store_true', help='Enable Structure-Aware WCV on deep skip features')
     parser.add_argument('--use-gcv', action='store_true', help='Enable global cost volume on deep features')
@@ -1383,6 +1415,16 @@ def main():
         parser.error('--use-cagr requires --use-dpfc.')
     if args.cagr_strength < 0 or args.cagr_strength >= 1:
         parser.error('--cagr-strength must be in [0, 1).')
+    if args.use_rrrc and not args.use_dpfc:
+        parser.error('--use-rrrc requires --use-dpfc.')
+    if args.rrrc_min_gate < 0 or args.rrrc_min_gate >= 1:
+        parser.error('--rrrc-min-gate must be in [0, 1).')
+    if args.use_rcc and not args.use_dpfc:
+        parser.error('--use-rcc requires --use-dpfc.')
+    if args.rcc_strength < 0 or args.rcc_strength >= 1:
+        parser.error('--rcc-strength must be in [0, 1).')
+    if args.rcc_start_epoch < 1:
+        parser.error('--rcc-start-epoch must be positive.')
     if args.use_saor and (args.saor_alpha < 0 or args.saor_risk_gamma < 0 or args.saor_risk_threshold < 0):
         parser.error('SAOR parameters must be non-negative.')
     if args.use_sbc and not args.use_dpfc:
@@ -1489,6 +1531,7 @@ def main():
     loss_weights = [1.0, args.lambda_param]
     feature_edge_indices = parse_feature_edge_indices(args.feature_edge_scales)
     pyramid_image_weights = parse_pyramid_image_weights(args.pyramid_image_weights)
+    sdcs_weights = parse_pyramid_image_weights(args.sdcs_weights)
     base_feature_edge_loss_weight = args.feature_edge_loss_weight if args.use_feature_edge_loss else 0.0
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     
@@ -1558,6 +1601,10 @@ def main():
         f.write(f"Pyramid Image Weight: {args.pyramid_image_weight}\n")
         f.write(f"Pyramid Image Start Epoch: {args.pyramid_image_start_epoch}\n")
         f.write(f"Pyramid Image Weights: {args.pyramid_image_weights}\n")
+        f.write(f"Use SDCS: {args.use_sdcs}\n")
+        f.write(f"SDCS Weight: {args.sdcs_weight}\n")
+        f.write(f"SDCS Start Epoch: {args.sdcs_start_epoch}\n")
+        f.write(f"SDCS Weights: {args.sdcs_weights}\n")
         f.write(f"Feature Edge Loss Weight: {base_feature_edge_loss_weight}\n")
         f.write(f"Feature Edge Start Epoch: {args.feature_edge_start_epoch}\n")
         f.write(f"Feature Edge Scales: {args.feature_edge_scales}\n")
@@ -1590,6 +1637,12 @@ def main():
         f.write(f"SSCC Strength: {args.sscc_strength}\n")
         f.write(f"Use CAGR: {args.use_cagr}\n")
         f.write(f"CAGR Strength: {args.cagr_strength}\n")
+        f.write(f"Use RRRC: {args.use_rrrc}\n")
+        f.write(f"RRRC Min Gate: {args.rrrc_min_gate}\n")
+        f.write(f"Use RCC: {args.use_rcc}\n")
+        f.write(f"RCC Strength: {args.rcc_strength}\n")
+        f.write(f"RCC Scales: {args.rcc_scales}\n")
+        f.write(f"RCC Start Epoch: {args.rcc_start_epoch}\n")
         f.write(f"Use Error-Guided Residual: {args.use_error_guided_residual}\n")
         f.write(f"Residual Flow Limit: {args.residual_flow_limit}\n")
         f.write(f"Residual Flow Reg Weight: {args.residual_flow_reg_weight}\n")
@@ -1616,6 +1669,14 @@ def main():
         f.write(f"Cross-Mamba Residual Scale: {args.cross_mamba_residual_scale}\n")
         f.write(f"Cross-Mamba Residual Scales: {args.cross_mamba_residual_scales}\n")
         f.write(f"Cross-Mamba Start Epochs: {args.cross_mamba_start_epochs}\n")
+        f.write(f"Use ACF Cross-Mamba: {args.use_acf_cross_mamba}\n")
+        f.write(f"ACF Hidden Channels: {args.acf_hidden_channels}\n")
+        f.write(f"ACF Min Gate: {args.acf_min_gate}\n")
+        f.write(f"Cross-Mamba Structured Interaction: {args.cross_mamba_structured_interaction}\n")
+        f.write(f"Cross-Mamba Structure Edge Weight: {args.cross_mamba_structure_edge_weight}\n")
+        f.write(f"Cross-Mamba Structure Min Gate: {args.cross_mamba_structure_min_gate}\n")
+        f.write(f"Cross-Mamba Channel Gate: {args.cross_mamba_channel_gate}\n")
+        f.write(f"Cross-Mamba Channel Gate Min: {args.cross_mamba_channel_gate_min}\n")
         f.write(f"Use SDMR: {args.use_sdmr}\n")
         f.write(f"SDMR Use MIND: {args.sdmr_use_mind}\n")
         f.write(f"SDMR Scale: {args.sdmr_scale}\n")
@@ -1648,12 +1709,20 @@ def main():
         epoch_num = epoch + 1
         if hasattr(model, 'set_cross_mamba_epoch'):
             model.set_cross_mamba_epoch(epoch_num)
+        if hasattr(model, 'set_rcc_epoch'):
+            model.set_rcc_epoch(epoch_num)
         boundary_loss_active = args.use_boundary_loss and (epoch_num > args.boundary_loss_start_epoch)
         active_boundary_loss_weight = args.boundary_loss_weight if boundary_loss_active else 0.0
         feature_edge_active = args.use_feature_edge_loss and (epoch_num >= args.feature_edge_start_epoch)
         active_feature_edge_loss_weight = base_feature_edge_loss_weight if feature_edge_active else 0.0
-        pyramid_image_active = epoch_num >= args.pyramid_image_start_epoch
-        active_pyramid_image_weight = args.pyramid_image_weight if pyramid_image_active else 0.0
+        if args.use_sdcs:
+            pyramid_image_active = epoch_num >= args.sdcs_start_epoch
+            active_pyramid_image_weight = args.sdcs_weight if pyramid_image_active else 0.0
+            active_pyramid_image_weights = sdcs_weights
+        else:
+            pyramid_image_active = epoch_num >= args.pyramid_image_start_epoch
+            active_pyramid_image_weight = args.pyramid_image_weight if pyramid_image_active else 0.0
+            active_pyramid_image_weights = pyramid_image_weights
         active_sbc_weight = args.sbc_weight if args.use_sbc and epoch_num >= args.sbc_start_epoch else 0.0
         active_dess_weight = args.dess_weight if args.use_dess and epoch_num >= args.dess_start_epoch else 0.0
         
@@ -1678,7 +1747,7 @@ def main():
             feature_edge_loss_weight=active_feature_edge_loss_weight,
             feature_edge_indices=feature_edge_indices,
             pyramid_image_weight=active_pyramid_image_weight,
-            pyramid_image_weights=pyramid_image_weights,
+            pyramid_image_weights=active_pyramid_image_weights,
             residual_flow_reg_weight=args.residual_flow_reg_weight,
             saor_loss_fn=saor_loss_fn,
             sbc_weight=active_sbc_weight,
@@ -1709,7 +1778,7 @@ def main():
             feature_edge_indices=feature_edge_indices,
             pyramid_weight=args.pyramid_weight,
             pyramid_image_weight=active_pyramid_image_weight,
-            pyramid_image_weights=pyramid_image_weights,
+            pyramid_image_weights=active_pyramid_image_weights,
             residual_flow_reg_weight=args.residual_flow_reg_weight,
             use_mask=args.use_mask,
             loss_type=args.loss.lower(),
