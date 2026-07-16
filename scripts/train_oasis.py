@@ -89,7 +89,7 @@ def build_registration_model(args, device):
 
     if args.model_config == 'voxelmorph_baseline':
         ignored_flags = []
-        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv', 'use_boundary_branch', 'use_ussc', 'use_dasr', 'use_drfc', 'use_sdmr', 'use_dpfc', 'use_miscv', 'use_sscc', 'use_cagr', 'use_rrrc', 'use_rcc'):
+        for flag in ('use_pdaps', 'use_daps', 'use_dsin', 'use_cmim', 'use_cross_mamba', 'use_wcv', 'use_swcv', 'use_gcv', 'use_boundary_branch', 'use_ussc', 'use_dasr', 'use_drfc', 'use_sdmr', 'use_dpfc', 'use_miscv', 'use_sscc', 'use_cagr', 'use_rrrc', 'use_rcc', 'use_boundary_rcc'):
             if getattr(args, flag):
                 ignored_flags.append(f'--{flag.replace("_", "-")}')
         if ignored_flags:
@@ -166,7 +166,18 @@ def build_registration_model(args, device):
             use_rcc=getattr(args, 'use_rcc', False),
             rcc_strength=getattr(args, 'rcc_strength', 0.25),
             rcc_scales=getattr(args, 'rcc_scales', 'all'),
+            rcc_strengths=getattr(args, 'rcc_strengths', ''),
+            rcc_direction_gate=getattr(args, 'rcc_direction_gate', False),
+            rcc_direction_gate_strength=getattr(args, 'rcc_direction_gate_strength', 0.25),
             rcc_start_epoch=getattr(args, 'rcc_start_epoch', 1),
+            rcc_warmup_epochs=getattr(args, 'rcc_warmup_epochs', 1),
+            use_boundary_rcc=getattr(args, 'use_boundary_rcc', False),
+            boundary_rcc_strength=getattr(args, 'boundary_rcc_strength', 0.25),
+            boundary_rcc_smooth_kernel=getattr(args, 'boundary_rcc_smooth_kernel', 3),
+            boundary_rcc_scales=getattr(args, 'boundary_rcc_scales', '1/4,1/2'),
+            boundary_rcc_start_epoch=getattr(args, 'boundary_rcc_start_epoch', 1),
+            boundary_rcc_use_residual_gate=getattr(args, 'boundary_rcc_use_residual_gate', False),
+            boundary_rcc_highpass_correction=getattr(args, 'boundary_rcc_highpass_correction', False),
             use_error_guided_residual=getattr(args, 'use_error_guided_residual', False),
             residual_flow_limit=getattr(args, 'residual_flow_limit', 4.0),
             use_boundary_branch=getattr(args, 'use_boundary_branch', False),
@@ -1277,7 +1288,18 @@ def main():
     parser.add_argument('--use-rcc', action='store_true', help='Use residual consistency correction inside C2F-RDC')
     parser.add_argument('--rcc-strength', type=float, default=0.25, help='Maximum additive correction strength for RCC residual velocity')
     parser.add_argument('--rcc-scales', type=str, default='all', help='Comma-separated decoder scales for RCC, e.g. 1/4,1/2, or all')
+    parser.add_argument('--rcc-strengths', type=str, default='', help='Optional per-scale RCC strengths, e.g. 1/4:0.25,1/2:0.10 or values aligned with --rcc-scales')
+    parser.add_argument('--rcc-direction-gate', action='store_true', help='Suppress RCC correction when its direction conflicts with the current local velocity')
+    parser.add_argument('--rcc-direction-gate-strength', type=float, default=0.25, help='Suppression strength for RCC direction-consistency gate')
     parser.add_argument('--rcc-start-epoch', type=int, default=1, help='First 1-based epoch that enables RCC correction')
+    parser.add_argument('--rcc-warmup-epochs', type=int, default=1, help='Linearly ramp RCC strength after --rcc-start-epoch for this many epochs')
+    parser.add_argument('--use-boundary-rcc', action='store_true', help='Modulate RCC correction with structure-boundary response')
+    parser.add_argument('--boundary-rcc-strength', type=float, default=0.25, help='Boundary response gain for RCC correction modulation')
+    parser.add_argument('--boundary-rcc-smooth-kernel', type=int, default=3, help='Odd smoothing kernel for structure-boundary response')
+    parser.add_argument('--boundary-rcc-scales', type=str, default='1/4,1/2', help='Comma-separated decoder scales for Boundary-RCC modulation')
+    parser.add_argument('--boundary-rcc-start-epoch', type=int, default=1, help='First 1-based epoch that enables Boundary-RCC modulation')
+    parser.add_argument('--boundary-rcc-use-residual-gate', action='store_true', help='Gate Boundary-RCC by warped-source/target structure residual')
+    parser.add_argument('--boundary-rcc-highpass-correction', action='store_true', help='Apply Boundary-RCC only to local high-pass correction instead of scaling the full correction')
     parser.add_argument('--use-error-guided-residual', action='store_true', help='Enhance residual flow pyramid with Structure-aware & Error-guided side branch')
     parser.add_argument("--error-guided-metric", type=str, default="feature_ncc", choices=["feature_ncc", "mind"], help="Metric to compute error maps for guidance")
     parser.add_argument('--residual-flow-limit', type=float, default=4.0, help='Per-stage magnitude cap for residual flow heads when residual flow pyramid is enabled')
@@ -1423,8 +1445,20 @@ def main():
         parser.error('--use-rcc requires --use-dpfc.')
     if args.rcc_strength < 0 or args.rcc_strength >= 1:
         parser.error('--rcc-strength must be in [0, 1).')
+    if args.rcc_direction_gate_strength < 0 or args.rcc_direction_gate_strength > 1:
+        parser.error('--rcc-direction-gate-strength must be in [0, 1].')
     if args.rcc_start_epoch < 1:
         parser.error('--rcc-start-epoch must be positive.')
+    if args.rcc_warmup_epochs < 1:
+        parser.error('--rcc-warmup-epochs must be positive.')
+    if args.use_boundary_rcc and not args.use_rcc:
+        parser.error('--use-boundary-rcc requires --use-rcc.')
+    if args.boundary_rcc_strength < 0:
+        parser.error('--boundary-rcc-strength must be non-negative.')
+    if args.boundary_rcc_smooth_kernel < 1 or args.boundary_rcc_smooth_kernel % 2 == 0:
+        parser.error('--boundary-rcc-smooth-kernel must be a positive odd integer.')
+    if args.boundary_rcc_start_epoch < 1:
+        parser.error('--boundary-rcc-start-epoch must be positive.')
     if args.use_saor and (args.saor_alpha < 0 or args.saor_risk_gamma < 0 or args.saor_risk_threshold < 0):
         parser.error('SAOR parameters must be non-negative.')
     if args.use_sbc and not args.use_dpfc:
@@ -1642,7 +1676,18 @@ def main():
         f.write(f"Use RCC: {args.use_rcc}\n")
         f.write(f"RCC Strength: {args.rcc_strength}\n")
         f.write(f"RCC Scales: {args.rcc_scales}\n")
+        f.write(f"RCC Strengths: {args.rcc_strengths}\n")
+        f.write(f"RCC Direction Gate: {args.rcc_direction_gate}\n")
+        f.write(f"RCC Direction Gate Strength: {args.rcc_direction_gate_strength}\n")
         f.write(f"RCC Start Epoch: {args.rcc_start_epoch}\n")
+        f.write(f"RCC Warmup Epochs: {args.rcc_warmup_epochs}\n")
+        f.write(f"Use Boundary RCC: {args.use_boundary_rcc}\n")
+        f.write(f"Boundary RCC Strength: {args.boundary_rcc_strength}\n")
+        f.write(f"Boundary RCC Smooth Kernel: {args.boundary_rcc_smooth_kernel}\n")
+        f.write(f"Boundary RCC Scales: {args.boundary_rcc_scales}\n")
+        f.write(f"Boundary RCC Start Epoch: {args.boundary_rcc_start_epoch}\n")
+        f.write(f"Boundary RCC Use Residual Gate: {args.boundary_rcc_use_residual_gate}\n")
+        f.write(f"Boundary RCC Highpass Correction: {args.boundary_rcc_highpass_correction}\n")
         f.write(f"Use Error-Guided Residual: {args.use_error_guided_residual}\n")
         f.write(f"Residual Flow Limit: {args.residual_flow_limit}\n")
         f.write(f"Residual Flow Reg Weight: {args.residual_flow_reg_weight}\n")

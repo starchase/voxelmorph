@@ -780,7 +780,11 @@ class SiameseUNetBaseline(nn.Module):
                  use_dpfc=False, dpfc_flow_limit=8.0, use_miscv=False, miscv_scales='1/8,1/4',
                  use_sscc=False, sscc_scales='1/16,1/8', sscc_hidden_channels=16, sscc_strength=0.2,
                  use_cagr=False, cagr_strength=0.5, use_rrrc=False, rrrc_min_gate=0.2,
-                 use_rcc=False, rcc_strength=0.25, rcc_scales='all', rcc_start_epoch=1,
+                 use_rcc=False, rcc_strength=0.25, rcc_scales='all', rcc_start_epoch=1, rcc_warmup_epochs=1,
+                 rcc_strengths='', rcc_direction_gate=False, rcc_direction_gate_strength=0.25,
+                 use_boundary_rcc=False, boundary_rcc_strength=0.25, boundary_rcc_smooth_kernel=3,
+                 boundary_rcc_scales='1/4,1/2', boundary_rcc_start_epoch=1,
+                 boundary_rcc_use_residual_gate=False, boundary_rcc_highpass_correction=False,
                  miscv_projection_channels=8, miscv_search_radius=2, miscv_temperature=0.1):
         super().__init__()
         self.inshape = inshape
@@ -803,8 +807,19 @@ class SiameseUNetBaseline(nn.Module):
         self.use_rcc = bool(use_rcc)
         self.rcc_strength = float(rcc_strength)
         self.rcc_scales = self._parse_rcc_scales(rcc_scales)
+        self.rcc_strengths = self._parse_rcc_strengths(rcc_strengths, rcc_scales)
+        self.rcc_direction_gate = bool(rcc_direction_gate)
+        self.rcc_direction_gate_strength = float(rcc_direction_gate_strength)
         self.rcc_start_epoch = int(rcc_start_epoch)
+        self.rcc_warmup_epochs = int(rcc_warmup_epochs)
         self.rcc_current_epoch = 1
+        self.use_boundary_rcc = bool(use_boundary_rcc)
+        self.boundary_rcc_strength = float(boundary_rcc_strength)
+        self.boundary_rcc_smooth_kernel = int(boundary_rcc_smooth_kernel)
+        self.boundary_rcc_scales = self._parse_rcc_scales(boundary_rcc_scales)
+        self.boundary_rcc_start_epoch = int(boundary_rcc_start_epoch)
+        self.boundary_rcc_use_residual_gate = bool(boundary_rcc_use_residual_gate)
+        self.boundary_rcc_highpass_correction = bool(boundary_rcc_highpass_correction)
         self.use_error_guided_residual = use_error_guided_residual
         self.error_guided_metric = error_guided_metric
         self.use_sdmr = use_sdmr
@@ -894,8 +909,24 @@ class SiameseUNetBaseline(nn.Module):
             raise ValueError('RCC requires use_dpfc=True')
         if not (0 <= self.rcc_strength < 1):
             raise ValueError('rcc_strength must be in [0, 1)')
+        if any(not (0 <= strength < 1) for strength in self.rcc_strengths.values()):
+            raise ValueError('all rcc_strengths values must be in [0, 1)')
+        if not (0 <= self.rcc_direction_gate_strength <= 1):
+            raise ValueError('rcc_direction_gate_strength must be in [0, 1]')
         if self.rcc_start_epoch < 1:
             raise ValueError('rcc_start_epoch must be positive')
+        if self.rcc_warmup_epochs < 1:
+            raise ValueError('rcc_warmup_epochs must be positive')
+        if self.use_boundary_rcc and not self.use_rcc:
+            raise ValueError('Boundary-RCC requires use_rcc=True')
+        if self.boundary_rcc_strength < 0:
+            raise ValueError('boundary_rcc_strength must be non-negative')
+        if self.boundary_rcc_smooth_kernel < 1 or self.boundary_rcc_smooth_kernel % 2 == 0:
+            raise ValueError('boundary_rcc_smooth_kernel must be a positive odd integer')
+        if self.use_boundary_rcc and not self.boundary_rcc_scales:
+            raise ValueError('boundary_rcc_scales must not be empty when Boundary-RCC is enabled')
+        if self.boundary_rcc_start_epoch < 1:
+            raise ValueError('boundary_rcc_start_epoch must be positive')
         if self.use_error_guided_residual and not self.use_residual_flow_pyramid:
             raise ValueError('use_error_guided_residual requires use_residual_flow_pyramid to be enabled')
         
@@ -1290,6 +1321,55 @@ class SiameseUNetBaseline(nn.Module):
         cosine_residual = 1.0 - (source_norm * target_norm).sum(dim=1, keepdim=True)
         return torch.cat([absolute_residual, cosine_residual], dim=1).to(source_feature.dtype)
 
+    def _structure_boundary_response(self, source_feature, target_feature):
+        def feature_edge(feature):
+            feature = F.normalize(feature.float(), dim=1, eps=1e-6)
+            edge = feature.new_zeros(feature.shape[0], 1, *feature.shape[2:])
+            spatial_dims = feature.dim() - 2
+            for axis in range(spatial_dims):
+                dim = 2 + axis
+                forward = feature.narrow(dim, 1, feature.shape[dim] - 1)
+                backward = feature.narrow(dim, 0, feature.shape[dim] - 1)
+                diff = (forward - backward).abs().mean(dim=1, keepdim=True)
+                pad = [0, 0] * spatial_dims
+                pad[2 * (spatial_dims - 1 - axis) + 1] = 1
+                edge = edge + F.pad(diff, pad, mode='replicate')
+            return edge / max(spatial_dims, 1)
+
+        response = 0.5 * (feature_edge(source_feature) + feature_edge(target_feature))
+        if self.boundary_rcc_smooth_kernel > 1:
+            kernel = self.boundary_rcc_smooth_kernel
+            pool = F.avg_pool3d if self.ndim == 3 else F.avg_pool2d
+            response = pool(response, kernel_size=kernel, stride=1, padding=kernel // 2)
+        flat = response.flatten(1)
+        low = flat.amin(dim=1).view(-1, 1, *([1] * self.ndim))
+        high = flat.amax(dim=1).view(-1, 1, *([1] * self.ndim))
+        response = (response - low) / (high - low + 1e-6)
+        return response.clamp_(0.0, 1.0).to(source_feature.dtype)
+
+    def _normalized_residual_response(self, source_feature, target_feature):
+        source_norm = F.normalize(source_feature.float(), dim=1, eps=1e-6)
+        target_norm = F.normalize(target_feature.float(), dim=1, eps=1e-6)
+        absolute_residual = (source_norm - target_norm).abs().mean(dim=1, keepdim=True)
+        cosine_residual = 1.0 - (source_norm * target_norm).sum(dim=1, keepdim=True)
+        response = absolute_residual + cosine_residual.clamp_min(0.0)
+        flat = response.flatten(1)
+        low = flat.amin(dim=1).view(-1, 1, *([1] * self.ndim))
+        high = flat.amax(dim=1).view(-1, 1, *([1] * self.ndim))
+        response = (response - low) / (high - low + 1e-6)
+        return response.clamp_(0.0, 1.0).to(source_feature.dtype)
+
+    def _highpass_correction(self, correction):
+        kernel = self.boundary_rcc_smooth_kernel
+        if kernel <= 1:
+            kernel = 3
+        pool = F.avg_pool3d if self.ndim == 3 else F.avg_pool2d
+        smooth = pool(correction.float(), kernel_size=kernel, stride=1, padding=kernel // 2)
+        return (correction.float() - smooth).to(correction.dtype)
+
+    def _is_boundary_rcc_active(self):
+        return self.rcc_current_epoch >= self.boundary_rcc_start_epoch
+
     def _resize_flow(self, flow, target_shape):
         mode = 'trilinear' if self.ndim == 3 else 'bilinear'
         source_shape = flow.shape[2:]
@@ -1485,6 +1565,12 @@ class SiameseUNetBaseline(nn.Module):
     def _is_rcc_active(self):
         return self.rcc_current_epoch >= self.rcc_start_epoch
 
+    def _rcc_warmup_scale(self):
+        if self.rcc_warmup_epochs <= 1:
+            return 1.0
+        progress = self.rcc_current_epoch - self.rcc_start_epoch + 1
+        return max(0.0, min(1.0, progress / float(self.rcc_warmup_epochs)))
+
     def _is_cross_mamba_scale_active(self, scale):
         return self.cross_mamba_current_epoch >= self.cross_mamba_start_epochs.get(scale, 1)
 
@@ -1515,6 +1601,61 @@ class SiameseUNetBaseline(nn.Module):
         if invalid:
             raise ValueError(f'Unsupported RCC scales: {invalid}. Valid values are {sorted(valid)}')
         return set(items)
+
+    def _ordered_rcc_scales(self, scales):
+        valid_order = ['1/8', '1/4', '1/2', '1/1']
+        if scales is None:
+            return valid_order
+        if isinstance(scales, str):
+            if scales.strip().lower() == 'all':
+                return valid_order
+            items = [item.strip() for item in scales.split(',') if item.strip()]
+        else:
+            items = [str(item).strip() for item in scales if str(item).strip()]
+        seen = set()
+        ordered = []
+        for item in items:
+            if item not in seen:
+                ordered.append(item)
+                seen.add(item)
+        return ordered
+
+    def _parse_rcc_strengths(self, strengths, rcc_scales):
+        if strengths is None:
+            return {}
+        if isinstance(strengths, str):
+            text = strengths.strip()
+            if not text:
+                return {}
+            items = [item.strip() for item in text.split(',') if item.strip()]
+        else:
+            items = [str(item).strip() for item in strengths if str(item).strip()]
+        if not items:
+            return {}
+
+        valid = {'1/8', '1/4', '1/2', '1/1'}
+        parsed = {}
+        if all(':' in item for item in items):
+            for item in items:
+                scale, value = [part.strip() for part in item.split(':', 1)]
+                if scale not in valid:
+                    raise ValueError(f'Unsupported RCC strength scale: {scale}. Valid values are {sorted(valid)}')
+                parsed[scale] = float(value)
+            return parsed
+
+        ordered_scales = self._ordered_rcc_scales(rcc_scales)
+        if len(items) != len(ordered_scales):
+            raise ValueError(
+                'rcc_strengths must either use scale:value entries or match the number of rcc_scales'
+            )
+        for scale, value in zip(ordered_scales, items):
+            if scale not in valid:
+                raise ValueError(f'Unsupported RCC strength scale: {scale}. Valid values are {sorted(valid)}')
+            parsed[scale] = float(value)
+        return parsed
+
+    def _rcc_strength_for_scale(self, scale):
+        return self.rcc_strengths.get(scale, self.rcc_strength) * self._rcc_warmup_scale()
 
     def forward(self, source, target, return_warped_source=True, return_field_type='displacement', return_coarse_flows=False, return_residual_flows=False, return_feature_edge_loss=False, feature_edge_indices=(0, 1), swap_encoder_branches=False):
         # --- [Ablation 1 Hook: FDA will go here] ---
@@ -1749,9 +1890,13 @@ class SiameseUNetBaseline(nn.Module):
                 else:
                     coarse_displacement = self._resize_displacement_to_feature(dpfc_displacement, x)
 
+                boundary_source_feature = None
+                boundary_target_feature = None
                 if s_skip_raw is not None and t_skip_raw is not None:
                     warped_source_feature = self.spatial_transform(s_skip_raw, coarse_displacement)
                     structure_residual = self._dpfc_structure_residual(warped_source_feature, t_skip_raw)
+                    boundary_source_feature = warped_source_feature
+                    boundary_target_feature = t_skip_raw
                 else:
                     source_scale = F.interpolate(source, size=x.shape[2:], mode=mode, align_corners=True)
                     target_scale = F.interpolate(target, size=x.shape[2:], mode=mode, align_corners=True)
@@ -1762,6 +1907,8 @@ class SiameseUNetBaseline(nn.Module):
                         (warped_source_scale.float() - source_gradient).abs(),
                         (target_scale.float() - target_gradient).abs(),
                     ], dim=1).to(x.dtype)
+                    boundary_source_feature = warped_source_scale
+                    boundary_target_feature = target_scale
 
                 normalized_coarse = coarse_displacement / local_limit
                 residual_inputs = [x, structure_residual, normalized_coarse]
@@ -1781,12 +1928,45 @@ class SiameseUNetBaseline(nn.Module):
                     reliability_gate = 1.0 - (1.0 - self.rrrc_min_gate) * risk
                     local_velocity = local_velocity * reliability_gate.to(dtype=local_velocity.dtype)
                 if self.use_rcc and self._is_rcc_active() and self.decoder_scales[i] in self.rcc_scales:
+                    scale_rcc_strength = self._rcc_strength_for_scale(self.decoder_scales[i])
                     normalized_velocity = local_velocity / local_limit
                     correction_feature = self.rcc_correction_blocks[i](
                         torch.cat([residual_feature, normalized_velocity], dim=1)
                     )
                     raw_correction = self.rcc_correction_heads[i](correction_feature)
-                    correction = self.rcc_strength * local_limit * torch.tanh(raw_correction / local_limit)
+                    correction = scale_rcc_strength * local_limit * torch.tanh(raw_correction / local_limit)
+                    if self.rcc_direction_gate and self.rcc_direction_gate_strength > 0:
+                        with torch.no_grad():
+                            velocity_ref = local_velocity.float()
+                            correction_ref = correction.float()
+                            dot = (velocity_ref * correction_ref).sum(dim=1, keepdim=True)
+                            velocity_norm = velocity_ref.square().sum(dim=1, keepdim=True).sqrt()
+                            correction_norm = correction_ref.square().sum(dim=1, keepdim=True).sqrt()
+                            cosine = dot / (velocity_norm * correction_norm + 1e-6)
+                            consistency = 0.5 * (cosine.clamp(-1.0, 1.0) + 1.0)
+                            direction_gate = 1.0 - self.rcc_direction_gate_strength * (1.0 - consistency)
+                        correction = correction * direction_gate.to(dtype=correction.dtype)
+                    if (
+                        self.use_boundary_rcc
+                        and self._is_boundary_rcc_active()
+                        and self.decoder_scales[i] in self.boundary_rcc_scales
+                    ):
+                        with torch.no_grad():
+                            boundary_response = self._structure_boundary_response(boundary_source_feature, boundary_target_feature)
+                            if self.boundary_rcc_use_residual_gate:
+                                residual_response = self._normalized_residual_response(
+                                    boundary_source_feature,
+                                    boundary_target_feature,
+                                )
+                                boundary_response = boundary_response * residual_response
+                        if self.boundary_rcc_highpass_correction:
+                            correction = correction + (
+                                self.boundary_rcc_strength
+                                * boundary_response
+                                * self._highpass_correction(correction)
+                            )
+                        else:
+                            correction = correction * (1.0 + self.boundary_rcc_strength * boundary_response)
                     local_velocity = local_velocity + correction
                 residual_flows.append(local_velocity)
                 local_displacement = self.integrate(local_velocity)
